@@ -28,6 +28,7 @@ pub const Session = struct {
     target: Target,
     inbound_tag: ?[]const u8 = null,
     sniffed_domain: ?[]const u8 = null,
+    outbound_tag: ?[]const u8 = null,
 };
 
 pub const Preface = struct {

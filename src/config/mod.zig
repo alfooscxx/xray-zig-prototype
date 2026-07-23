@@ -119,12 +119,12 @@ pub const RealitySettings = struct {
 
 pub const DnsConfig = struct {
     servers: []DnsServer,
-    fake_dns: FakeDnsConfig,
+    fake_dns: ?FakeDnsConfig,
 
     pub fn deinit(self: *DnsConfig, allocator: std.mem.Allocator) void {
         for (self.servers) |*server| server.deinit(allocator);
         allocator.free(self.servers);
-        self.fake_dns.deinit(allocator);
+        if (self.fake_dns) |*fake_dns| fake_dns.deinit(allocator);
         self.* = undefined;
     }
 
@@ -138,10 +138,12 @@ pub const DnsConfig = struct {
 
 pub const DnsServer = struct {
     resolver: []const u8,
+    outbound_tag: []const u8,
     domains: []DomainRule,
 
     pub fn deinit(self: *DnsServer, allocator: std.mem.Allocator) void {
         allocator.free(self.resolver);
+        allocator.free(self.outbound_tag);
         for (self.domains) |*domain| domain.deinit(allocator);
         allocator.free(self.domains);
         self.* = undefined;
@@ -291,6 +293,7 @@ pub const ParseConfigError = error{
     MissingRealityShortId,
     MissingDnsServers,
     MissingDnsResolver,
+    MissingDnsOutboundTag,
     MissingDnsServerDomains,
     MissingDnsFallbackServer,
     MissingRouteOutboundTag,
@@ -520,10 +523,10 @@ fn parseDns(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) !?DnsCon
     if (!isDnsFallbackServer(servers.items[servers.items.len - 1])) return error.MissingDnsFallbackServer;
 
     const fake_dns = try parseFakeDns(allocator, object.get("fakeDns"));
-    errdefer {
-        var owned = fake_dns;
+    errdefer if (fake_dns) |owned_value| {
+        var owned = owned_value;
         owned.deinit(allocator);
-    }
+    };
 
     return .{
         .servers = try servers.toOwnedSlice(allocator),
@@ -537,6 +540,8 @@ fn parseDnsServer(allocator: std.mem.Allocator, value: std.json.Value) !DnsServe
 
     const resolver = try requiredString(allocator, object, "resolver", error.MissingDnsResolver);
     errdefer allocator.free(resolver);
+    const outbound_tag = try requiredString(allocator, object, "outboundTag", error.MissingDnsOutboundTag);
+    errdefer allocator.free(outbound_tag);
 
     const domains_value = object.get("domains") orelse return error.MissingDnsServerDomains;
     if (domains_value != .array) return error.DnsServerDomainsMustBeArray;
@@ -551,6 +556,7 @@ fn parseDnsServer(allocator: std.mem.Allocator, value: std.json.Value) !DnsServe
 
     return .{
         .resolver = resolver,
+        .outbound_tag = outbound_tag,
         .domains = try domains.toOwnedSlice(allocator),
     };
 }
@@ -559,14 +565,10 @@ fn isDnsFallbackServer(server: DnsServer) bool {
     return server.domains.len == 1 and std.mem.eql(u8, server.domains[0].pattern, "domain:");
 }
 
-fn parseFakeDns(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) !FakeDnsConfig {
+fn parseFakeDns(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) !?FakeDnsConfig {
     const default_pool = "198.18.0.0/15";
     const default_pool6 = "fc00::/18";
-    const value = maybe_value orelse return .{
-        .ip_pool = try allocator.dupe(u8, default_pool),
-        .ip_pool6 = try allocator.dupe(u8, default_pool6),
-        .ttl = 60,
-    };
+    const value = maybe_value orelse return null;
     if (value != .object) return error.FakeDnsMustBeObject;
     const object = &value.object;
 
@@ -922,15 +924,15 @@ test "defaults inbound listen address to loopback" {
     try std.testing.expectEqualStrings("127.0.0.1", cfg.inbounds[0].listen);
 }
 
-test "parses dns config with fakedns defaults" {
+test "parses dns config without enabling fakedns" {
     const source =
         \\{
         \\  "dns": {
         \\    "servers": [
-        \\      {"resolver": "9.9.9.9", "domains": ["domain:example.com"]},
-        \\      {"resolver": "8.8.4.4", "domains": ["domain:mail.example.com"]},
-        \\      {"resolver": "77.88.8.8", "domains": ["domain:ru"]},
-        \\      {"resolver": "1.1.1.1:53", "domains": ["domain:"]}
+        \\      {"resolver": "9.9.9.9", "outboundTag": "direct", "domains": ["domain:example.com"]},
+        \\      {"resolver": "8.8.4.4", "outboundTag": "direct", "domains": ["domain:mail.example.com"]},
+        \\      {"resolver": "77.88.8.8", "outboundTag": "direct", "domains": ["domain:ru"]},
+        \\      {"resolver": "1.1.1.1:53", "outboundTag": "direct", "domains": ["domain:"]}
         \\    ]
         \\  },
         \\  "inbounds": [
@@ -949,9 +951,29 @@ test "parses dns config with fakedns defaults" {
     try std.testing.expectEqualStrings("9.9.9.9", cfg.dns.?.selectServer("mail.example.com").resolver);
     try std.testing.expectEqualStrings("77.88.8.8", cfg.dns.?.selectServer("mail.ru").resolver);
     try std.testing.expectEqualStrings("1.1.1.1:53", cfg.dns.?.selectServer("other.net").resolver);
-    try std.testing.expectEqualStrings("198.18.0.0/15", cfg.dns.?.fake_dns.ip_pool);
-    try std.testing.expectEqualStrings("fc00::/18", cfg.dns.?.fake_dns.ip_pool6);
-    try std.testing.expectEqual(@as(u32, 60), cfg.dns.?.fake_dns.ttl);
+    try std.testing.expectEqualStrings("direct", cfg.dns.?.selectServer("other.net").outbound_tag);
+    try std.testing.expect(cfg.dns.?.fake_dns == null);
+}
+
+test "parses explicit fakedns with defaults" {
+    const source =
+        \\{
+        \\  "dns": {
+        \\    "servers": [
+        \\      {"resolver": "1.1.1.1", "outboundTag": "direct", "domains": ["domain:"]}
+        \\    ],
+        \\    "fakeDns": {}
+        \\  }
+        \\}
+    ;
+
+    var cfg = try parse(std.testing.allocator, source);
+    defer cfg.deinit();
+
+    const fake_dns = cfg.dns.?.fake_dns.?;
+    try std.testing.expectEqualStrings("198.18.0.0/15", fake_dns.ip_pool);
+    try std.testing.expectEqualStrings("fc00::/18", fake_dns.ip_pool6);
+    try std.testing.expectEqual(@as(u32, 60), fake_dns.ttl);
 }
 
 test "rejects dns config without final fallback resolver" {
@@ -959,13 +981,27 @@ test "rejects dns config without final fallback resolver" {
         \\{
         \\  "dns": {
         \\    "servers": [
-        \\      {"resolver": "1.1.1.1", "domains": ["domain:example.com"]}
+        \\      {"resolver": "1.1.1.1", "outboundTag": "direct", "domains": ["domain:example.com"]}
         \\    ]
         \\  }
         \\}
     ;
 
     try std.testing.expectError(error.MissingDnsFallbackServer, parse(std.testing.allocator, source));
+}
+
+test "rejects dns server without outbound tag" {
+    const source =
+        \\{
+        \\  "dns": {
+        \\    "servers": [
+        \\      {"resolver": "1.1.1.1", "domains": ["domain:"]}
+        \\    ]
+        \\  }
+        \\}
+    ;
+
+    try std.testing.expectError(error.MissingDnsOutboundTag, parse(std.testing.allocator, source));
 }
 
 test "parses route IP CIDR rules" {

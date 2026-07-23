@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
 
     const command = args[1];
     if (std.mem.eql(u8, command, "version")) {
-        try stdout.print("xray-zig mvp 0.0.0\n", .{});
+        try stdout.print("xray-zig {s}\n", .{xray.version});
         return;
     }
 
@@ -54,7 +54,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "run")) {
         try xray.core.validate(&cfg);
-        var runtime: xray.core.Runtime = .{ .cfg = &cfg, .allocator = arena };
+        // Runtime-owned connection state must support individual frees. The
+        // process arena is reserved for configuration and CLI lifetime data.
+        var runtime: xray.core.Runtime = .{ .cfg = &cfg, .allocator = init.gpa };
         try runtime.run(io, stdout);
         return;
     }

@@ -12,7 +12,9 @@ pub const Error = error{
     InvalidResponseVersion,
     InvalidUuid,
     InvalidTargetDomain,
+    ClientEndOfStream,
     TlsRecordTooLarge,
+    UpstreamEndOfStream,
 };
 
 const max_initial_tls_record_len = 18 * 1024;
@@ -27,6 +29,7 @@ pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: sessio
         .vless => |vless| vless,
         .none => return error.InvalidOutboundSettings,
     };
+    logTarget(connection_id, sess.target);
 
     var upstream: session.OutboundConnection = undefined;
     connect(&upstream, outbound, settings, io) catch |err| {
@@ -114,7 +117,7 @@ fn waitResponseHeader(
 
         if (ready.first) {
             const n = try session.readAvailable(&client_reader.interface, &client_chunk);
-            if (n == 0) return error.EndOfStream;
+            if (n == 0) return error.ClientEndOfStream;
             try vision.writeUplink(upstream, traffic_state, client_chunk[0..n], io);
             try upstream.flush();
             log.trace("vless {d} response-wait uplink={d}\n", .{ traffic_state.connection_id, n });
@@ -126,10 +129,17 @@ fn waitResponseHeader(
                     error.ReadPending => break,
                     else => |e| return e,
                 };
-                if (n == 0) return error.EndOfStream;
+                if (n == 0) return error.UpstreamEndOfStream;
                 if (try response.advance(n)) return;
             }
         }
+    }
+}
+
+fn logTarget(connection_id: u32, target: session.Target) void {
+    switch (target) {
+        .address => |address| log.debug("vless {d} target={f}\n", .{ connection_id, address }),
+        .host => |host| log.debug("vless {d} target={s}:{d}\n", .{ connection_id, host.name.bytes, host.port }),
     }
 }
 

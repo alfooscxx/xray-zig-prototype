@@ -23,10 +23,10 @@ commands from this directory.
 Supported:
 
 - IPv4 and IPv6 transparent TCP `redirect` inbounds.
-- IPv4 and IPv6 FakeDNS through the local `dns` inbound.
+- Resolver-backed DNS by default, with opt-in IPv4 and IPv6 FakeDNS through the local `dns` inbound.
 - SOCKS inbound for tests and manual probes.
 - Domain, IP CIDR, and `inboundTag` routing.
-- Ordered DNS resolver rules with required `resolver` fields.
+- Ordered DNS resolver rules with required `resolver` and `outboundTag` fields.
 - VLESS over raw TCP REALITY with `xtls-rprx-vision`.
 - TLS 1.3 and TLS 1.2 with no ECH or GREASE ECH.
 - Optional `chacha20-only` REALITY policy for software-AES targets.
@@ -35,6 +35,8 @@ Supported:
 The runtime uses 1 MiB stacks, a 128-worker cap, listener backpressure, and a
 32-session VLESS/REALITY handshake limit. See
 `docs/vision-response-deadlock.md` before changing the connection lifecycle.
+The DNS inbound processes at most 16 queries concurrently. Each selected query
+uses DNS-over-TCP through its rule's `outboundTag`; see `docs/dns-servfail.md`.
 
 Missing or intentionally out of scope:
 
@@ -44,9 +46,11 @@ Missing or intentionally out of scope:
 - TUN/TProxy and iptables/ip6tables setup.
 - Server mode.
 
-Go Xray still owns production router NAT. The current MIPS artifact is
-2,235,120 bytes with MD5 `326c49769032e93f911af9f5855e801e`; it is published
-to the VPS but has not been deployed to or validated on the router.
+Redirect selects the original-destination socket option from the listener's
+bind family; see `docs/ipv6-original-destination.md`. Resolver-backed DNS sends
+each query over TCP through its selected outbound; see `docs/dns-servfail.md`.
+Runtime objects use the general-purpose allocator so completed raw-reactor
+connections are released; see `docs/raw-reactor-memory-leak.md`.
 
 ## Build And Test
 
@@ -55,6 +59,7 @@ The supported compiler is Zig 0.16.0 at `/usr/local/bin/zig`.
 ```sh
 zig build
 zig build test
+zig build e2e-dns -Doptimize=ReleaseFast
 zig build run -- check -config tests/fixtures/minimal-socks.json
 zig build run -- check -config field-config-test.json
 XRAY_BIN=/tmp/codex-xray-bin/xray XRAY_ZIG_REALITY_TRAFFIC=1 zig build e2e-reality
@@ -65,7 +70,7 @@ For REALITY, TLS, or Vision changes, run unit tests, the real-Xray e2e harness,
 and the deterministic delayed-preface field regression documented in
 `docs/vision-response-deadlock.md`.
 
-Build the router artifact with:
+Build a MIPS32r2 O32 soft-float artifact with:
 
 ```sh
 zig build -Dtarget=mips-linux-musleabi -Dcpu=mips32r2 -Doptimize=ReleaseFast --prefix zig-out-mips-release
@@ -84,7 +89,7 @@ silently ignored.
 
 Use `apply_patch` for manual edits. Do not commit build output, caches, logs, or
 Python bytecode. Keep documentation current when changing config fields,
-TLS/REALITY policy, Vision behavior, concurrency limits, or deployment status.
+TLS/REALITY policy, Vision behavior, or concurrency limits.
 
 ## Commits
 

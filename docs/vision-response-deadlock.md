@@ -2,11 +2,10 @@
 
 ## Failure Symptoms
 
-During full router cutover, direct-routing exceptions continued to work while
+During a mixed transparent-routing test, direct-routing exceptions continued to work while
 proxied HTTPS and WebSocket traffic first reported TLS failures and then timed
-out. The Zig process remained alive, the VPS accepted new REALITY sessions, and
-the router showed neither a crash nor OOM-killer evidence. This distinguished
-the failure from the earlier worker-stack and router-memory problems.
+out. The Zig process remained alive, the proxy server accepted new REALITY
+sessions, and the host showed neither a crash nor OOM-killer evidence.
 
 The same failure reproduced on the x86 workstation through the real VPS Xray
 server. Fresh Zig processes failed nondeterministically near the concurrency
@@ -100,7 +99,7 @@ response-wait deadlock: rejected clients failed immediately instead of reaching
 
 TCP inbounds now retain one accepted socket and retry scheduling every 10 ms
 while the pool is full. Remaining connections stay in the kernel listen backlog.
-The runtime cap is 128 workers, which allows about 124 established production
+The runtime cap is 128 workers, which allows about 124 established
 connections after the reactor and inbound workers; later bursts queue rather
 than reset. Capacity waits are visible at warning level.
 
@@ -129,11 +128,8 @@ fresh-process runs taking 6.55 and 6.38 seconds. The first measured run reached
 
 ## Resource Comparison
 
-Read-only router measurements with Go active showed 154 MiB total RAM, 33.9 MiB
-`MemAvailable`, 39.8 MiB Go RSS, a 33.55 MiB Go binary in `/run`, and a 2.23 MiB
-Zig binary. Retiring Go therefore releases both runtime memory and roughly
-31.3 MiB of additional tmpfs binary data. An isolated Zig allowance near 80 MiB
-is consistent with the live router accounting.
+Measurements on a 154 MiB MIPS32 target showed that an isolated Zig allowance
+near 80 MiB accommodates the 128-worker stress test.
 
 Matched x86 CPU deltas through the real server were:
 

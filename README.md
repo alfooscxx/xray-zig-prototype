@@ -19,6 +19,10 @@
 - `tests/field/`: mixed HTTPS, sustained-transfer, fragmented-WSS, and router-resource harnesses.
 - `docs/`: protocol notes and implementation plans.
 
+The current failure records are `docs/vision-response-deadlock.md`,
+`docs/dns-servfail.md`, `docs/ipv6-original-destination.md`, and
+`docs/raw-reactor-memory-leak.md`.
+
 ## Build And Test
 
 Run commands from this directory:
@@ -41,11 +45,12 @@ The real Xray REALITY harness is opt-in:
 ```sh
 XRAY_BIN=/tmp/codex-xray-bin/xray zig build e2e-reality
 XRAY_BIN=/tmp/codex-xray-bin/xray XRAY_ZIG_REALITY_TRAFFIC=1 zig build e2e-reality
+zig build e2e-dns -Doptimize=ReleaseFast
 ```
 
 The second command also sends SOCKS traffic through the Zig client to the Xray server.
 
-Field-router workloads use the staged SOCKS inbound and do not require a production cutover:
+Remote workloads use a SOCKS inbound and do not require transparent routing:
 
 ```sh
 XRAY_ZIG_SOCKS_PROXY=socks5h://192.168.1.1:21080 tests/field/http-matrix.sh
@@ -54,7 +59,7 @@ python3 tests/field/fragmented-wss.py --target-host VPS_IP --server-name VPS_IP.
 python3 tests/field/fragmented-wss.py --target-host VPS_IP --server-name VPS_IP.nip.io --clients 1 --post-connect-delay 750
 ```
 
-The WSS server is `tests/field/wss-echo-server.py`. It is a temporary sidecar and does not require restarting or reconfiguring Xray. See `docs/performance.md` for the latest router results and matched Go comparison.
+The WSS server is `tests/field/wss-echo-server.py`. It is a temporary sidecar and does not require restarting or reconfiguring Xray. See `docs/performance.md` for benchmark results and a matched Go comparison.
 The delayed command deterministically exercises the empty initial Vision frame that previously deadlocked while waiting for the VLESS response. See `docs/vision-response-deadlock.md` for symptoms, root cause, and before/after evidence.
 
 ## Current Runtime Scope
@@ -71,7 +76,8 @@ Supported:
 - REALITY certificate authentication using the derived auth key.
 - `freedom`, `blackhole`, and minimal TCP `dns` outbounds.
 - Routing by domain, IP CIDR, and inbound tag, with required `routing.defaultOutboundTag`.
-- DNS resolver selection by ordered domain rules. The final DNS rule must be `domains: ["domain:"]`.
+- DNS resolver selection by ordered domain rules. Every rule requires
+  `outboundTag`; the final rule must be `domains: ["domain:"]`.
 
 Out of scope for now:
 
@@ -88,10 +94,13 @@ The config format is explicit and narrower than Xray JSON:
 - Outbounds must have unique tags.
 - `routing.defaultOutboundTag` is required.
 - DNS servers use `resolver`, not Xray's `address`.
+- DNS servers require `outboundTag`; queries use DNS-over-TCP through that
+  outbound. A VLESS/REALITY outbound encrypts the resolver traffic without DoH.
 - DNS rules are evaluated top to bottom; first matching `domains` rule wins.
-- FakeDNS uses `ipPool` for A answers and `ipPool6` for AAAA answers. Their defaults are `198.18.0.0/15` and `fc00::/18`.
+- FakeDNS is opt-in through `dns.fakeDns`. Without it, A and AAAA queries are forwarded to the selected resolver.
+- When enabled, FakeDNS uses `ipPool` for A answers and `ipPool6` for AAAA answers. Their defaults are `198.18.0.0/15` and `fc00::/18`.
 - VLESS REALITY users may set `flow: "xtls-rprx-vision"`.
-- REALITY `cipherPolicy` defaults to `"firefox"`. Set it to `"chacha20-only"` on software-AES targets such as the field MIPS32 router. This changes the advertised cipher-suite fingerprint and requires server-side ChaCha20 support, but still offers TLS 1.3 and TLS 1.2 and never offers ECH.
+- REALITY `cipherPolicy` defaults to `"firefox"`. Set it to `"chacha20-only"` on software-AES targets. This changes the advertised cipher-suite fingerprint and requires server-side ChaCha20 support, but still offers TLS 1.3 and TLS 1.2 and never offers ECH.
 - `redirect` is the supported transparent inbound protocol; `dokodemo-door` is not accepted.
 
 `field-config-test.json` is a real-server client fixture for the current native API. `field-config-test-server.json` records the matching Xray server-side config used for interoperability testing.
@@ -106,9 +115,12 @@ zig fmt src tests
 
 Keep tests close to the module being changed. For transport or Vision behavior, run both `zig build test` and the real Xray e2e harness with `XRAY_ZIG_REALITY_TRAFFIC=1`.
 
-Production and router performance must be measured with `-Doptimize=ReleaseFast`; the default Debug build is intentionally not optimized. See `docs/performance.md` for the current real-server CPU, throughput, latency, and memory baseline.
+For DNS changes, run `zig build e2e-dns -Doptimize=ReleaseFast`. The harness
+verifies bounded concurrent DNS-over-TCP through explicit outbound dispatch.
 
-Build the field MIPS32r2 O32 soft-float artifact with:
+Performance must be measured with `-Doptimize=ReleaseFast`; the default Debug build is intentionally not optimized. See `docs/performance.md` for the current real-server CPU, throughput, latency, and memory baseline.
+
+Build a MIPS32r2 O32 soft-float artifact with:
 
 ```sh
 zig build -Dtarget=mips-linux-musleabi -Dcpu=mips32r2 -Doptimize=ReleaseFast --prefix zig-out-mips-release
@@ -118,4 +130,4 @@ mips-linux-gnu-strip --strip-all -o zig-out-mips/bin/xray-zig zig-out-mips-relea
 
 Verify `readelf -A zig-out-mips/bin/xray-zig` reports MIPS32r2 and soft float before publishing it.
 
-The executable creates a bounded Zig `Io.Threaded` runtime rather than using the standard unlimited concurrent pool. Worker stacks are 1 MiB and at most 128 concurrent workers are allowed. Each bidirectional bridge uses one poll-driven connection worker. Full pools apply listener backpressure instead of resetting accepted clients, and at most 32 VLESS/REALITY handshakes run at once to bound CPU and ClientHello bursts. This is required on the field MIPS router: Zig's default 16 MiB stack reservation exhausted the 32-bit address space, while the earlier two-worker bridge saturated a 64-worker pool at about 30 live connections. A 512 KiB stack corrupted MIPS TLS workers under concurrent load and is not supported.
+The executable creates a bounded Zig `Io.Threaded` runtime rather than using the standard unlimited concurrent pool. Worker stacks are 1 MiB and at most 128 concurrent workers are allowed. Each bidirectional bridge uses one poll-driven connection worker. Full pools apply listener backpressure instead of resetting accepted clients, and at most 32 VLESS/REALITY handshakes run at once to bound CPU and ClientHello bursts. The limits are important on 32-bit targets: Zig's default 16 MiB stack reservation can exhaust the address space, while the earlier two-worker bridge saturated a 64-worker pool at about 30 live connections. A 512 KiB stack corrupted MIPS TLS workers under concurrent load and is not supported.

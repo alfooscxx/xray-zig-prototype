@@ -26,7 +26,10 @@ pub const Runtime = struct {
         const dispatch_interface = self.dispatcher();
 
         var fake_dns_store: ?fakedns.Store = if (self.cfg.dns) |dns_cfg|
-            try fakedns.Store.init(self.allocator, dns_cfg.fake_dns)
+            if (dns_cfg.fake_dns) |fake_dns_cfg|
+                try fakedns.Store.init(self.allocator, fake_dns_cfg)
+            else
+                null
         else
             null;
         defer if (fake_dns_store) |*store| store.deinit();
@@ -50,8 +53,7 @@ pub const Runtime = struct {
             }
             if (std.mem.eql(u8, inbound.protocol, "dns")) {
                 const dns_cfg = self.cfg.dns orelse return error.MissingDnsConfig;
-                const store = if (fake_dns_store) |*fake_dns| fake_dns else return error.MissingDnsConfig;
-                try group.concurrent(io, runDnsInbound, .{ inbound, dns_cfg, store, io, log_writer, &log_mutex });
+                try group.concurrent(io, runDnsInbound, .{ inbound, dns_cfg, if (fake_dns_store) |*store| store else null, dispatch_interface, io, log_writer, &log_mutex });
                 continue;
             }
             return error.UnsupportedInboundProtocol;
@@ -68,7 +70,10 @@ pub const Runtime = struct {
     }
 
     pub fn dispatch(self: *Runtime, client: net.Stream, sess: session.Session, preface: session.Preface, io: Io) !void {
-        const outbound = try routing.selectOutbound(self.cfg, sess);
+        const outbound = if (sess.outbound_tag) |tag|
+            self.cfg.findOutbound(tag) orelse return error.MissingOutboundTag
+        else
+            try routing.selectOutbound(self.cfg, sess);
         const reactor = self.reactor orelse return error.RuntimeNotRunning;
         if (std.mem.eql(u8, outbound.protocol, "freedom")) {
             try freedom.handle(client, sess, preface, reactor, io);
@@ -108,8 +113,8 @@ fn runRedirectInbound(inbound: config.Inbound, dispatcher: session.Dispatcher, f
     };
 }
 
-fn runDnsInbound(inbound: config.Inbound, dns_cfg: config.DnsConfig, fake_dns: *fakedns.Store, io: Io, log_writer: *Io.Writer, log_mutex: *Io.Mutex) Io.Cancelable!void {
-    dns_inbound.run(inbound, dns_cfg, fake_dns, io, log_writer, log_mutex) catch |err| switch (err) {
+fn runDnsInbound(inbound: config.Inbound, dns_cfg: config.DnsConfig, fake_dns: ?*fakedns.Store, dispatcher: session.Dispatcher, io: Io, log_writer: *Io.Writer, log_mutex: *Io.Mutex) Io.Cancelable!void {
+    dns_inbound.run(inbound, dns_cfg, fake_dns, dispatcher, io, log_writer, log_mutex) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => return,
     };
@@ -158,6 +163,17 @@ pub fn validate(cfg: *const config.Config) !void {
 
     for (cfg.routing.rules) |rule| {
         if (cfg.findOutbound(rule.outbound_tag) == null) return error.MissingOutboundTag;
+    }
+
+    if (cfg.dns) |dns_cfg| {
+        for (dns_cfg.servers) |server| {
+            const outbound = cfg.findOutbound(server.outbound_tag) orelse return error.MissingOutboundTag;
+            if (!std.mem.eql(u8, outbound.protocol, "freedom") and
+                !std.mem.eql(u8, outbound.protocol, "vless"))
+            {
+                return error.UnsupportedDnsResolverOutbound;
+            }
+        }
     }
 }
 
@@ -334,7 +350,7 @@ test "validates dns inbound with configured upstream" {
         \\{
         \\  "dns": {
         \\    "servers": [
-        \\      {"resolver": "1.1.1.1:53", "domains": ["domain:"]}
+        \\      {"resolver": "1.1.1.1:53", "outboundTag": "direct", "domains": ["domain:"]}
         \\    ]
         \\  },
         \\  "inbounds": [
@@ -359,7 +375,7 @@ test "validates blackhole and dns outbounds" {
         \\{
         \\  "dns": {
         \\    "servers": [
-        \\      {"resolver": "1.1.1.1", "domains": ["domain:"]}
+        \\      {"resolver": "1.1.1.1", "outboundTag": "proxy", "domains": ["domain:"]}
         \\    ]
         \\  },
         \\  "inbounds": [
@@ -383,6 +399,31 @@ test "validates blackhole and dns outbounds" {
     defer cfg.deinit();
 
     try validate(&cfg);
+}
+
+test "rejects dns resolver routed through dns outbound" {
+    const source =
+        \\{
+        \\  "dns": {
+        \\    "servers": [
+        \\      {"resolver": "1.1.1.1", "outboundTag": "dns-out", "domains": ["domain:"]}
+        \\    ]
+        \\  },
+        \\  "inbounds": [
+        \\    {"tag": "dns-in", "listen": "127.0.0.1", "port": 1053, "protocol": "dns"}
+        \\  ],
+        \\  "outbounds": [
+        \\    {"tag": "direct", "protocol": "freedom"},
+        \\    {"tag": "dns-out", "protocol": "dns"}
+        \\  ],
+        \\  "routing": {"defaultOutboundTag": "direct"}
+        \\}
+    ;
+
+    var cfg = try config.parse(std.testing.allocator, source);
+    defer cfg.deinit();
+
+    try std.testing.expectError(error.UnsupportedDnsResolverOutbound, validate(&cfg));
 }
 
 test "rejects missing explicit default outbound tag" {

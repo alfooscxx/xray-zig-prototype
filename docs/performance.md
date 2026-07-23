@@ -26,7 +26,7 @@ The Zig ReleaseFast executable was 8.1 MiB; the stripped Xray executable was 35 
 
 ## Reproduction
 
-Build and verify the production client from `xray-zig/`:
+Build and verify an optimized client from `xray-zig/`:
 
 ```sh
 zig build test -Doptimize=ReleaseFast
@@ -37,9 +37,9 @@ Wrap the field config's `proxy` outbound in a local SOCKS inbound, remove routin
 
 The default Zig build mode is Debug and is not representative of router performance.
 
-## 2026-07-22 MIPS32 Router Field Result
+## 2026-07-22 MIPS32 Field Result
 
-The production router is big-endian MIPS32r2 O32 soft-float with 154 MiB RAM. The old Go Xray remained active, and the Zig client ran side-by-side on a temporary SOCKS inbound without changing firewall rules. Both clients used the same remote REALITY/Vision server.
+The test target is big-endian MIPS32r2 O32 soft-float with 154 MiB RAM. Go Xray and the Zig client ran side-by-side, with Zig on a temporary SOCKS inbound. Both clients used the same remote REALITY/Vision server.
 
 An 8 MiB byte range from `cdn.kernel.org` produced this same-origin comparison:
 
@@ -50,7 +50,7 @@ An 8 MiB byte range from `cdn.kernel.org` produced this same-origin comparison:
 
 The Vision framing fix reduced Zig's CPU cost from the earlier 2.23 CPU s/MiB result to 1.61 CPU s/MiB when the server kept the response inside outer TLS. A separate Cloudflare trace entered direct copy in both directions, but the kernel.org workload did not: aggregate instrumentation observed 8.41 MiB framed and zero downlink direct bytes. Xray's server-side direct-copy transition is therefore origin- and read-boundary-dependent.
 
-The final isolated build returned HTTP 200 through the real server for `example.com`, `cloudflare.com`, and jsDelivr. A final 4 MiB CDN range completed at 0.568 MiB/s. These tests validate side-by-side operation only; the production proxy and iptables/ip6tables configuration were not replaced.
+The final isolated build returned HTTP 200 through the real server for `example.com`, `cloudflare.com`, and jsDelivr. A final 4 MiB CDN range completed at 0.568 MiB/s.
 
 ## MIPS Cipher Mitigation
 
@@ -77,15 +77,15 @@ Zig consumed about 154% of one CPU over the 3.00 s concurrent run, compared with
 
 The tradeoff is fingerprint fidelity: removing AES suites no longer produces Firefox's normal cipher-suite list. The default remains `cipherPolicy: "firefox"`; the MIPS field fixture opts into `"chacha20-only"` explicitly.
 
-## Router Concurrency Fix
+## Concurrency Fix
 
-The first production cutover exposed a runtime limit that the isolated throughput tests did not: Zig 0.16's default `Io.Threaded` pool created permanent workers with 16 MiB virtual stacks. Mixed LAN traffic reached 80 threads, 1.3 GiB virtual size, and 23.4 MiB RSS; new accepts then stalled. An initial 256 KiB stack experiment was too small for the MIPS TLS/crypto call path and exited under four streams.
+A mixed transparent-routing workload exposed a runtime limit that the isolated throughput tests did not: Zig 0.16's default `Io.Threaded` pool created permanent workers with 16 MiB virtual stacks. The test reached 80 threads, 1.3 GiB virtual size, and 23.4 MiB RSS; new accepts then stalled. An initial 256 KiB stack experiment was too small for the MIPS TLS/crypto call path and exited under four streams.
 
-The first full-LAN retry then reached the 64-worker ceiling within one minute. Each live transparent connection uses one handler/downlink worker and one uplink worker, so the old limit admitted only about 30 simultaneous connections. The VPS showed about 65 established sessions from the field router's apparent WAN address, requiring more than 130 workers before allowing for bursts.
+The next mixed-traffic test reached the 64-worker ceiling within one minute. Each live transparent connection used one handler/downlink worker and one uplink worker, so the old limit admitted only about 30 simultaneous connections. About 65 established sessions were observed, requiring more than 130 workers before allowing for bursts.
 
 The bridge now polls both sockets and drains both directions from one connection worker. The runtime uses 1 MiB stacks and later moved from this initial 96-worker revision to a 128-worker limit with listener backpressure. Workers are created on demand. Both 256 KiB and 512 KiB stacks are unsupported: 256 KiB exited under earlier four-stream MIPS TLS load, while 512 KiB left downlink workers corrupted and stalled during a 16-stream field test.
 
-With Go still serving production traffic, the 1 MiB/64-worker revision produced:
+The 1 MiB/64-worker revision produced:
 
 | Isolated workload | Throughput | Process CPU | CPU s/MiB | RSS after test | Threads | Virtual size |
 |---|---:|---:|---:|---:|---:|---:|
@@ -93,11 +93,11 @@ With Go still serving production traffic, the 1 MiB/64-worker revision produced:
 | Four concurrent 4 MiB transparent ranges, workstation-only rule | 5.895 MiB/s | not sampled | not sampled | 8.07 MiB | 16 | 22.0 MiB |
 | Sixteen concurrent 1 MiB SOCKS ranges | 2.414 MiB/s | 7.98 s | 0.499 | 15.49 MiB | 37 | 48.45 MiB |
 
-The workstation-only transparent rules were removed after testing. The router was rolled back to Go Xray and the staged Zig process was stopped, so these results validate the fix but do not claim that production replacement is complete.
+The workstation-only transparent rules were removed after testing.
 
 ## Interactive Traffic Regression
 
-A later full-LAN cutover showed that fixed-address HTTPS probes were insufficient: general interactive traffic stopped, including existing WebSocket sessions. The one-worker Vision uplink assembled a partial inner TLS record by synchronously reading until the full declared record length was present. While blocked there, the same worker could not service downstream data.
+A later mixed-traffic test showed that fixed-address HTTPS probes were insufficient: general interactive traffic stopped, including existing WebSocket sessions. The one-worker Vision uplink assembled a partial inner TLS record by synchronously reading until the full declared record length was present. While blocked there, the same worker could not service downstream data.
 
 The uplink is now an incremental state machine. It reads one available fragment, preserves `pending_len`, and returns to the bidirectional poll loop until the record is complete. A later `readAvailable` fix also prevents an already-buffered client request from triggering a second blocking socket read before the bridge can service downlink traffic.
 
@@ -111,9 +111,9 @@ The corrected binary was staged beside Go Xray without changing PREROUTING and t
 | Eight fragmented WSS sessions | 800/800 round trips in 18 s |
 | Sixteen fragmented WSS sessions | 1600/1600 round trips in 19 s |
 
-The WSS harness used a TLS WebSocket echo endpoint on the VPS, reached through the production Xray server. After the ClientHello, the client split every encrypted write into 7-byte chunks with 1 ms spacing. The endpoint confirmed every successful HTTP upgrade and frame count. One earlier uninstrumented eight-client batch completed seven clients and timed out one upgrade; that timeout did not reproduce across the following 24 instrumented clients and remains a residual field-test risk.
+The WSS harness used a TLS WebSocket echo endpoint reached through an Xray server. After the ClientHello, the client split every encrypted write into 7-byte chunks with 1 ms spacing. The endpoint confirmed every successful HTTP upgrade and frame count. One earlier uninstrumented eight-client batch completed seven clients and timed out one upgrade; that timeout did not reproduce across the following 24 instrumented clients and remains a residual field-test risk.
 
-After the CDN burst, the Zig worker pool retained 37 threads at 19.6 MiB RSS and 49.6 MiB virtual size. Running Go and Zig together left only about 12 MiB free excluding buffers, so staged tests must be short and Zig must be stopped afterward. Stopping Zig restored that figure to about 31 MiB. Go Xray remained active, the firewall stayed on `XRAY_REDIR`/`XRAY_DNS_REDIR`, and this test did not constitute a production cutover.
+After the CDN burst, the Zig worker pool retained 37 threads at 19.6 MiB RSS and 49.6 MiB virtual size.
 
 ### Empty-Preface Response Deadlock
 
@@ -140,9 +140,9 @@ bursts from leaving upstream TCP payload unacknowledged. Three final immediate
 `docs/vision-response-deadlock.md` for the complete evidence and matched CPU
 results.
 
-## 2026-07-23 Expanded Router Validation
+## 2026-07-23 Expanded MIPS32 Validation
 
-The expanded field test kept Go Xray active on production NAT and ran Zig on staged SOCKS port `21080` through the real VPS Xray server. The trace MIPS binary had MD5 `274e9965eb6f245b04139eef3e4b6d24`. CPU values are process user plus system jiffies; RSS and FD values are sampled peaks. Router control time is included in the sampling window, but both proxy processes are effectively idle outside each workload.
+The expanded field test ran Zig on a SOCKS inbound through a real Xray server. CPU values are process user plus system jiffies; RSS and FD values are sampled peaks. Both proxy processes were effectively idle outside each workload.
 
 The mixed HTTPS matrix used 8 requests each to IANA, Cloudflare, kernel.org/Fastly, and jsDelivr at concurrency 16:
 
@@ -178,9 +178,7 @@ Routing and FakeDNS field checks passed:
 - FakeDNS returned stable `198.18.0.0/15` A and `fc00::/18` AAAA mappings.
 - A temporary workstation-only rule sent `198.18.0.1:443` to staged redirect port `22345`; reverse mapping recovered `example.com` and completed HTTPS through REALITY. The exact rule was then removed.
 
-## Superseded Release Candidate
-
-The pre-deadlock-fix non-trace MIPS32r2 O32 soft-float ReleaseFast candidate was 2,227,376 bytes with MD5 `a7edbf53f05426f847abb727bfa2e256`. It must not be cut over again. Go still owns production NAT.
+## Pre-Deadlock-Fix Validation
 
 Reduced acceptance on this exact binary passed:
 
@@ -189,7 +187,7 @@ Reduced acceptance on this exact binary passed:
 - Fragmented WSS: 8/8 clients and 400/400 frames in 9.54 seconds.
 - Domain-direct, private-IP direct, and FakeDNS A/AAAA probes.
 
-Across the reduced HTTPS plus transfer sample, peak RSS was 7.35 MiB, peak threads 14, and peak FDs 23. This confirms trace logging and its retained worker activity materially inflate staged memory measurements; production sizing should use the non-trace ReleaseFast binary.
+Across the reduced HTTPS plus transfer sample, peak RSS was 7.35 MiB, peak threads 14, and peak FDs 23. This confirms trace logging and its retained worker activity materially inflate memory measurements; sizing should use the non-trace ReleaseFast binary.
 
 Reproduce the field workloads from the workstation:
 
@@ -199,22 +197,6 @@ XRAY_ZIG_SOCKS_PROXY=socks5h://192.168.1.1:21080 tests/field/sustained-transfer.
 python3 tests/field/fragmented-wss.py --target-host VPS_IP --server-name VPS_IP.nip.io
 ```
 
-`tests/field/router-sample.sh` is installed on the router for `start`, `summary`, and `stop` sampling commands. Temporary WSS sidecars and diagnostic NAT rules must be stopped or removed after each field run.
-
-## Current Workstation-Validated Candidate
-
-The post-concurrency-fix MIPS32r2 O32 soft-float ReleaseFast binary is 2,235,120
-bytes with MD5 `326c49769032e93f911af9f5855e801e`. Its compressed payload and configs
-are published in the existing VPS artifact directory; decompressing the remote
-payload produces the same binary checksum. It has not been deployed to the
-router and has not passed router-side validation yet.
-
-Acceptance completed before publishing:
-
-- `zig build test -Doptimize=ReleaseFast`.
-- Local real-Xray normal REALITY and Vision e2e traffic.
-- Three immediate 128-client real-server WSS runs at 128/128.
-- The deterministic 750 ms delayed-preface regression.
-- An 80-client run after the delayed-preface test, at 80/80.
-- Matched Zig/Go CPU and sustained-transfer comparisons recorded in
-  `docs/vision-response-deadlock.md`.
+`tests/field/router-sample.sh` provides `start`, `summary`, and `stop` sampling
+commands. Temporary WSS sidecars and diagnostic NAT rules must be stopped or
+removed after each field run.

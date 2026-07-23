@@ -1,9 +1,9 @@
 #!/bin/sh
 set -eu
 
-target_pidfile="${XRAY_ZIG_PIDFILE:-/run/xray-zig/xray-zig.pid}"
-sampler_pidfile="${XRAY_ZIG_SAMPLER_PIDFILE:-/run/xray-zig-field-sampler.pid}"
-output="${XRAY_ZIG_SAMPLE_OUTPUT:-/run/xray-zig-field-samples.tsv}"
+target_pidfile="${XRAY_ZIG_PIDFILE:-/tmp/xray-zig.pid}"
+sampler_pidfile="${XRAY_ZIG_SAMPLER_PIDFILE:-/tmp/xray-zig-field-sampler.pid}"
+output="${XRAY_ZIG_SAMPLE_OUTPUT:-/tmp/xray-zig-field-samples.tsv}"
 interval="${XRAY_ZIG_SAMPLE_INTERVAL:-1}"
 
 sampler_alive() {

@@ -44,7 +44,7 @@ Important interop fix: REALITY reads must return already-decrypted buffered TLS 
 
 Vision framing must preserve inner TLS record boundaries until `CommandDirect`. The initial payload reader reads exactly the five-byte TLS header and its declared payload, without consuming bytes from a following record. The uplink pump likewise assembles complete TLS records before passing them to the Vision writer. This is required because Xray only emits `CommandDirect` when its TLS filter receives complete application-data records; arbitrary TCP read fragments can leave the connection on the expensive outer-TLS path.
 
-Record assembly must remain non-blocking with respect to the opposite direction. `forwardUplinkOnce` reads at most one available fragment, stores its pending length, and returns to the socket poll loop when the record is incomplete. The earlier loop that synchronously waited for the remaining record bytes blocked downstream handling and caused broad interactive-traffic failures during router cutovers, including WebSocket interruption.
+Record assembly must remain non-blocking with respect to the opposite direction. `forwardUplinkOnce` reads at most one available fragment, stores its pending length, and returns to the socket poll loop when the record is incomplete. The earlier loop that synchronously waited for the remaining record bytes blocked downstream handling and caused broad interactive-traffic failures, including WebSocket interruption.
 
 The client-side TCP pump uses short `readVec` operations while assembling those records. Zig 0.16's `readSliceShort` fills the requested slice until EOF, so using it with a 16 KiB buffer stalls post-handshake TLS records on persistent HTTPS connections.
 

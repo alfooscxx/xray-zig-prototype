@@ -3,6 +3,7 @@
     "servers": [
       {
         "resolver": "1.1.1.1",
+        "outboundTag": "proxy",
         "domains": [
           "domain:"
         ]

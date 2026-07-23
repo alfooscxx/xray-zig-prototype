@@ -20,8 +20,17 @@ pub const Error = error{
     UnsupportedListenAddress,
 };
 
+const AddressFamily = enum {
+    ip4,
+    ip6,
+};
+
 pub fn run(inbound: config.Inbound, dispatcher: session.Dispatcher, fake_dns: ?*fakedns.Store, io: Io, log_writer: *Io.Writer, log_mutex: *Io.Mutex) !void {
     var address = try bindAddress(inbound.listen, inbound.port);
+    const address_family: AddressFamily = switch (address) {
+        .ip4 => .ip4,
+        .ip6 => .ip6,
+    };
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
     var group: Io.Group = .init;
@@ -41,7 +50,7 @@ pub fn run(inbound: config.Inbound, dispatcher: session.Dispatcher, fake_dns: ?*
         };
         var capacity_warned = false;
         while (true) {
-            group.concurrent(io, handleConnection, .{ stream, dispatcher, inbound.tag, fake_dns, io }) catch {
+            group.concurrent(io, handleConnection, .{ stream, dispatcher, inbound.tag, fake_dns, address_family, io }) catch {
                 if (!capacity_warned) {
                     log.warn("redirect inbound at worker capacity; queueing connection\n", .{});
                     capacity_warned = true;
@@ -61,10 +70,13 @@ fn bindAddress(listen: []const u8, port: u16) !net.IpAddress {
     return net.IpAddress.parse(listen, port) catch error.UnsupportedListenAddress;
 }
 
-fn handleConnection(stream: net.Stream, dispatcher: session.Dispatcher, inbound_tag: ?[]const u8, fake_dns: ?*fakedns.Store, io: Io) Io.Cancelable!void {
+fn handleConnection(stream: net.Stream, dispatcher: session.Dispatcher, inbound_tag: ?[]const u8, fake_dns: ?*fakedns.Store, address_family: AddressFamily, io: Io) Io.Cancelable!void {
     defer stream.close(io);
 
-    const target = originalDestination(stream) catch return;
+    const target = originalDestination(stream, address_family) catch |err| {
+        log.warn("redirect inbound {s} original destination failed: {s}\n", .{ inbound_tag orelse "-", @errorName(err) });
+        return;
+    };
 
     if (fake_dns) |store| {
         if (store.lookup(target, io)) |domain| {
@@ -98,13 +110,12 @@ fn handleConnection(stream: net.Stream, dispatcher: session.Dispatcher, inbound_
     };
 }
 
-pub fn originalDestination(stream: net.Stream) !net.IpAddress {
+fn originalDestination(stream: net.Stream, address_family: AddressFamily) !net.IpAddress {
     if (builtin.os.tag != .linux) return error.RedirectRequiresLinux;
 
-    return originalDestination4(stream) catch |ip4_err| switch (ip4_err) {
-        error.OriginalDestinationUnavailable,
-        error.UnsupportedOriginalDestination,
-        => originalDestination6(stream),
+    return switch (address_family) {
+        .ip4 => originalDestination4(stream),
+        .ip6 => originalDestination6(stream),
     };
 }
 

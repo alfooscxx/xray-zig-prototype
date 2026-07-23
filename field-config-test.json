@@ -56,10 +56,6 @@
     {
       "tag": "block",
       "protocol": "blackhole"
-    },
-    {
-      "tag": "dns-out",
-      "protocol": "dns"
     }
   ],
   "dns": {
@@ -71,6 +67,7 @@
     "servers": [
       {
         "resolver": "77.88.8.8",
+        "outboundTag": "direct",
         "domains": [
           "domain:ru",
           "domain:su",
@@ -83,6 +80,7 @@
       },
       {
         "resolver": "8.8.8.8",
+        "outboundTag": "proxy",
         "domains": [
           "domain:"
         ]
@@ -92,10 +90,6 @@
   "routing": {
     "defaultOutboundTag": "proxy",
     "rules": [
-      {
-        "inboundTag": ["dns-in"],
-        "outboundTag": "dns-out"
-      },
       {
         "domain": [
           "domain:ru",

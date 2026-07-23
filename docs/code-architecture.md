@@ -13,9 +13,15 @@ This document describes how the Zig client is organized and where protocol behav
 
 The runtime intentionally keeps protocol parsing close to the protocol module. Shared code should live in `src/net/`, `src/dns/`, or a protocol-owned helper only when more than one module needs it.
 
+Configuration and CLI data use the process-lifetime arena. Runtime-owned
+objects that are destroyed individually, including raw-reactor connections,
+use the thread-safe general-purpose allocator. Do not pass an arena allocator
+to the raw reactor: each connection contains two 16 KiB buffers, and arena
+`destroy` is a no-op.
+
 ## Runtime Concurrency
 
-`src/main.zig` owns a bounded `Io.Threaded` instance with 1 MiB worker stacks and a 128-worker concurrent limit. Do not replace it with `init.io`: Zig 0.16's default concurrent pool is unlimited and reserves 16 MiB per worker, which exhausted the field router's 32-bit virtual address space under normal transparent traffic. Smaller 256 KiB and 512 KiB stacks are unsafe in the MIPS TLS/crypto path.
+`src/main.zig` owns a bounded `Io.Threaded` instance with 1 MiB worker stacks and a 128-worker concurrent limit. Do not replace it with `init.io`: Zig 0.16's default concurrent pool is unlimited and reserves 16 MiB per worker, which exhausted a 32-bit target's virtual address space under mixed transparent traffic. Smaller 256 KiB and 512 KiB stacks are unsafe in the MIPS TLS/crypto path.
 
 Each accepted TCP connection gets one handler worker. Bidirectional plain, REALITY, and Vision bridges poll the client and upstream sockets from that handler, then drain any userspace reader/TLS buffers before polling again. This keeps a live connection to one worker. If the pool limit is reached, a TCP inbound holds one accepted stream, retries scheduling every 10 ms, and leaves later connections in the kernel listen backlog. It must not run the handler synchronously on the accept worker because a long-lived connection would stall that listener indefinitely.
 
@@ -29,9 +35,9 @@ Important rules:
 
 - `routing.defaultOutboundTag` is required.
 - Outbounds must be tagged.
-- DNS server entries require `resolver`.
+- DNS server entries require `resolver` and `outboundTag`.
 - DNS domain selection is ordered and first-match wins.
-- The last DNS server rule is the fallback and must be `domains: ["domain:"]`.
+- The last DNS server rule is the catch-all and must be `domains: ["domain:"]`.
 - VLESS REALITY supports only raw TCP security `reality`.
 
 Keep parser tests next to parser changes so fixture behavior and validation errors stay visible.
@@ -50,7 +56,7 @@ If no rule matches, `routing.defaultOutboundTag` is used.
 
 ## DNS
 
-`src/dns/protocol.zig` handles DNS wire parsing and A/AAAA response writing. `src/dns/fakedns.zig` owns independent IPv4 and IPv6 FakeDNS pools and reverse mappings. `src/dns/upstream.zig` owns resolver address parsing.
+`src/dns/protocol.zig` handles DNS wire parsing and A/AAAA response writing. `src/dns/fakedns.zig` owns the optional independent IPv4 and IPv6 FakeDNS pools and reverse mappings. Without `dns.fakeDns`, the DNS inbound selects the first matching resolver rule, frames the query as DNS-over-TCP, and dispatches it through that rule's `outboundTag`. A `vless` tag therefore protects DNS with REALITY without exposing direct DoH. `src/dns/upstream.zig` owns resolver address parsing.
 
 DNS server selection should not be implemented in protocol code. Protocol code should ask the DNS config/upstream layer for the selected resolver based on the queried domain.
 
@@ -125,4 +131,4 @@ For real remote probes that cannot use transparent `redirect` without root netwo
 - `wss-echo-server.py` is the dependency-free temporary TLS/WebSocket sidecar.
 - `router-sample.sh` records process jiffies, RSS, threads, FDs, sockets, and reclaimable memory, with `start`, `summary`, and `stop` modes.
 
-Keep production firewall changes out of these harnesses. Any reverse-FakeDNS or transparent comparison rule must be exact, workstation-scoped, inserted manually for one probe, and deleted immediately afterward.
+Keep persistent firewall changes out of these harnesses. Any reverse-FakeDNS or transparent comparison rule must be exact, workstation-scoped, inserted manually for one probe, and deleted immediately afterward.
