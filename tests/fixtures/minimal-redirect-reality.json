@@ -1,0 +1,54 @@
+{
+  "inbounds": [
+    {
+      "tag": "redirect-in",
+      "listen": "127.0.0.1",
+      "port": 12345,
+      "protocol": "redirect"
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "proxy.example.com",
+            "port": 443,
+            "users": [
+              {
+                "id": "00000000-0000-0000-0000-000000000000"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "www.example.com",
+          "publicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "shortId": "0123456789abcdef",
+          "fingerprint": "firefox"
+        }
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ],
+  "routing": {
+    "defaultOutboundTag": "proxy",
+    "rules": [
+      {
+        "domain": [
+          "domain:google.com"
+        ],
+        "outboundTag": "direct"
+      }
+    ]
+  }
+}

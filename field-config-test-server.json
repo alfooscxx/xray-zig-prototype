@@ -1,0 +1,52 @@
+{
+  "log": {
+    "loglevel": "error"
+  },
+  "inbounds": [
+    {
+      "tag": "vless-reality-in",
+      "listen": "::",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "decryption": "none",
+        "clients": [
+          {
+            "id": "6cafa718-ebe3-46fa-aeef-542f4f160c93",
+            "flow": "xtls-rprx-vision"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "marktplaats.nl:443",
+          "xver": 0,
+          "serverNames": [
+            "marktplaats.nl"
+          ],
+          "privateKey": "EM5I_iZS-saBahPw247vFWLtLQWKcwFehwA5qiPv3XE",
+          "shortIds": [
+            "ce5144e14334af42"
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls"
+        ]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ]
+}

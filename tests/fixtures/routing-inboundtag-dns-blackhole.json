@@ -1,0 +1,60 @@
+{
+  "dns": {
+    "servers": [
+      {
+        "resolver": "1.1.1.1",
+        "domains": [
+          "domain:"
+        ]
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "port": 1080,
+      "protocol": "socks"
+    },
+    {
+      "tag": "dns-in",
+      "listen": "127.0.0.1",
+      "port": 1053,
+      "protocol": "dns"
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    },
+    {
+      "tag": "dns-out",
+      "protocol": "dns"
+    }
+  ],
+  "routing": {
+    "defaultOutboundTag": "proxy",
+    "rules": [
+      {
+        "inboundTag": [
+          "dns-in"
+        ],
+        "outboundTag": "dns-out"
+      },
+      {
+        "inboundTag": [
+          "socks-in"
+        ],
+        "domain": [
+          "domain:block.example"
+        ],
+        "outboundTag": "block"
+      }
+    ]
+  }
+}

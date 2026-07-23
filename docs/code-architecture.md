@@ -1,0 +1,128 @@
+# Code Architecture
+
+This document describes how the Zig client is organized and where protocol behavior belongs.
+
+## Runtime Flow
+
+1. `src/main.zig` parses CLI arguments and loads a JSON config for `check` or `run`.
+2. `src/config/mod.zig` parses the native config subset into typed structs and validates cross-reference constraints such as outbound tags and routing defaults.
+3. `src/core/mod.zig` builds the runtime from the parsed config, starts inbounds, and owns the dispatcher used by inbound handlers.
+4. Inbounds convert accepted sockets into `net.Session` values and call `session.Dispatcher`.
+5. The dispatcher uses `src/routing/mod.zig` to select an outbound tag, then invokes the matching outbound implementation.
+6. Outbounds connect to the target or proxy server and bridge traffic until EOF, cancellation, or an error.
+
+The runtime intentionally keeps protocol parsing close to the protocol module. Shared code should live in `src/net/`, `src/dns/`, or a protocol-owned helper only when more than one module needs it.
+
+## Runtime Concurrency
+
+`src/main.zig` owns a bounded `Io.Threaded` instance with 1 MiB worker stacks and a 128-worker concurrent limit. Do not replace it with `init.io`: Zig 0.16's default concurrent pool is unlimited and reserves 16 MiB per worker, which exhausted the field router's 32-bit virtual address space under normal transparent traffic. Smaller 256 KiB and 512 KiB stacks are unsafe in the MIPS TLS/crypto path.
+
+Each accepted TCP connection gets one handler worker. Bidirectional plain, REALITY, and Vision bridges poll the client and upstream sockets from that handler, then drain any userspace reader/TLS buffers before polling again. This keeps a live connection to one worker. If the pool limit is reached, a TCP inbound holds one accepted stream, retries scheduling every 10 ms, and leaves later connections in the kernel listen backlog. It must not run the handler synchronously on the accept worker because a long-lived connection would stall that listener indefinitely.
+
+Inbound startup and error messages share one buffered writer, protected by an `Io.Mutex`. Any new concurrent log site must use the same mutex.
+
+## Config Layer
+
+`src/config/mod.zig` is the only place that should accept JSON field names. It should reject unsupported modes early with typed errors. The current config is a native API, not Xray compatibility mode.
+
+Important rules:
+
+- `routing.defaultOutboundTag` is required.
+- Outbounds must be tagged.
+- DNS server entries require `resolver`.
+- DNS domain selection is ordered and first-match wins.
+- The last DNS server rule is the fallback and must be `domains: ["domain:"]`.
+- VLESS REALITY supports only raw TCP security `reality`.
+
+Keep parser tests next to parser changes so fixture behavior and validation errors stay visible.
+
+## Core And Routing
+
+`src/core/mod.zig` validates runtime combinations that require multiple config sections. It also wires the inbound dispatcher to outbound handlers.
+
+`src/routing/mod.zig` evaluates rules in config order. Supported matchers are:
+
+- `inboundTag`
+- `domain`
+- `ip`
+
+If no rule matches, `routing.defaultOutboundTag` is used.
+
+## DNS
+
+`src/dns/protocol.zig` handles DNS wire parsing and A/AAAA response writing. `src/dns/fakedns.zig` owns independent IPv4 and IPv6 FakeDNS pools and reverse mappings. `src/dns/upstream.zig` owns resolver address parsing.
+
+DNS server selection should not be implemented in protocol code. Protocol code should ask the DNS config/upstream layer for the selected resolver based on the queried domain.
+
+## Network Session Model
+
+`src/net/session.zig` defines:
+
+- `Target`: either an IP address or a domain plus port.
+- `Session`: target metadata plus inbound tag and optional sniffed domain.
+- `OutboundConnection`: plain or REALITY-wrapped stream abstraction.
+
+`OutboundConnection.read` is expected to be a short read suitable for live proxying. In particular, the REALITY implementation must return already-decrypted buffered TLS plaintext before waiting for more network input.
+
+## Proxy Modules
+
+Each protocol owns its wire format:
+
+- `src/proxy/redirect/inbound.zig`: transparent TCP accept and original destination lookup.
+- `src/proxy/dns/inbound.zig`: DNS inbound request handling.
+- `src/proxy/socks/inbound.zig`: SOCKS5 test/manual inbound.
+- `src/proxy/vless/outbound.zig`: VLESS request/response headers and REALITY connection setup.
+- `src/proxy/vless/vision.zig`: Vision padding, unpadding, TLS detection, and direct-copy state tracking.
+- `src/proxy/freedom/outbound.zig`: direct TCP outbound.
+- `src/proxy/blackhole/outbound.zig`: discard outbound.
+- `src/proxy/dns/outbound.zig`: minimal TCP DNS outbound.
+
+Protocol modules should return explicit errors for unsupported modes instead of ignoring config fields.
+
+## REALITY And TLS
+
+`src/transport/reality/client.zig` prepares the REALITY ClientHello session id, derives the auth key, and wraps a TCP stream with the TLS client.
+
+VLESS limits concurrent TCP plus REALITY initialization to 32 sessions. This bounds CPU and outbound ClientHello bursts without reducing established bridge capacity; the semaphore permit is released as soon as REALITY setup completes.
+
+`src/transport/tls/client_hello.zig` builds Firefox-like ClientHello bytes. Current policy:
+
+- TLS 1.3 and TLS 1.2 are offered.
+- ECH and GREASE ECH are never emitted.
+- Firefox-like fingerprints are supported; generic `firefox` maps to a no-ECH profile.
+- `realitySettings.cipherPolicy` defaults to `firefox`. The explicit `chacha20-only` policy restricts TLS 1.3 and TLS 1.2 suites to ChaCha20 for software-AES CPUs; it intentionally changes the cipher-suite portion of the browser fingerprint.
+
+`src/transport/tls/client.zig` is a small TLS client used by REALITY. REALITY certificate verification checks the Ed25519 certificate signature as `HMAC-SHA512(public_key, auth_key)`, matching Xray's REALITY client behavior.
+
+## Vision Flow
+
+VLESS Vision handling is split in two:
+
+- `src/proxy/vless/outbound.zig` writes the VLESS header, waits up to 500 ms for initial client bytes, writes the first Vision frame, then polls both sides while incrementally reading the VLESS response header.
+- `src/proxy/vless/vision.zig` handles Vision framing for both directions.
+
+The initial 500 ms wait mirrors Xray's behavior. If no client bytes arrive, an empty long-padding frame is sent so the VLESS header is camouflaged. While the response header is pending, later client bytes must still be Vision-encoded and flushed; otherwise an empty initial frame can deadlock with a server waiting for target payload. See `docs/vision-response-deadlock.md` for the failure artifact and regression command.
+
+If the input is TLS, the initial reader consumes exactly one complete record. The uplink pump continues assembling complete TLS records until Vision switches to direct copy; socket read boundaries must not become Vision frame boundaries. It performs at most one socket read per readiness event and preserves an incomplete record in connection state, returning to the bidirectional poll loop between fragments. Waiting synchronously for the rest of an inner TLS record prevents downlink progress and stalls interactive HTTPS and WebSocket sessions.
+
+After a TLS 1.3 application-data record triggers Vision `CommandDirect`, the final command frame is flushed through outer REALITY/TLS. Subsequent writes use the raw TCP stream, while the reader first drains decrypted and socket-buffered bytes before switching to raw reads. Network pumps use single `readVec` calls so small TLS records are forwarded without waiting for a full 16 KiB buffer.
+
+## Testing Strategy
+
+Use three levels of tests:
+
+- Unit tests next to changed Zig modules for parser, routing, DNS, TLS, and Vision helpers.
+- Fixture checks with `zig build run -- check -config tests/fixtures/<name>.json`.
+- Real Xray e2e with `XRAY_BIN=/tmp/codex-xray-bin/xray XRAY_ZIG_REALITY_TRAFFIC=1 zig build e2e-reality`.
+
+For real remote probes that cannot use transparent `redirect` without root network setup, wrap the same `proxy` outbound in a temporary SOCKS inbound and test with `curl --socks5-hostname`.
+
+`tests/field/` contains reusable router workloads:
+
+- `http-matrix.sh` runs bounded mixed-origin HTTPS concurrency.
+- `sustained-transfer.sh` measures fixed-byte throughput.
+- `fragmented-wss.py` drives TLS through `SSLObject`/`MemoryBIO`, splits encrypted records into configurable TCP fragments, and can delay TLS after SOCKS CONNECT to force the empty-preface regression path.
+- `wss-echo-server.py` is the dependency-free temporary TLS/WebSocket sidecar.
+- `router-sample.sh` records process jiffies, RSS, threads, FDs, sockets, and reclaimable memory, with `start`, `summary`, and `stop` modes.
+
+Keep production firewall changes out of these harnesses. Any reverse-FakeDNS or transparent comparison rule must be exact, workstation-scoped, inserted manually for one probe, and deleted immediately afterward.
