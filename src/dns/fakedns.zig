@@ -59,56 +59,52 @@ pub const Store = struct {
     }
 
     pub fn resolveA(self: *Store, domain: []const u8, io: Io) ![4]u8 {
+        var normalized_buffer: [net.HostName.max_len]u8 = undefined;
+        const normalized = try normalizeDomain(&normalized_buffer, domain);
+
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
 
-        const normalized = try normalizeDomain(self.allocator, domain);
-        errdefer self.allocator.free(normalized);
-
         if (self.domain_to_ip.get(normalized)) |ip| {
-            self.allocator.free(normalized);
             return ipToBytes(ip);
         }
 
+        const owned = try self.allocator.dupe(u8, normalized);
+        errdefer self.allocator.free(owned);
         const ip = try self.nextIp();
         if (self.ip_to_domain.fetchRemove(ip)) |old| {
             _ = self.domain_to_ip.remove(old.value);
             self.allocator.free(old.value);
         }
 
-        try self.domain_to_ip.put(normalized, ip);
-        errdefer {
-            _ = self.domain_to_ip.remove(normalized);
-            self.allocator.free(normalized);
-        }
-        try self.ip_to_domain.put(ip, normalized);
+        try self.domain_to_ip.put(owned, ip);
+        errdefer _ = self.domain_to_ip.remove(owned);
+        try self.ip_to_domain.put(ip, owned);
         return ipToBytes(ip);
     }
 
     pub fn resolveAAAA(self: *Store, domain: []const u8, io: Io) ![16]u8 {
+        var normalized_buffer: [net.HostName.max_len]u8 = undefined;
+        const normalized = try normalizeDomain(&normalized_buffer, domain);
+
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
 
-        const normalized = try normalizeDomain(self.allocator, domain);
-        errdefer self.allocator.free(normalized);
-
         if (self.domain_to_ip6.get(normalized)) |ip| {
-            self.allocator.free(normalized);
             return ip;
         }
 
+        const owned = try self.allocator.dupe(u8, normalized);
+        errdefer self.allocator.free(owned);
         const ip = try self.nextIp6();
         if (self.ip6_to_domain.fetchRemove(ip)) |old| {
             _ = self.domain_to_ip6.remove(old.value);
             self.allocator.free(old.value);
         }
 
-        try self.domain_to_ip6.put(normalized, ip);
-        errdefer {
-            _ = self.domain_to_ip6.remove(normalized);
-            self.allocator.free(normalized);
-        }
-        try self.ip6_to_domain.put(ip, normalized);
+        try self.domain_to_ip6.put(owned, ip);
+        errdefer _ = self.domain_to_ip6.remove(owned);
+        try self.ip6_to_domain.put(ip, owned);
         return ip;
     }
 
@@ -231,13 +227,12 @@ fn addOffset6(base: [16]u8, offset: u64) [16]u8 {
     return address;
 }
 
-fn normalizeDomain(allocator: std.mem.Allocator, domain: []const u8) ![]const u8 {
+fn normalizeDomain(buffer: *[net.HostName.max_len]u8, domain: []const u8) ![]const u8 {
     var trimmed = domain;
     while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '.') trimmed = trimmed[0 .. trimmed.len - 1];
     if (trimmed.len == 0 or trimmed.len > net.HostName.max_len) return error.DomainTooLong;
-    const owned = try allocator.alloc(u8, trimmed.len);
-    for (trimmed, 0..) |c, i| owned[i] = std.ascii.toLower(c);
-    return owned;
+    for (trimmed, 0..) |c, i| buffer[i] = std.ascii.toLower(c);
+    return buffer[0..trimmed.len];
 }
 
 fn bytesToIp(bytes: [4]u8) u32 {
@@ -266,6 +261,41 @@ test "allocates and reverse maps fake IPv4 addresses" {
 
     const domain = store.lookup(.{ .ip4 = .{ .bytes = first, .port = 443 } }, std.Io.failing).?;
     try std.testing.expectEqualStrings("example.com", domain);
+}
+
+test "cached fake addresses do not allocate" {
+    var store = try Store.init(std.testing.allocator, .{
+        .ip_pool = "198.18.0.0/30",
+        .ip_pool6 = "fc00::/126",
+        .ttl = 60,
+    });
+    defer store.deinit();
+
+    const ipv4 = try store.resolveA("example.com", std.Io.failing);
+    const ipv6 = try store.resolveAAAA("example.com", std.Io.failing);
+
+    const allocator = store.allocator;
+    store.allocator = std.testing.failing_allocator;
+    defer store.allocator = allocator;
+
+    try std.testing.expectEqual(ipv4, try store.resolveA("Example.COM.", std.Io.failing));
+    try std.testing.expectEqual(ipv6, try store.resolveAAAA("Example.COM.", std.Io.failing));
+}
+
+test "fake address insertion is leak-free on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var store = try Store.init(allocator, .{
+                .ip_pool = "198.18.0.0/30",
+                .ip_pool6 = "fc00::/126",
+                .ttl = 60,
+            });
+            defer store.deinit();
+
+            _ = try store.resolveA("example.com", std.Io.failing);
+            _ = try store.resolveAAAA("example.com", std.Io.failing);
+        }
+    }.run, .{});
 }
 
 test "wraps fake pool and evicts reverse mapping" {

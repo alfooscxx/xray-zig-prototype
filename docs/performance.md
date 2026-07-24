@@ -1,5 +1,45 @@
 # Real-Server Performance
 
+## 2026-07-23 Runtime CPU And Lifetime Audit
+
+The raw bridge previously rebuilt its poll set every 20 ms, including while it
+had no connections. A three-second idle `strace -f -c` sample completed 146
+`poll` calls. The reactor now blocks on an `eventfd`-backed poll set, wakes
+immediately when producers publish a connection, and performs only a one-second
+bounded poll to observe cooperative runtime cancellation. The same sample
+completed 2 `poll` calls, a 98.6% reduction in idle polling. Connection
+publication uses a lock-free atomic handoff stack; the previous hand-written
+spin lock was removed.
+
+The reactor now also closes both active and queued connections when it stops.
+A local ReleaseFast SOCKS/freedom churn test, which exercises the raw handoff on
+every request, produced this settled state:
+
+| Completed connections | RSS | FDs | Threads |
+|---:|---:|---:|---:|
+| 100 | 2,024 KiB | 5 | 4 |
+| 600 | 2,024 KiB | 5 | 4 |
+| 1,100 | 2,024 KiB | 5 | 4 |
+
+A separate 512-request run at concurrency 64 completed without failures and
+returned to 5 FDs. It retained 56 on-demand I/O workers and 15.8 MiB RSS; these
+workers are intentionally kept by `Io.Threaded`, so sizing under burst traffic
+must distinguish that bounded pool from per-connection reactor retention.
+
+FakeDNS cache hits now normalize names in a stack buffer and allocate only on a
+new mapping. Allocation-failure tests cover every insertion allocation and
+verify complete cleanup. On Linux, resolver-backed DNS uses an `AF_UNIX`
+`socketpair` for its internal dispatcher stream instead of creating a temporary
+TCP listener for every query. The outbound-routed concurrent DNS e2e suite and
+the real-Xray REALITY/Vision traffic suite pass with these changes.
+
+This audit did not find another busy-wait loop. Remaining blocking locks are
+`Io.Mutex` instances for FakeDNS maps and the shared startup log writer, and
+bounded `Io.Semaphore` instances for DNS queries and REALITY handshakes. These
+sleep through the runtime rather than spinning. Under sustained REALITY traffic,
+the negotiated cipher remains the dominant CPU cost; use the explicit
+`chacha20-only` policy on software-AES targets as described below.
+
 ## 2026-07-22 Baseline
 
 The benchmark used the field REALITY/Vision server from `field-config-test.json`, HTTPS payloads from Cloudflare's speed endpoint, and fresh SOCKS connections for latency samples. The Zig client was built with Zig 0.16.0 and `-Doptimize=ReleaseFast`. The comparison client was the official Xray 26.3.27 Linux x86-64 binary.

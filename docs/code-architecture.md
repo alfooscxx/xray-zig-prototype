@@ -25,6 +25,14 @@ to the raw reactor: each connection contains two 16 KiB buffers, and arena
 
 Each accepted TCP connection gets one handler worker. Bidirectional plain, REALITY, and Vision bridges poll the client and upstream sockets from that handler, then drain any userspace reader/TLS buffers before polling again. This keeps a live connection to one worker. If the pool limit is reached, a TCP inbound holds one accepted stream, retries scheduling every 10 ms, and leaves later connections in the kernel listen backlog. It must not run the handler synchronously on the accept worker because a long-lived connection would stall that listener indefinitely.
 
+Connections that have completed the Vision direct-copy transition, plus plain
+freedom connections, move to the shared raw reactor. Producers publish them
+through a lock-free atomic stack and signal an `eventfd`; there is no producer
+spin lock. The reactor blocks in `poll` until socket activity, a new connection,
+or its one-second cooperative-cancellation check. Reactor shutdown drains and
+closes both active and not-yet-adopted connections before its allocator and wake
+descriptor are released.
+
 Inbound startup and error messages share one buffered writer, protected by an `Io.Mutex`. Any new concurrent log site must use the same mutex.
 
 ## Config Layer
@@ -56,7 +64,7 @@ If no rule matches, `routing.defaultOutboundTag` is used.
 
 ## DNS
 
-`src/dns/protocol.zig` handles DNS wire parsing and A/AAAA response writing. `src/dns/fakedns.zig` owns the optional independent IPv4 and IPv6 FakeDNS pools and reverse mappings. Without `dns.fakeDns`, the DNS inbound selects the first matching resolver rule, frames the query as DNS-over-TCP, and dispatches it through that rule's `outboundTag`. A `vless` tag therefore protects DNS with REALITY without exposing direct DoH. `src/dns/upstream.zig` owns resolver address parsing.
+`src/dns/protocol.zig` handles DNS wire parsing and A/AAAA response writing. `src/dns/fakedns.zig` owns the optional independent IPv4 and IPv6 FakeDNS pools and reverse mappings. Without `dns.fakeDns`, the DNS inbound selects the first matching resolver rule, frames the query as DNS-over-TCP, and dispatches it through that rule's `outboundTag`. A `vless` tag therefore protects DNS with REALITY without exposing direct DoH. `src/dns/upstream.zig` owns resolver address parsing. On Linux, the DNS inbound connects its handler and dispatcher with a local `AF_UNIX` socket pair, avoiding a temporary loopback TCP listener per query. Other platforms retain the loopback TCP fallback.
 
 DNS server selection should not be implemented in protocol code. Protocol code should ask the DNS config/upstream layer for the selected resolver based on the queried domain.
 

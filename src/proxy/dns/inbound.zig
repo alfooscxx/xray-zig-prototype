@@ -1,6 +1,8 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
+const posix = std.posix;
 
 const config = @import("../../config/mod.zig");
 const fakedns = @import("../../dns/fakedns.zig");
@@ -186,6 +188,8 @@ fn forward(packet: []const u8, domain: []const u8, server: *const config.DnsServ
 }
 
 fn createLoopbackPair(io: Io) ![2]net.Stream {
+    if (builtin.os.tag == .linux) return createLocalPair();
+
     var address = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
@@ -194,6 +198,27 @@ fn createLoopbackPair(io: Io) ![2]net.Stream {
     errdefer client.close(io);
     const server = try listener.accept(io);
     return .{ client, server };
+}
+
+fn createLocalPair() ![2]net.Stream {
+    var fds: [2]posix.socket_t = undefined;
+    while (true) switch (posix.errno(posix.system.socketpair(
+        posix.AF.UNIX,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+        0,
+        &fds,
+    ))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .MFILE, .NFILE, .NOBUFS, .NOMEM => return error.SystemResources,
+        else => return error.Unexpected,
+    };
+
+    const address = net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    return .{
+        .{ .socket = .{ .handle = fds[0], .address = address } },
+        .{ .socket = .{ .handle = fds[1], .address = address } },
+    };
 }
 
 fn dispatchQuery(stream: net.Stream, dispatcher: session.Dispatcher, upstream: net.IpAddress, domain: []const u8, outbound_tag: []const u8, framed_query: []const u8, io: Io) Io.Cancelable!void {

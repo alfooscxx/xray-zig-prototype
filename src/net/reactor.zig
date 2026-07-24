@@ -8,7 +8,7 @@ const posix = std.posix;
 
 const max_connections = 256;
 const buffer_size = 16 * 1024;
-const poll_timeout_ms = 20;
+const cancellation_poll_ms = 1000;
 
 const Buffer = struct {
     bytes: [buffer_size]u8 = undefined,
@@ -45,17 +45,40 @@ const Connection = struct {
 pub const Reactor = struct {
     allocator: std.mem.Allocator,
     io: Io,
-    pending_mutex: std.atomic.Mutex = .unlocked,
-    pending_head: ?*Connection = null,
-    pending_tail: ?*Connection = null,
+    wake_fd: posix.fd_t,
+    pending_head: std.atomic.Value(?*Connection) = .init(null),
+    stopped: std.atomic.Value(bool) = .init(false),
     active_count: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator, io: Io) Reactor {
-        return .{ .allocator = allocator, .io = io };
+    pub fn init(allocator: std.mem.Allocator, io: Io) !Reactor {
+        if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+        const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => .{
+                .allocator = allocator,
+                .io = io,
+                .wake_fd = @intCast(rc),
+            },
+            .MFILE, .NFILE, .NOMEM => error.SystemResources,
+            else => error.Unexpected,
+        };
+    }
+
+    pub fn deinit(self: *Reactor) void {
+        self.stop();
+        self.closePendingList(self.pending_head.swap(null, .acquire));
+        _ = linux.close(self.wake_fd);
+        self.* = undefined;
+    }
+
+    pub fn stop(self: *Reactor) void {
+        if (self.stopped.swap(true, .release)) return;
+        self.wake();
     }
 
     pub fn adoptDuplicate(self: *Reactor, client: net.Stream, upstream: net.Stream) !void {
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+        if (self.stopped.load(.acquire)) return error.ReactorStopped;
 
         const client_copy = try duplicateStream(client);
         errdefer client_copy.close(self.io);
@@ -68,36 +91,55 @@ pub const Reactor = struct {
         const connection = try self.allocator.create(Connection);
         connection.* = .{ .client = client_copy, .upstream = upstream_copy };
 
-        lock(&self.pending_mutex);
-        defer self.pending_mutex.unlock();
-        if (self.pending_tail) |tail| {
-            tail.next = connection;
-        } else {
-            self.pending_head = connection;
+        self.pushPending(connection);
+        self.wake();
+    }
+
+    fn pushPending(self: *Reactor, connection: *Connection) void {
+        var head = self.pending_head.load(.monotonic);
+        while (true) {
+            connection.next = head;
+            head = self.pending_head.cmpxchgWeak(
+                head,
+                connection,
+                .release,
+                .monotonic,
+            ) orelse return;
         }
-        self.pending_tail = connection;
     }
 
     pub fn run(self: *Reactor) Io.Cancelable!void {
         var active_head: ?*Connection = null;
-        var poll_fds: [max_connections * 2]posix.pollfd = undefined;
+        defer {
+            self.closeActiveList(active_head);
+            self.closePendingList(self.pending_head.swap(null, .acquire));
+        }
+
+        var poll_fds: [max_connections * 2 + 1]posix.pollfd = undefined;
         var poll_connections: [max_connections]*Connection = undefined;
 
         while (true) {
             self.takePending(&active_head);
+            if (self.stopped.load(.acquire)) return;
+
+            poll_fds[0] = .{
+                .fd = self.wake_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            };
 
             var count: usize = 0;
             var current = active_head;
             while (current) |connection| : (current = connection.next) {
                 if (count == max_connections) break;
                 poll_connections[count] = connection;
-                poll_fds[count * 2] = .{
+                poll_fds[count * 2 + 1] = .{
                     .fd = connection.client.socket.handle,
                     .events = readEvents(connection.client_eof, &connection.client_to_upstream) |
                         writeEvents(&connection.upstream_to_client),
                     .revents = 0,
                 };
-                poll_fds[count * 2 + 1] = .{
+                poll_fds[count * 2 + 2] = .{
                     .fd = connection.upstream.socket.handle,
                     .events = readEvents(connection.upstream_eof, &connection.upstream_to_client) |
                         writeEvents(&connection.client_to_upstream),
@@ -106,13 +148,17 @@ pub const Reactor = struct {
                 count += 1;
             }
 
-            _ = posix.poll(poll_fds[0 .. count * 2], poll_timeout_ms) catch continue;
+            _ = posix.poll(poll_fds[0 .. count * 2 + 1], cancellation_poll_ms) catch continue;
+            try Io.checkCancel(self.io);
+            if (poll_fds[0].revents & posix.POLL.IN != 0) self.drainWake();
+            if (poll_fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return;
+            if (self.stopped.load(.acquire)) return;
 
             var index: usize = 0;
             while (index < count) : (index += 1) {
                 const connection = poll_connections[index];
-                const client_events = poll_fds[index * 2].revents;
-                const upstream_events = poll_fds[index * 2 + 1].revents;
+                const client_events = poll_fds[index * 2 + 1].revents;
+                const upstream_events = poll_fds[index * 2 + 2].revents;
                 service(connection, client_events, upstream_events);
             }
 
@@ -129,12 +175,7 @@ pub const Reactor = struct {
     }
 
     fn takePending(self: *Reactor, active_head: *?*Connection) void {
-        lock(&self.pending_mutex);
-        defer self.pending_mutex.unlock();
-
-        var pending = self.pending_head;
-        self.pending_head = null;
-        self.pending_tail = null;
+        var pending = self.pending_head.swap(null, .acquire);
         while (pending) |connection| {
             const next = connection.next;
             if (self.active_count >= max_connections) {
@@ -145,6 +186,24 @@ pub const Reactor = struct {
                 self.active_count += 1;
             }
             pending = next;
+        }
+    }
+
+    fn closeActiveList(self: *Reactor, head: ?*Connection) void {
+        var current = head;
+        while (current) |connection| {
+            const next = connection.next;
+            self.closeConnection(connection);
+            current = next;
+        }
+    }
+
+    fn closePendingList(self: *Reactor, head: ?*Connection) void {
+        var current = head;
+        while (current) |connection| {
+            const next = connection.next;
+            self.closePending(connection);
+            current = next;
         }
     }
 
@@ -159,6 +218,30 @@ pub const Reactor = struct {
         connection.client.close(self.io);
         connection.upstream.close(self.io);
         self.allocator.destroy(connection);
+    }
+
+    fn wake(self: *Reactor) void {
+        var value: u64 = 1;
+        while (true) {
+            const rc = linux.write(self.wake_fd, @ptrCast(&value), @sizeOf(u64));
+            switch (linux.errno(rc)) {
+                .SUCCESS, .AGAIN => return,
+                .INTR => continue,
+                else => return,
+            }
+        }
+    }
+
+    fn drainWake(self: *Reactor) void {
+        var value: u64 = undefined;
+        while (true) {
+            const rc = linux.read(self.wake_fd, @ptrCast(&value), @sizeOf(u64));
+            switch (linux.errno(rc)) {
+                .SUCCESS, .AGAIN => return,
+                .INTR => continue,
+                else => return,
+            }
+        }
     }
 };
 
@@ -256,6 +339,20 @@ fn setNonBlocking(fd: posix.fd_t) !void {
     if (posix.errno(set_rc) != .SUCCESS) return error.Unexpected;
 }
 
-fn lock(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+test "pending connections use a lock-free handoff stack" {
+    var reactor: Reactor = .{
+        .allocator = std.testing.allocator,
+        .io = std.Io.failing,
+        .wake_fd = -1,
+    };
+    var first: Connection = .{ .client = undefined, .upstream = undefined };
+    var second: Connection = .{ .client = undefined, .upstream = undefined };
+
+    reactor.pushPending(&first);
+    reactor.pushPending(&second);
+
+    const head = reactor.pending_head.swap(null, .acquire).?;
+    try std.testing.expectEqual(&second, head);
+    try std.testing.expectEqual(&first, head.next.?);
+    try std.testing.expect(head.next.?.next == null);
 }

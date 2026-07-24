@@ -55,3 +55,8 @@ bridge closes.
 - `zig build test -Doptimize=ReleaseFast` passed.
 - The real-Xray REALITY/Vision traffic harness passed.
 - The 408-handoff real-server churn run plateaued at 7.6 MiB RSS.
+- A later local ReleaseFast SOCKS/freedom run plateaued at 2,024 KiB RSS,
+  5 FDs, and 4 threads at 100, 600, and 1,100 completed raw handoffs.
+- Reactor shutdown now explicitly closes active and pending handoffs. A
+  512-request, 64-way contention run completed without failures and returned
+  to 5 FDs.

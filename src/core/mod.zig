@@ -34,10 +34,14 @@ pub const Runtime = struct {
             null;
         defer if (fake_dns_store) |*store| store.deinit();
 
-        var group: Io.Group = .init;
-        defer group.cancel(io);
         var log_mutex: Io.Mutex = .init;
-        var reactor = raw_reactor.Reactor.init(self.allocator, io);
+        var reactor = try raw_reactor.Reactor.init(self.allocator, io);
+        defer reactor.deinit();
+        var group: Io.Group = .init;
+        defer {
+            reactor.stop();
+            group.cancel(io);
+        }
         self.reactor = &reactor;
         defer self.reactor = null;
         try group.concurrent(io, runRawReactor, .{&reactor});
