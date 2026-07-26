@@ -46,9 +46,14 @@ MiB in addition to worker stacks, TLS state, and socket memory.
 ## Fix
 
 Configuration and CLI data remain in the process-lifetime arena. Runtime-owned
-objects now use `init.gpa`, Zig's thread-safe general-purpose allocator. Reactor
-`destroy` therefore releases each large connection allocation when the raw
-bridge closes.
+objects were first moved to `init.gpa`, Zig's thread-safe general-purpose
+allocator. The reactor now has a separate allocator and uses
+`std.heap.page_allocator`: in ReleaseFast, `init.gpa` is the SMP allocator and
+may cache freed pages. Reactor `destroy` now unmaps each large connection
+allocation when the raw bridge closes, returning it to the kernel promptly.
+FakeDNS and the threaded I/O runtime remain on `init.gpa`; using a page
+allocator for their smaller allocations would add unnecessary mappings and
+system calls.
 
 ## Validation
 

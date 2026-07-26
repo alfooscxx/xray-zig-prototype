@@ -56,7 +56,14 @@ pub fn main(init: std.process.Init) !void {
         try xray.core.validate(&cfg);
         // Runtime-owned connection state must support individual frees. The
         // process arena is reserved for configuration and CLI lifetime data.
-        var runtime: xray.core.Runtime = .{ .cfg = &cfg, .allocator = init.gpa };
+        var runtime: xray.core.Runtime = .{
+            .cfg = &cfg,
+            .allocator = init.gpa,
+            // Raw connections are page-sized, long-lived allocations. Freeing
+            // them should unmap their storage instead of retaining it in the
+            // ReleaseFast SMP allocator's caches.
+            .reactor_allocator = std.heap.page_allocator,
+        };
         try runtime.run(io, stdout);
         return;
     }

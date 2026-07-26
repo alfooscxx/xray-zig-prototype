@@ -14,14 +14,26 @@ This document describes how the Zig client is organized and where protocol behav
 The runtime intentionally keeps protocol parsing close to the protocol module. Shared code should live in `src/net/`, `src/dns/`, or a protocol-owned helper only when more than one module needs it.
 
 Configuration and CLI data use the process-lifetime arena. Runtime-owned
-objects that are destroyed individually, including raw-reactor connections,
-use the thread-safe general-purpose allocator. Do not pass an arena allocator
-to the raw reactor: each connection contains two 16 KiB buffers, and arena
-`destroy` is a no-op.
+objects that are destroyed individually use a thread-safe allocator. FakeDNS
+uses `init.gpa`; raw-reactor connections use `std.heap.page_allocator`. Each
+reactor connection contains two 16 KiB buffers, so releasing one unmaps its
+pages instead of leaving them in the ReleaseFast SMP allocator's caches. Do
+not pass an arena allocator to the raw reactor: arena `destroy` is a no-op.
 
 ## Runtime Concurrency
 
 `src/main.zig` owns a bounded `Io.Threaded` instance with 1 MiB worker stacks and a 128-worker concurrent limit. Do not replace it with `init.io`: Zig 0.16's default concurrent pool is unlimited and reserves 16 MiB per worker, which exhausted a 32-bit target's virtual address space under mixed transparent traffic. Smaller 256 KiB and 512 KiB stacks are unsafe in the MIPS TLS/crypto path.
+
+The worker and raw-reactor limits cover different connection states. Lowering
+the worker limit does not increase reactor capacity: it reduces the number of
+connections that can initialize or remain in a non-direct bridge. The
+32-permit REALITY semaphore already bounds the CPU-heavy handshake phase. Keep
+the 128-worker and 256-reactor limits until a mixed burst-and-steady-state field
+test demonstrates safe replacement values. The documented 96-worker run failed
+a 128-client admission test, although it also predates the current listener
+backpressure. Raising reactor capacity also requires two file descriptors and
+two 16 KiB buffers per adopted connection, so validate the target's descriptor
+limit as well as RSS.
 
 Each accepted TCP connection gets one handler worker. Bidirectional plain, REALITY, and Vision bridges poll the client and upstream sockets from that handler, then drain any userspace reader/TLS buffers before polling again. This keeps a live connection to one worker. If the pool limit is reached, a TCP inbound holds one accepted stream, retries scheduling every 10 ms, and leaves later connections in the kernel listen backlog. It must not run the handler synchronously on the accept worker because a long-lived connection would stall that listener indefinitely.
 

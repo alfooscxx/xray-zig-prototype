@@ -20,6 +20,7 @@ const vless = @import("../proxy/vless/outbound.zig");
 pub const Runtime = struct {
     cfg: *const config.Config,
     allocator: std.mem.Allocator,
+    reactor_allocator: std.mem.Allocator = std.heap.page_allocator,
     reactor: ?*raw_reactor.Reactor = null,
 
     pub fn run(self: *Runtime, io: Io, log_writer: *Io.Writer) !void {
@@ -35,7 +36,7 @@ pub const Runtime = struct {
         defer if (fake_dns_store) |*store| store.deinit();
 
         var log_mutex: Io.Mutex = .init;
-        var reactor = try raw_reactor.Reactor.init(self.allocator, io);
+        var reactor = try raw_reactor.Reactor.init(self.reactor_allocator, io);
         defer reactor.deinit();
         var group: Io.Group = .init;
         defer {

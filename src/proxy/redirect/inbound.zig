@@ -44,10 +44,7 @@ pub fn run(inbound: config.Inbound, dispatcher: session.Dispatcher, fake_dns: ?*
     }
 
     while (true) {
-        const stream = server.accept(io) catch |err| switch (err) {
-            error.Canceled => return err,
-            else => |e| return e,
-        };
+        const stream = try server.accept(io);
         var capacity_warned = false;
         while (true) {
             group.concurrent(io, handleConnection, .{ stream, dispatcher, inbound.tag, fake_dns, address_family, io }) catch {
