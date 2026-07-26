@@ -59,6 +59,27 @@ pub fn parseQuestion(packet: []const u8, name_buffer: []u8) !Question {
     };
 }
 
+pub fn buildQuery(out: []u8, id: u16, name: []const u8, qtype: u16) ![]const u8 {
+    var writer: std.Io.Writer = .fixed(out);
+    try writeU16(&writer, id);
+    try writeU16(&writer, 0x0100);
+    try writeU16(&writer, 1);
+    try writeU16(&writer, 0);
+    try writeU16(&writer, 0);
+    try writeU16(&writer, 0);
+
+    var labels = std.mem.splitScalar(u8, name, '.');
+    while (labels.next()) |label| {
+        if (label.len == 0 or label.len > 63) return error.InvalidDomain;
+        try writer.writeByte(@intCast(label.len));
+        try writer.writeAll(label);
+    }
+    try writer.writeByte(0);
+    try writeU16(&writer, qtype);
+    try writeU16(&writer, qclass_in);
+    return writer.buffered();
+}
+
 pub fn buildAResponse(out: []u8, question: Question, ip: [4]u8, ttl: u32) ![]const u8 {
     return buildAddressResponse(out, question, qtype_a, &ip, ttl);
 }
@@ -137,6 +158,18 @@ test "parses a single A question" {
     const question = try parseQuestion(&packet, &name_buffer);
     try std.testing.expectEqualStrings("example.com", question.name);
     try std.testing.expectEqual(@as(u16, qtype_a), question.qtype);
+}
+
+test "builds an A query" {
+    var out: [512]u8 = undefined;
+    const query = try buildQuery(&out, 0x1234, "example.com", qtype_a);
+    const expected = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x07, 'e',  'x',  'a',
+        'm',  'p',  'l',  'e',  0x03, 'c',  'o',  'm',
+        0x00, 0x00, 0x01, 0x00, 0x01,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, query);
 }
 
 test "builds an A response" {

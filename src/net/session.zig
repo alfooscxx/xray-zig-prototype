@@ -29,6 +29,7 @@ pub const Session = struct {
     inbound_tag: ?[]const u8 = null,
     sniffed_domain: ?[]const u8 = null,
     outbound_tag: ?[]const u8 = null,
+    preferred_family: ?net.IpAddress.Family = null,
 };
 
 pub const Preface = struct {

@@ -81,7 +81,11 @@ pub const Runtime = struct {
             try routing.selectOutbound(self.cfg, sess);
         const reactor = self.reactor orelse return error.RuntimeNotRunning;
         if (std.mem.eql(u8, outbound.protocol, "freedom")) {
-            try freedom.handle(client, sess, preface, reactor, io);
+            const fake_dns_config: ?config.DnsConfig = if (self.cfg.dns) |dns_cfg|
+                if (dns_cfg.fake_dns != null) dns_cfg else null
+            else
+                null;
+            try freedom.handle(client, sess, preface, fake_dns_config, self.dispatcher(), reactor, io);
             return;
         }
         if (std.mem.eql(u8, outbound.protocol, "blackhole")) {

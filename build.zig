@@ -60,4 +60,11 @@ pub fn build(b: *std.Build) void {
 
     const e2e_dns_step = b.step("e2e-dns", "Run concurrent outbound-routed DNS-over-TCP tests");
     e2e_dns_step.dependOn(&e2e_dns_cmd.step);
+
+    const e2e_fakedns_freedom_cmd = b.addSystemCommand(&.{ "python3", "tests/e2e/fakedns-freedom.py" });
+    e2e_fakedns_freedom_cmd.addArtifactArg(exe);
+    e2e_fakedns_freedom_cmd.has_side_effects = true;
+
+    const e2e_fakedns_freedom_step = b.step("e2e-fakedns-freedom", "Run FakeDNS freedom resolution regression");
+    e2e_fakedns_freedom_step.dependOn(&e2e_fakedns_freedom_cmd.step);
 }

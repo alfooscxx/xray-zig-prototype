@@ -1,8 +1,9 @@
-pub const version = "0.0.3";
+pub const version = "0.0.4";
 
 pub const config = @import("config/mod.zig");
 pub const core = @import("core/mod.zig");
 pub const dns = struct {
+    pub const client = @import("dns/client.zig");
     pub const fakedns = @import("dns/fakedns.zig");
     pub const protocol = @import("dns/protocol.zig");
     pub const upstream = @import("dns/upstream.zig");
@@ -34,6 +35,7 @@ pub const transport = struct {
 test {
     _ = config;
     _ = core;
+    _ = dns.client;
     _ = dns.fakedns;
     _ = dns.protocol;
     _ = dns.upstream;

@@ -1,13 +1,11 @@
-const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
-const posix = std.posix;
 
 const config = @import("../../config/mod.zig");
+const dns_client = @import("../../dns/client.zig");
 const fakedns = @import("../../dns/fakedns.zig");
 const dns_protocol = @import("../../dns/protocol.zig");
-const dns_upstream = @import("../../dns/upstream.zig");
 const log = @import("../../log.zig");
 const session = @import("../../net/session.zig");
 
@@ -19,8 +17,6 @@ pub const Error = error{
 };
 
 const max_inflight_queries = 16;
-const query_timeout_seconds = 5;
-
 const OwnedPacket = struct {
     bytes: [4096]u8 = undefined,
     len: usize,
@@ -137,114 +133,13 @@ fn handleMessage(
     }
 
     const server = dns_config.selectServer(question.name);
-    const forwarded = forward(packet, question.name, server, dispatcher, &response_buffer, io) catch |err| {
+    const forwarded = dns_client.exchange(packet, question.name, server, dispatcher, &response_buffer, io) catch |err| {
         log.warn("dns query {s} via {s}/{s} failed: {s}\n", .{ question.name, server.resolver, server.outbound_tag, @errorName(err) });
         const response = try dns_protocol.buildErrorResponse(&response_buffer, packet, .server_failure);
         try socket.send(io, &client_address, response);
         return;
     };
     try socket.send(io, &client_address, forwarded);
-}
-
-fn forward(packet: []const u8, domain: []const u8, server: *const config.DnsServer, dispatcher: session.Dispatcher, response_buffer: []u8, io: Io) ![]const u8 {
-    if (packet.len > std.math.maxInt(u16)) return error.DnsResponseTooLarge;
-    const upstream = dns_upstream.parseAddress(server.resolver) catch return error.UnsupportedDnsUpstream;
-
-    var pair = try createLoopbackPair(io);
-    defer pair[0].close(io);
-
-    var framed_query: [4098]u8 = undefined;
-    var length_bytes: [2]u8 = undefined;
-    std.mem.writeInt(u16, &length_bytes, @intCast(packet.len), .big);
-    @memcpy(framed_query[0..2], &length_bytes);
-    @memcpy(framed_query[2 .. packet.len + 2], packet);
-
-    var group: Io.Group = .init;
-    defer group.cancel(io);
-    while (true) {
-        group.concurrent(io, dispatchQuery, .{
-            pair[1],
-            dispatcher,
-            upstream,
-            domain,
-            server.outbound_tag,
-            framed_query[0 .. packet.len + 2],
-            io,
-        }) catch {
-            io.sleep(Io.Duration.fromMilliseconds(10), .awake) catch |err| {
-                pair[1].close(io);
-                return err;
-            };
-            continue;
-        };
-        break;
-    }
-
-    try receiveAllTimeout(pair[0], &length_bytes, io);
-    const response_len = std.mem.readInt(u16, &length_bytes, .big);
-    if (response_len > response_buffer.len) return error.DnsResponseTooLarge;
-    try receiveAllTimeout(pair[0], response_buffer[0..response_len], io);
-    return response_buffer[0..response_len];
-}
-
-fn createLoopbackPair(io: Io) ![2]net.Stream {
-    if (builtin.os.tag == .linux) return createLocalPair();
-
-    var address = try net.IpAddress.parse("127.0.0.1", 0);
-    var listener = try address.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
-
-    const client = try listener.socket.address.connect(io, .{ .mode = .stream, .protocol = .tcp });
-    errdefer client.close(io);
-    const server = try listener.accept(io);
-    return .{ client, server };
-}
-
-fn createLocalPair() ![2]net.Stream {
-    var fds: [2]posix.socket_t = undefined;
-    while (true) switch (posix.errno(posix.system.socketpair(
-        posix.AF.UNIX,
-        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
-        0,
-        &fds,
-    ))) {
-        .SUCCESS => break,
-        .INTR => continue,
-        .MFILE, .NFILE, .NOBUFS, .NOMEM => return error.SystemResources,
-        else => return error.Unexpected,
-    };
-
-    const address = net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
-    return .{
-        .{ .socket = .{ .handle = fds[0], .address = address } },
-        .{ .socket = .{ .handle = fds[1], .address = address } },
-    };
-}
-
-fn dispatchQuery(stream: net.Stream, dispatcher: session.Dispatcher, upstream: net.IpAddress, domain: []const u8, outbound_tag: []const u8, framed_query: []const u8, io: Io) Io.Cancelable!void {
-    defer stream.close(io);
-    dispatcher.dispatch(stream, .{
-        .target = .{ .address = upstream },
-        .sniffed_domain = domain,
-        .outbound_tag = outbound_tag,
-    }, .{ .bytes = framed_query }, io) catch |err| {
-        log.warn("dns outbound {s} dispatch failed: {s}\n", .{ outbound_tag, @errorName(err) });
-        return;
-    };
-}
-
-fn receiveAllTimeout(stream: net.Stream, buffer: []u8, io: Io) !void {
-    var used: usize = 0;
-    while (used < buffer.len) {
-        const message = try stream.socket.receiveTimeout(io, buffer[used..], .{
-            .duration = .{
-                .raw = Io.Duration.fromSeconds(query_timeout_seconds),
-                .clock = .awake,
-            },
-        });
-        if (message.data.len == 0) return error.EndOfStream;
-        used += message.data.len;
-    }
 }
 
 fn bindAddress(listen: []const u8, port: u16) !net.IpAddress {

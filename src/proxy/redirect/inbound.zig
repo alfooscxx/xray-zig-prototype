@@ -85,6 +85,7 @@ fn handleConnection(stream: net.Stream, dispatcher: session.Dispatcher, inbound_
                 } },
                 .inbound_tag = inbound_tag,
                 .sniffed_domain = domain,
+                .preferred_family = std.meta.activeTag(target),
             }, .{}, io) catch |err| {
                 log.warn("redirect dispatch failed: {s}\n", .{@errorName(err)});
                 return;
