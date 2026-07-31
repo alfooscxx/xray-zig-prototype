@@ -113,7 +113,11 @@ fn waitResponseHeader(
                 .second = upstream.hasBufferedRead(),
             }
         else
-            try session.waitReadable(client, upstream.pollStream());
+            try session.waitReadableTimeout(
+                client,
+                upstream.pollStream(),
+                session.response_header_timeout_ms,
+            );
 
         if (ready.first) {
             const n = try session.readAvailable(&client_reader.interface, &client_chunk);

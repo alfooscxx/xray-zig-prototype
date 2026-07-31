@@ -93,7 +93,11 @@ pub fn bridge(client: net.Stream, upstream: *session.OutboundConnection, state: 
                 .second = upstream.hasBufferedRead(),
             }
         else
-            session.waitReadable(client, upstream.pollStream()) catch return;
+            session.waitReadableTimeout(
+                client,
+                upstream.pollStream(),
+                session.connection_idle_timeout_ms,
+            ) catch return;
         if (ready.first and !forwardUplinkOnce(
             &client_reader.interface,
             upstream,

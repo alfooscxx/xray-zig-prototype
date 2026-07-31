@@ -22,20 +22,54 @@ not pass an arena allocator to the raw reactor: arena `destroy` is a no-op.
 
 ## Runtime Concurrency
 
-`src/main.zig` owns a bounded `Io.Threaded` instance with 1 MiB worker stacks and a 128-worker concurrent limit. Do not replace it with `init.io`: Zig 0.16's default concurrent pool is unlimited and reserves 16 MiB per worker, which exhausted a 32-bit target's virtual address space under mixed transparent traffic. Smaller 256 KiB and 512 KiB stacks are unsafe in the MIPS TLS/crypto path.
+`src/main.zig` owns a bounded `Io.Threaded` instance with 1 MiB worker stacks.
+Do not replace it with `init.io`: Zig 0.16's default concurrent pool is
+unlimited and reserves 16 MiB per worker, which exhausted a 32-bit target's
+virtual address space under mixed transparent traffic. Smaller 256 KiB and 512
+KiB stacks are unsafe in the MIPS TLS/crypto path.
 
 The worker and raw-reactor limits cover different connection states. Lowering
 the worker limit does not increase reactor capacity: it reduces the number of
 connections that can initialize or remain in a non-direct bridge. The
-32-permit REALITY semaphore already bounds the CPU-heavy handshake phase. Keep
-the 128-worker and 256-reactor limits until a mixed burst-and-steady-state field
-test demonstrates safe replacement values. The documented 96-worker run failed
-a 128-client admission test, although it also predates the current listener
-backpressure. Raising reactor capacity also requires two file descriptors and
-two 16 KiB buffers per adopted connection, so validate the target's descriptor
-limit as well as RSS.
+32-permit REALITY semaphore already bounds the CPU-heavy handshake phase.
+`XRAY_ZIG_MEMORY_BUDGET_MIB` defaults to 70 MiB and is shared with the router
+watchdog. The runtime models an initialization worker as 560 KiB and a raw
+connection as 112 KiB, reflecting the measured approximately 5:1 resident
+memory ratio. Requested limits are proportionally reduced until their combined
+estimate fits the budget. With the default requests of 128 workers and five raw
+connections per worker, the initial effective limits are 64 workers and 320
+raw connections.
+
+`XRAY_ZIG_WORKER_LIMIT` and `XRAY_ZIG_RAW_CONNECTION_LIMIT` override the
+requested counts. When the raw limit is omitted, it is five times the requested
+worker limit. The selected budget and effective counts are logged at startup.
+This model is an admission-sizing estimate, not an allocator-enforced RSS
+limit; the watchdog remains responsible for terminating a process that exceeds
+the same budget. The process raises its soft descriptor limit to the permitted
+hard limit before starting the runtime. Each raw connection still requires two
+file descriptors and two 16 KiB buffers, so field validation must sample both
+FD use and RSS.
+
+The production router controller requests 80 workers and 240 raw connections
+within the same 70 MiB budget. A 64/320 field run passed all traffic but emitted
+126 worker-capacity warnings. The 80/240 run passed the same 32-request mixed
+HTTPS matrix and four 4 MiB transfers, emitted 16 warnings, and reached 5.342
+MiB/s. The final 0.0.5 run repeated 32/32 and 4/4, reached 5.678 MiB/s, emitted
+four warnings, and peaked at 37.1 MiB RSS. A 96/160 run eliminated capacity
+warnings and reached 5.778 MiB/s, but two successive mixed matrices each lost
+one Fastly TLS handshake. The 80/240 split is therefore the production default
+pending longer observation.
 
 Each accepted TCP connection gets one handler worker. Bidirectional plain, REALITY, and Vision bridges poll the client and upstream sockets from that handler, then drain any userspace reader/TLS buffers before polling again. This keeps a live connection to one worker. If the pool limit is reached, a TCP inbound holds one accepted stream, retries scheduling every 10 ms, and leaves later connections in the kernel listen backlog. It must not run the handler synchronously on the accept worker because a long-lived connection would stall that listener indefinitely.
+
+The response-header phase has a 60-second inactivity timeout, and established
+worker and raw-reactor bridges have a 300-second inactivity timeout. These
+match Xray-core's default handshake and connection-idle policy. Without these
+bounds, speculative TCP opens and abandoned half-open sessions can permanently
+consume every handler worker or raw-reactor slot even while RSS remains below
+the watchdog threshold. Version 0.0.6 added these timeouts after a production
+process reached all 80 workers and approximately 540 open descriptors while
+remaining below its RSS limit.
 
 Connections that have completed the Vision direct-copy transition, plus plain
 freedom connections, move to the shared raw reactor. Producers publish them

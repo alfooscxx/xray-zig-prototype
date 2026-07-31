@@ -4,14 +4,31 @@ const Io = std.Io;
 const xray = @import("xray_zig");
 
 const max_config_bytes = 16 * 1024 * 1024;
+const worker_stack_size = 1024 * 1024;
+const default_memory_budget_mib = 70;
+const default_worker_limit = 128;
+const raw_connections_per_worker = 5;
+const estimated_raw_connection_kib = 112;
+const estimated_worker_kib = estimated_raw_connection_kib * raw_connections_per_worker;
+const max_memory_budget_mib = 4096;
+const max_requested_capacity = 1_000_000;
+
+const RuntimeCapacity = struct {
+    memory_budget_mib: usize,
+    worker_limit: usize,
+    raw_connection_limit: usize,
+};
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
+    const capacity = try runtimeCapacity(init.environ_map);
+
+    std.process.raiseFileDescriptorLimit();
 
     var threaded: Io.Threaded = .init(init.gpa, .{
-        .stack_size = 1024 * 1024,
-        .concurrent_limit = .limited(128),
+        .stack_size = worker_stack_size,
+        .concurrent_limit = .limited(capacity.worker_limit),
     });
     defer threaded.deinit();
     const io = threaded.io();
@@ -54,11 +71,21 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "run")) {
         try xray.core.validate(&cfg);
+        try stdout.print(
+            "runtime capacity: memory_budget_mib={d} workers={d} raw_connections={d}\n",
+            .{
+                capacity.memory_budget_mib,
+                capacity.worker_limit,
+                capacity.raw_connection_limit,
+            },
+        );
+        try stdout.flush();
         // Runtime-owned connection state must support individual frees. The
         // process arena is reserved for configuration and CLI lifetime data.
         var runtime: xray.core.Runtime = .{
             .cfg = &cfg,
             .allocator = init.gpa,
+            .raw_connection_limit = capacity.raw_connection_limit,
             // Raw connections are page-sized, long-lived allocations. Freeing
             // them should unmap their storage instead of retaining it in the
             // ReleaseFast SMP allocator's caches.
@@ -71,6 +98,97 @@ pub fn main(init: std.process.Init) !void {
     try stderr.print("unknown command: {s}\n\n", .{command});
     try usage(stderr);
     std.process.exit(2);
+}
+
+fn runtimeCapacity(environ: *const std.process.Environ.Map) !RuntimeCapacity {
+    const memory_budget_mib = try parseEnvironmentLimit(
+        environ,
+        "XRAY_ZIG_MEMORY_BUDGET_MIB",
+        default_memory_budget_mib,
+        max_memory_budget_mib,
+    );
+    const requested_workers = try parseEnvironmentLimit(
+        environ,
+        "XRAY_ZIG_WORKER_LIMIT",
+        default_worker_limit,
+        max_requested_capacity,
+    );
+    const default_raw_limit = std.math.mul(
+        usize,
+        requested_workers,
+        raw_connections_per_worker,
+    ) catch return error.InvalidRuntimeCapacity;
+    const requested_raw = try parseEnvironmentLimit(
+        environ,
+        "XRAY_ZIG_RAW_CONNECTION_LIMIT",
+        default_raw_limit,
+        max_requested_capacity,
+    );
+
+    return calculateCapacity(memory_budget_mib, requested_workers, requested_raw);
+}
+
+fn parseEnvironmentLimit(
+    environ: *const std.process.Environ.Map,
+    name: []const u8,
+    default: usize,
+    maximum: usize,
+) !usize {
+    const value = environ.get(name) orelse return default;
+    const parsed = std.fmt.parseUnsigned(usize, value, 10) catch
+        return error.InvalidRuntimeCapacity;
+    if (parsed == 0 or parsed > maximum) return error.InvalidRuntimeCapacity;
+    return parsed;
+}
+
+fn calculateCapacity(
+    memory_budget_mib: usize,
+    requested_workers: usize,
+    requested_raw: usize,
+) !RuntimeCapacity {
+    if (memory_budget_mib == 0 or requested_workers == 0 or requested_raw == 0)
+        return error.InvalidRuntimeCapacity;
+
+    const budget_kib = std.math.mul(usize, memory_budget_mib, 1024) catch
+        return error.InvalidRuntimeCapacity;
+    const budget_units = budget_kib / estimated_raw_connection_kib;
+    if (budget_units < raw_connections_per_worker + 1)
+        return error.MemoryBudgetTooSmall;
+
+    const requested_units =
+        @as(u128, requested_workers) * raw_connections_per_worker + requested_raw;
+    if (requested_units <= budget_units) return .{
+        .memory_budget_mib = memory_budget_mib,
+        .worker_limit = requested_workers,
+        .raw_connection_limit = requested_raw,
+    };
+
+    var workers: usize = @intCast(
+        @as(u128, requested_workers) * budget_units / requested_units,
+    );
+    var raw_connections: usize = @intCast(
+        @as(u128, requested_raw) * budget_units / requested_units,
+    );
+    workers = @max(workers, 1);
+    raw_connections = @max(raw_connections, 1);
+
+    while (workers * estimated_worker_kib +
+        raw_connections * estimated_raw_connection_kib > budget_kib)
+    {
+        if (raw_connections > 1) {
+            raw_connections -= 1;
+        } else if (workers > 1) {
+            workers -= 1;
+        } else {
+            return error.MemoryBudgetTooSmall;
+        }
+    }
+
+    return .{
+        .memory_budget_mib = memory_budget_mib,
+        .worker_limit = workers,
+        .raw_connection_limit = raw_connections,
+    };
 }
 
 fn usage(writer: *Io.Writer) !void {
@@ -121,4 +239,24 @@ fn printSummary(writer: *Io.Writer, cfg: *const xray.config.Config) !void {
             outbound.protocol,
         });
     }
+}
+
+test "default runtime capacity splits 70 MiB equally across connection states" {
+    const capacity = try calculateCapacity(70, 128, 640);
+    try std.testing.expectEqual(@as(usize, 70), capacity.memory_budget_mib);
+    try std.testing.expectEqual(@as(usize, 64), capacity.worker_limit);
+    try std.testing.expectEqual(@as(usize, 320), capacity.raw_connection_limit);
+}
+
+test "runtime capacity preserves values already inside the memory budget" {
+    const capacity = try calculateCapacity(70, 80, 240);
+    try std.testing.expectEqual(@as(usize, 80), capacity.worker_limit);
+    try std.testing.expectEqual(@as(usize, 240), capacity.raw_connection_limit);
+}
+
+test "runtime capacity rejects a zero memory budget" {
+    try std.testing.expectError(
+        error.InvalidRuntimeCapacity,
+        calculateCapacity(0, 1, 1),
+    );
 }

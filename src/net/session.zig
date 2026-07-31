@@ -6,6 +6,8 @@ const reality = @import("../transport/reality/client.zig");
 pub const RawReactor = @import("reactor.zig").Reactor;
 
 pub const max_preface_len = 2048;
+pub const response_header_timeout_ms = 60 * 1000;
+pub const connection_idle_timeout_ms = 300 * 1000;
 
 pub const Target = union(enum) {
     address: net.IpAddress,
@@ -206,7 +208,7 @@ pub fn bridge(client: net.Stream, upstream: net.Stream, io: Io) Io.Cancelable!vo
                 .second = upstream_reader.interface.buffered().len != 0,
             }
         else
-            waitReadable(client, upstream) catch return;
+            waitReadableTimeout(client, upstream, connection_idle_timeout_ms) catch return;
         if (ready.first and !copyOnce(&client_reader.interface, &upstream_writer.interface, &chunk)) return;
         if (ready.second and !copyOnce(&upstream_reader.interface, &client_writer.interface, &chunk)) return;
     }
@@ -217,12 +219,13 @@ pub const Readable = struct {
     second: bool,
 };
 
-pub fn waitReadable(first: net.Stream, second: net.Stream) !Readable {
+pub fn waitReadableTimeout(first: net.Stream, second: net.Stream, timeout_ms: i32) !Readable {
     var fds = [_]std.posix.pollfd{
         .{ .fd = first.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
         .{ .fd = second.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
     };
-    _ = try std.posix.poll(&fds, -1);
+    const ready_count = try std.posix.poll(&fds, timeout_ms);
+    if (ready_count == 0) return error.Timeout;
     const terminal = std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL;
     return .{
         .first = fds[0].revents & (std.posix.POLL.IN | terminal) != 0,
@@ -269,7 +272,7 @@ pub fn bridgeOutbound(client: net.Stream, upstream: *OutboundConnection, io: Io)
                         .second = reality_client.hasBufferedRead(),
                     }
                 else
-                    waitReadable(client, reality_client.stream) catch return;
+                    waitReadableTimeout(client, reality_client.stream, connection_idle_timeout_ms) catch return;
                 if (ready.first) {
                     const n = readAvailable(&client_reader.interface, &chunk) catch return;
                     if (n == 0) return;
