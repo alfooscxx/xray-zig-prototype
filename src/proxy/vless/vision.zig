@@ -3,6 +3,7 @@ const Io = std.Io;
 const net = Io.net;
 
 const session = @import("../../net/session.zig");
+const diagnostics = @import("../../diagnostics.zig");
 const log = @import("../../log.zig");
 
 pub const flow_name = "xtls-rprx-vision";
@@ -12,11 +13,9 @@ const frame_header_len = 5;
 const first_frame_overhead = 16 + frame_header_len;
 const max_content_len = max_buffer_size - first_frame_overhead;
 const max_tls_record_len = 18 * 1024;
-const max_server_hello_len = 1024;
+const max_server_hello_handshake_len = 64 * 1024;
 
-const tls13_supported_versions = [_]u8{ 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04 };
 const tls_client_handshake_start = [_]u8{ 0x16, 0x03 };
-const tls_server_handshake_start = [_]u8{ 0x16, 0x03, 0x03 };
 const tls_application_data_start = [_]u8{ 0x17, 0x03, 0x03 };
 const tls_handshake_type_client_hello = 0x01;
 const tls_handshake_type_server_hello = 0x02;
@@ -46,6 +45,222 @@ const LinkState = struct {
     writer_sent_user_uuid: bool = false,
 };
 
+const ServerHelloResult = enum {
+    pending,
+    tls12,
+    tls13,
+    rejected,
+};
+
+const ServerHelloFailure = enum {
+    none,
+    record_type,
+    record_version,
+    record_length,
+    handshake_type,
+    handshake_length,
+    extension_length,
+    supported_version_length,
+};
+
+const ServerHelloParser = struct {
+    const Phase = enum {
+        handshake_header,
+        legacy_version,
+        random,
+        session_id_length,
+        session_id,
+        cipher_suite,
+        compression,
+        extensions_length,
+        extension_header,
+        extension_data,
+        supported_version,
+        done,
+        rejected,
+    };
+
+    phase: Phase = .handshake_header,
+    failure: ServerHelloFailure = .none,
+    record_header: [5]u8 = undefined,
+    record_header_len: usize = 0,
+    record_remaining: usize = 0,
+    scratch: [4]u8 = undefined,
+    scratch_len: usize = 0,
+    skip_remaining: usize = 0,
+    extensions_remaining: usize = 0,
+    cipher: u16 = 0,
+    observed_prefix: [16]u8 = undefined,
+    observed_prefix_len: usize = 0,
+
+    fn reset(self: *ServerHelloParser) void {
+        self.* = .{};
+    }
+
+    fn isPending(self: *const ServerHelloParser) bool {
+        return self.phase != .done and self.phase != .rejected;
+    }
+
+    fn feed(self: *ServerHelloParser, bytes: []const u8) ServerHelloResult {
+        if (self.phase == .done) return .tls12;
+        if (self.phase == .rejected) return .rejected;
+
+        const prefix_take = @min(self.observed_prefix.len - self.observed_prefix_len, bytes.len);
+        @memcpy(self.observed_prefix[self.observed_prefix_len..][0..prefix_take], bytes[0..prefix_take]);
+        self.observed_prefix_len += prefix_take;
+
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            if (self.record_remaining == 0) {
+                const take = @min(self.record_header.len - self.record_header_len, bytes.len - offset);
+                @memcpy(self.record_header[self.record_header_len..][0..take], bytes[offset..][0..take]);
+                self.record_header_len += take;
+                offset += take;
+                if (self.record_header_len < self.record_header.len) return .pending;
+
+                if (self.record_header[0] != 0x16) return self.reject(.record_type);
+                if (self.record_header[1] != 0x03) return self.reject(.record_version);
+                self.record_remaining = std.mem.readInt(u16, self.record_header[3..5], .big);
+                self.record_header_len = 0;
+                if (self.record_remaining == 0 or self.record_remaining > max_tls_record_len) {
+                    return self.reject(.record_length);
+                }
+            }
+
+            const take = @min(self.record_remaining, bytes.len - offset);
+            const result = self.feedHandshake(bytes[offset..][0..take]);
+            self.record_remaining -= take;
+            offset += take;
+            if (result != .pending) return result;
+        }
+        return .pending;
+    }
+
+    fn feedHandshake(self: *ServerHelloParser, bytes: []const u8) ServerHelloResult {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            switch (self.phase) {
+                .handshake_header => {
+                    if (!self.fillScratch(bytes, &offset, 4)) return .pending;
+                    if (self.scratch[0] != tls_handshake_type_server_hello) {
+                        return self.reject(.handshake_type);
+                    }
+                    const handshake_len = (@as(usize, self.scratch[1]) << 16) |
+                        (@as(usize, self.scratch[2]) << 8) | self.scratch[3];
+                    self.scratch_len = 0;
+                    if (handshake_len == 0 or handshake_len > max_server_hello_handshake_len) {
+                        return self.reject(.handshake_length);
+                    }
+                    self.phase = .legacy_version;
+                    self.skip_remaining = 2;
+                },
+                .legacy_version => if (self.skip(bytes, &offset)) {
+                    self.phase = .random;
+                    self.skip_remaining = 32;
+                },
+                .random => if (self.skip(bytes, &offset)) {
+                    self.phase = .session_id_length;
+                },
+                .session_id_length => {
+                    if (!self.fillScratch(bytes, &offset, 1)) return .pending;
+                    self.skip_remaining = self.scratch[0];
+                    self.scratch_len = 0;
+                    self.phase = if (self.skip_remaining == 0) .cipher_suite else .session_id;
+                },
+                .session_id => if (self.skip(bytes, &offset)) {
+                    self.phase = .cipher_suite;
+                },
+                .cipher_suite => {
+                    if (!self.fillScratch(bytes, &offset, 2)) return .pending;
+                    self.cipher = std.mem.readInt(u16, self.scratch[0..2], .big);
+                    self.scratch_len = 0;
+                    self.phase = .compression;
+                    self.skip_remaining = 1;
+                },
+                .compression => if (self.skip(bytes, &offset)) {
+                    self.phase = .extensions_length;
+                },
+                .extensions_length => {
+                    if (!self.fillScratch(bytes, &offset, 2)) return .pending;
+                    self.extensions_remaining = std.mem.readInt(u16, self.scratch[0..2], .big);
+                    self.scratch_len = 0;
+                    if (self.extensions_remaining == 0) return self.finish(.tls12);
+                    self.phase = .extension_header;
+                },
+                .extension_header => {
+                    if (self.extensions_remaining < 4) return self.reject(.extension_length);
+                    if (!self.fillScratch(bytes, &offset, 4)) return .pending;
+                    const extension_type = std.mem.readInt(u16, self.scratch[0..2], .big);
+                    const extension_len: usize = std.mem.readInt(u16, self.scratch[2..4], .big);
+                    self.scratch_len = 0;
+                    self.extensions_remaining -= 4;
+                    if (extension_len > self.extensions_remaining) return self.reject(.extension_length);
+                    self.skip_remaining = extension_len;
+                    if (extension_type == 0x002b) {
+                        if (extension_len != 2) return self.reject(.supported_version_length);
+                        self.phase = .supported_version;
+                    } else {
+                        self.phase = .extension_data;
+                        if (extension_len == 0) {
+                            if (self.extensions_remaining == 0) return self.finish(.tls12);
+                            self.phase = .extension_header;
+                        }
+                    }
+                },
+                .extension_data => {
+                    const before = self.skip_remaining;
+                    const finished = self.skip(bytes, &offset);
+                    self.extensions_remaining -= before - self.skip_remaining;
+                    if (finished) {
+                        if (self.extensions_remaining == 0) return self.finish(.tls12);
+                        self.phase = .extension_header;
+                    }
+                },
+                .supported_version => {
+                    const before = self.scratch_len;
+                    if (!self.fillScratch(bytes, &offset, 2)) {
+                        self.extensions_remaining -= self.scratch_len - before;
+                        return .pending;
+                    }
+                    self.extensions_remaining -= self.scratch_len - before;
+                    const version = std.mem.readInt(u16, self.scratch[0..2], .big);
+                    self.scratch_len = 0;
+                    return self.finish(if (version == 0x0304) .tls13 else .tls12);
+                },
+                .done => return .tls12,
+                .rejected => return .rejected,
+            }
+        }
+        return .pending;
+    }
+
+    fn fillScratch(self: *ServerHelloParser, bytes: []const u8, offset: *usize, needed: usize) bool {
+        const take = @min(needed - self.scratch_len, bytes.len - offset.*);
+        @memcpy(self.scratch[self.scratch_len..][0..take], bytes[offset.*..][0..take]);
+        self.scratch_len += take;
+        offset.* += take;
+        return self.scratch_len == needed;
+    }
+
+    fn skip(self: *ServerHelloParser, bytes: []const u8, offset: *usize) bool {
+        const take = @min(self.skip_remaining, bytes.len - offset.*);
+        self.skip_remaining -= take;
+        offset.* += take;
+        return self.skip_remaining == 0;
+    }
+
+    fn finish(self: *ServerHelloParser, result: ServerHelloResult) ServerHelloResult {
+        self.phase = .done;
+        return result;
+    }
+
+    fn reject(self: *ServerHelloParser, failure: ServerHelloFailure) ServerHelloResult {
+        self.failure = failure;
+        self.phase = .rejected;
+        return .rejected;
+    }
+};
+
 pub const TrafficState = struct {
     user_uuid: [16]u8,
     connection_id: u32,
@@ -54,18 +269,21 @@ pub const TrafficState = struct {
     is_tls12_or_above: bool = false,
     is_tls: bool = false,
     cipher: u16 = 0,
-    server_hello_probe: [max_server_hello_len]u8 = undefined,
-    server_hello_probe_len: usize = 0,
+    client_hello_prefix: [6]u8 = undefined,
+    client_hello_prefix_len: usize = 0,
+    server_hello: ServerHelloParser = .{},
     inbound: LinkState = .{},
     outbound: LinkState = .{},
     first_raw_uplink_logged: bool = false,
+    diagnostic_classification_logged: bool = false,
+    diagnostic_probe_failure_logged: bool = false,
 
     pub fn init(user_uuid: [16]u8, connection_id: u32) TrafficState {
         return .{ .user_uuid = user_uuid, .connection_id = connection_id };
     }
 };
 
-pub fn bridge(client: net.Stream, upstream: *session.OutboundConnection, state: *TrafficState, raw_reactor: *session.RawReactor, io: Io) Io.Cancelable!void {
+pub fn bridge(client: net.Stream, upstream: *session.OutboundConnection, state: *TrafficState, target: session.Target, raw_reactor: *session.RawReactor, io: Io) Io.Cancelable!void {
     var client_read_buffer: [16 * 1024]u8 = undefined;
     var client_reader = client.reader(io, &client_read_buffer);
     var client_write_buffer: [16 * 1024]u8 = undefined;
@@ -77,13 +295,20 @@ pub fn bridge(client: net.Stream, upstream: *session.OutboundConnection, state: 
     var decoded: [16 * 1024 + first_frame_overhead]u8 = undefined;
 
     while (true) {
+        updateDiagnosticPhase(state, target);
         if (state.outbound.writer_direct_copy and state.outbound.reader_direct_copy and
             uplink_pending == 0 and client_reader.interface.buffered().len == 0 and
             upstream.rawHandoffReady())
         {
-            upstream.flush() catch return;
-            raw_reactor.adoptDuplicate(client, upstream.pollStream()) catch return;
-            log.trace("vision {d} raw handoff\n", .{state.connection_id});
+            upstream.flush() catch |err| {
+                logBridgeExit(@errorName(err), state, target);
+                return;
+            };
+            raw_reactor.adoptDuplicate(client, upstream.pollStream()) catch |err| {
+                logBridgeExit(@errorName(err), state, target);
+                return;
+            };
+            logTargetEvent("raw-handoff", state, target);
             return;
         }
         const ready: session.Readable = if (client_reader.interface.buffered().len != 0 or
@@ -97,7 +322,10 @@ pub fn bridge(client: net.Stream, upstream: *session.OutboundConnection, state: 
                 client,
                 upstream.pollStream(),
                 session.connection_idle_timeout_ms,
-            ) catch return;
+            ) catch |err| {
+                logBridgeExit(@errorName(err), state, target);
+                return;
+            };
         if (ready.first and !forwardUplinkOnce(
             &client_reader.interface,
             upstream,
@@ -106,7 +334,7 @@ pub fn bridge(client: net.Stream, upstream: *session.OutboundConnection, state: 
             &uplink_chunk,
             &uplink_pending,
         )) {
-            logBridgeExit("uplink", state);
+            logBridgeExit("uplink", state, target);
             return;
         }
         if (ready.second and !forwardDownlinkOnce(
@@ -117,27 +345,48 @@ pub fn bridge(client: net.Stream, upstream: *session.OutboundConnection, state: 
             &downlink_chunk,
             &decoded,
         )) {
-            logBridgeExit("downlink", state);
+            logBridgeExit("downlink", state, target);
             return;
         }
     }
 }
 
-fn logBridgeExit(reason: []const u8, state: *const TrafficState) void {
-    log.trace(
-        "vision {d} exit {s} tls={} tls12={} xtls={} write_direct={} read_direct={} cipher=0x{x} filter={d}\n",
-        .{
-            state.connection_id,
-            reason,
-            state.is_tls,
-            state.is_tls12_or_above,
-            state.enable_xtls,
-            state.outbound.writer_direct_copy,
-            state.outbound.reader_direct_copy,
-            state.cipher,
-            state.number_of_packets_to_filter,
-        },
-    );
+fn updateDiagnosticPhase(state: *TrafficState, target: session.Target) void {
+    if (state.enable_xtls) {
+        diagnostics.setThreadName("xz-vision-t13");
+    } else if (state.is_tls12_or_above) {
+        diagnostics.setThreadName("xz-vision-t12");
+    } else if (state.is_tls and state.server_hello.isPending()) {
+        diagnostics.setThreadName("xz-vision-scan");
+        return;
+    } else if (state.number_of_packets_to_filter <= 0) {
+        diagnostics.setThreadName(if (state.is_tls) "xz-vis-unrec" else "xz-vision-other");
+    } else {
+        diagnostics.setThreadName("xz-vision-scan");
+        return;
+    }
+
+    if (!state.diagnostic_classification_logged) {
+        state.diagnostic_classification_logged = true;
+        logTargetEvent("classified", state, target);
+    }
+}
+
+fn logBridgeExit(reason: []const u8, state: *const TrafficState, target: session.Target) void {
+    logTargetEvent(reason, state, target);
+}
+
+fn logTargetEvent(event: []const u8, state: *const TrafficState, target: session.Target) void {
+    switch (target) {
+        .address => |address| log.info(
+            "vision {d} {s} target={f} tls={} tls12={} xtls={} write_direct={} read_direct={} cipher=0x{x} filter={d}\n",
+            .{ state.connection_id, event, address, state.is_tls, state.is_tls12_or_above, state.enable_xtls, state.outbound.writer_direct_copy, state.outbound.reader_direct_copy, state.cipher, state.number_of_packets_to_filter },
+        ),
+        .host => |host| log.info(
+            "vision {d} {s} target={s}:{d} tls={} tls12={} xtls={} write_direct={} read_direct={} cipher=0x{x} filter={d}\n",
+            .{ state.connection_id, event, host.name.bytes, host.port, state.is_tls, state.is_tls12_or_above, state.enable_xtls, state.outbound.writer_direct_copy, state.outbound.reader_direct_copy, state.cipher, state.number_of_packets_to_filter },
+        ),
+    }
 }
 
 pub fn writeUplink(destination: *session.OutboundConnection, state: *TrafficState, bytes: []const u8, io: Io) !void {
@@ -228,7 +477,9 @@ fn forwardDownlinkOnce(
         source.enableDirectRead();
     }
     if (cleartext.len == 0) return true;
-    if (state.number_of_packets_to_filter > 0) {
+    if (state.number_of_packets_to_filter > 0 or
+        state.is_tls and state.server_hello.isPending())
+    {
         filterServerTls(state, cleartext);
     }
     writer.writeAll(cleartext) catch return false;
@@ -513,60 +764,58 @@ fn readerState(state: *TrafficState, direction: Direction) *LinkState {
 }
 
 fn filterClientTls(state: *TrafficState, bytes: []const u8) void {
-    if (state.number_of_packets_to_filter <= 0) return;
-    state.number_of_packets_to_filter -= 1;
+    if (state.number_of_packets_to_filter <= 0 or state.is_tls) return;
 
-    if (bytes.len >= 6 and std.mem.startsWith(u8, bytes, &tls_client_handshake_start) and
-        bytes[5] == tls_handshake_type_client_hello)
+    const take = @min(state.client_hello_prefix.len - state.client_hello_prefix_len, bytes.len);
+    @memcpy(
+        state.client_hello_prefix[state.client_hello_prefix_len..][0..take],
+        bytes[0..take],
+    );
+    state.client_hello_prefix_len += take;
+    if (state.client_hello_prefix_len < state.client_hello_prefix.len) return;
+
+    state.number_of_packets_to_filter -= 1;
+    if (std.mem.startsWith(u8, &state.client_hello_prefix, &tls_client_handshake_start) and
+        state.client_hello_prefix[5] == tls_handshake_type_client_hello)
     {
         state.is_tls = true;
+    } else {
+        state.client_hello_prefix_len = 0;
     }
 }
 
 fn filterServerTls(state: *TrafficState, bytes: []const u8) void {
-    if (state.number_of_packets_to_filter <= 0 or state.enable_xtls) return;
+    if (state.enable_xtls or !state.server_hello.isPending()) return;
 
-    const available = max_server_hello_len - state.server_hello_probe_len;
-    const take = @min(available, bytes.len);
-    @memcpy(state.server_hello_probe[state.server_hello_probe_len..][0..take], bytes[0..take]);
-    state.server_hello_probe_len += take;
-
-    const probe = state.server_hello_probe[0..state.server_hello_probe_len];
-    const prefix_len = @min(probe.len, tls_server_handshake_start.len);
-    if (!std.mem.eql(u8, probe[0..prefix_len], tls_server_handshake_start[0..prefix_len])) {
-        state.number_of_packets_to_filter -= 1;
-        state.server_hello_probe_len = 0;
-        return;
+    switch (state.server_hello.feed(bytes)) {
+        .pending => {},
+        .tls12, .tls13 => |result| {
+            state.is_tls12_or_above = true;
+            state.is_tls = true;
+            state.cipher = state.server_hello.cipher;
+            state.enable_xtls = result == .tls13 and tls13CipherCanUseDirectCopy(state.cipher);
+            state.number_of_packets_to_filter = 0;
+        },
+        .rejected => {
+            logProbeFailure(state);
+            if (state.is_tls) {
+                state.number_of_packets_to_filter = 0;
+            } else {
+                state.number_of_packets_to_filter -= 1;
+                state.server_hello.reset();
+            }
+        },
     }
-    if (probe.len < 9) return;
-    if (probe[5] != tls_handshake_type_server_hello) {
-        state.number_of_packets_to_filter -= 1;
-        state.server_hello_probe_len = 0;
-        return;
-    }
+}
 
-    const handshake_len = (@as(usize, probe[6]) << 16) |
-        (@as(usize, probe[7]) << 8) | probe[8];
-    const total_len = 9 + handshake_len;
-    if (total_len > max_server_hello_len) {
-        state.number_of_packets_to_filter = 0;
-        return;
-    }
-    if (probe.len < total_len) return;
-
-    state.is_tls12_or_above = true;
-    state.is_tls = true;
-    if (total_len > 46) {
-        const session_id_len: usize = probe[43];
-        const cipher_index = 44 + session_id_len;
-        if (cipher_index + 2 <= total_len) {
-            state.cipher = std.mem.readInt(u16, probe[cipher_index..][0..2], .big);
-        }
-    }
-
-    state.enable_xtls = std.mem.indexOf(u8, probe[0..total_len], &tls13_supported_versions) != null and
-        tls13CipherCanUseDirectCopy(state.cipher);
-    state.number_of_packets_to_filter = 0;
+fn logProbeFailure(state: *TrafficState) void {
+    if (state.diagnostic_probe_failure_logged) return;
+    state.diagnostic_probe_failure_logged = true;
+    const shown = state.server_hello.observed_prefix[0..state.server_hello.observed_prefix_len];
+    log.info(
+        "vision {d} server-probe-rejected reason={s} prefix={x}\n",
+        .{ state.connection_id, @tagName(state.server_hello.failure), shown },
+    );
 }
 
 fn tls13CipherCanUseDirectCopy(cipher: u16) bool {
@@ -651,6 +900,15 @@ test "detects TLS ClientHello" {
     try std.testing.expectEqual(@as(i32, 7), state.number_of_packets_to_filter);
 }
 
+test "assembles byte-fragmented TLS ClientHello prefix without exhausting filter budget" {
+    var state = TrafficState.init([_]u8{0} ** 16, 1);
+    const prefix = [_]u8{ 0x16, 0x03, 0x01, 0x00, 0x2a, 0x01 };
+    for (prefix) |byte| filterClientTls(&state, &.{byte});
+
+    try std.testing.expect(state.is_tls);
+    try std.testing.expectEqual(@as(i32, 7), state.number_of_packets_to_filter);
+}
+
 test "detects TLS 1.3 ServerHello and direct command transition" {
     const uuid = [_]u8{
         0xaa, 0xbb, 0xcc, 0xdd,
@@ -660,12 +918,8 @@ test "detects TLS 1.3 ServerHello and direct command transition" {
     };
     var state = TrafficState.init(uuid, 1);
 
-    var server_hello = [_]u8{0} ** 96;
-    server_hello[0..9].* = .{ 0x16, 0x03, 0x03, 0x00, 0x5b, 0x02, 0x00, 0x00, 0x57 };
-    server_hello[43] = 0;
-    server_hello[44] = 0x13;
-    server_hello[45] = 0x01;
-    server_hello[70..76].* = tls13_supported_versions;
+    var server_hello: [96]u8 = undefined;
+    buildTls13ServerHello(&server_hello, 0x1301);
     filterServerTls(&state, &server_hello);
 
     try std.testing.expect(state.is_tls);
@@ -688,18 +942,58 @@ test "detects TLS 1.3 ServerHello and direct command transition" {
 
 test "assembles fragmented TLS 1.3 ServerHello" {
     var state = TrafficState.init([_]u8{0} ** 16, 1);
-    var server_hello = [_]u8{0} ** 96;
-    server_hello[0..9].* = .{ 0x16, 0x03, 0x03, 0x00, 0x5b, 0x02, 0x00, 0x00, 0x57 };
-    server_hello[43] = 0;
-    server_hello[44] = 0x13;
-    server_hello[45] = 0x03;
-    server_hello[70..76].* = tls13_supported_versions;
+    var server_hello: [96]u8 = undefined;
+    buildTls13ServerHello(&server_hello, 0x1303);
 
     for (server_hello) |byte| filterServerTls(&state, &.{byte});
 
     try std.testing.expect(state.is_tls12_or_above);
     try std.testing.expect(state.enable_xtls);
     try std.testing.expectEqual(@as(u16, 0x1303), state.cipher);
+}
+
+test "streams post-quantum sized TLS 1.3 ServerHello without retaining extensions" {
+    var state = TrafficState.init([_]u8{0} ** 16, 1);
+    state.is_tls = true;
+    var server_hello: [1215]u8 = undefined;
+    buildTls13ServerHello(&server_hello, 0x1302);
+
+    var offset: usize = 0;
+    while (offset < server_hello.len) {
+        const take = @min(@as(usize, 7), server_hello.len - offset);
+        filterServerTls(&state, server_hello[offset..][0..take]);
+        offset += take;
+    }
+
+    try std.testing.expect(state.is_tls12_or_above);
+    try std.testing.expect(state.enable_xtls);
+    try std.testing.expectEqual(@as(u16, 0x1302), state.cipher);
+    try std.testing.expectEqual(@as(i32, 0), state.number_of_packets_to_filter);
+}
+
+fn buildTls13ServerHello(buffer: []u8, cipher: u16) void {
+    std.debug.assert(buffer.len >= 59);
+    std.debug.assert(buffer.len - 9 <= max_server_hello_handshake_len);
+    @memset(buffer, 0);
+
+    buffer[0..3].* = .{ 0x16, 0x03, 0x03 };
+    std.mem.writeInt(u16, buffer[3..5], @intCast(buffer.len - 5), .big);
+    buffer[5] = tls_handshake_type_server_hello;
+    const handshake_len = buffer.len - 9;
+    buffer[6] = @intCast(handshake_len >> 16);
+    buffer[7] = @intCast((handshake_len >> 8) & 0xff);
+    buffer[8] = @intCast(handshake_len & 0xff);
+    buffer[43] = 0;
+    std.mem.writeInt(u16, buffer[44..46], cipher, .big);
+    buffer[46] = 0;
+
+    const extensions_len = handshake_len - 40;
+    std.mem.writeInt(u16, buffer[47..49], @intCast(extensions_len), .big);
+    const filler_len = extensions_len - 10;
+    buffer[49..51].* = .{ 0x00, 0x33 };
+    std.mem.writeInt(u16, buffer[51..53], @intCast(filler_len), .big);
+    const supported_version = 53 + filler_len;
+    buffer[supported_version..][0..6].* = .{ 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04 };
 }
 
 test "assembles split initial Vision frame before decoding" {

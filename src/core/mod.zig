@@ -4,6 +4,7 @@ const Io = std.Io;
 const net = Io.net;
 
 const config = @import("../config/mod.zig");
+const diagnostics = @import("../diagnostics.zig");
 const fakedns = @import("../dns/fakedns.zig");
 const routing = @import("../routing/mod.zig");
 const raw_reactor = @import("../net/reactor.zig");
@@ -110,10 +111,12 @@ pub const Runtime = struct {
 };
 
 fn runRawReactor(reactor: *raw_reactor.Reactor) Io.Cancelable!void {
+    diagnostics.setRawReactorCount(0);
     try reactor.run();
 }
 
 fn runSocksInbound(inbound: config.Inbound, dispatcher: session.Dispatcher, io: Io, log_writer: *Io.Writer, log_mutex: *Io.Mutex) Io.Cancelable!void {
+    diagnostics.setThreadName("xz-socks-listen");
     socks.run(inbound, dispatcher, io, log_writer, log_mutex) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => return,
@@ -121,6 +124,7 @@ fn runSocksInbound(inbound: config.Inbound, dispatcher: session.Dispatcher, io: 
 }
 
 fn runRedirectInbound(inbound: config.Inbound, dispatcher: session.Dispatcher, fake_dns: ?*fakedns.Store, io: Io, log_writer: *Io.Writer, log_mutex: *Io.Mutex) Io.Cancelable!void {
+    diagnostics.setThreadName("xz-redir-listen");
     redirect.run(inbound, dispatcher, fake_dns, io, log_writer, log_mutex) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => return,
@@ -128,6 +132,7 @@ fn runRedirectInbound(inbound: config.Inbound, dispatcher: session.Dispatcher, f
 }
 
 fn runDnsInbound(inbound: config.Inbound, dns_cfg: config.DnsConfig, fake_dns: ?*fakedns.Store, dispatcher: session.Dispatcher, io: Io, log_writer: *Io.Writer, log_mutex: *Io.Mutex) Io.Cancelable!void {
+    diagnostics.setThreadName("xz-dns-listen");
     dns_inbound.run(inbound, dns_cfg, fake_dns, dispatcher, io, log_writer, log_mutex) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => return,

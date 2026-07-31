@@ -165,6 +165,8 @@ The initial 500 ms wait mirrors Xray's behavior. If no client bytes arrive, an e
 
 If the input is TLS, the initial reader consumes exactly one complete record. The uplink pump continues assembling complete TLS records until Vision switches to direct copy; socket read boundaries must not become Vision frame boundaries. It performs at most one socket read per readiness event and preserves an incomplete record in connection state, returning to the bidirectional poll loop between fragments. Waiting synchronously for the rest of an inner TLS record prevents downlink progress and stalls interactive HTTPS and WebSocket sessions.
 
+TLS classification is incremental in both directions. The client side retains only the six-byte ClientHello prefix, and the server side streams TLS record, ServerHello, and extension headers through a small state machine. Large extensions such as post-quantum hybrid key shares are skipped without buffering the complete ServerHello. This avoids both socket-read-boundary dependence and the former 1 KiB ServerHello limit, which left modern TLS 1.3 connections on the blocking Vision bridge instead of handing them to the raw reactor.
+
 After a TLS 1.3 application-data record triggers Vision `CommandDirect`, the final command frame is flushed through outer REALITY/TLS. Subsequent writes use the raw TCP stream, while the reader first drains decrypted and socket-buffered bytes before switching to raw reads. Network pumps use single `readVec` calls so small TLS records are forwarded without waiting for a full 16 KiB buffer.
 
 ## Testing Strategy

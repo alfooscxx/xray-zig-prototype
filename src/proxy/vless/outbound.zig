@@ -3,6 +3,7 @@ const Io = std.Io;
 const net = Io.net;
 
 const config = @import("../../config/mod.zig");
+const diagnostics = @import("../../diagnostics.zig");
 const log = @import("../../log.zig");
 const session = @import("../../net/session.zig");
 pub const vision = @import("vision.zig");
@@ -24,6 +25,8 @@ var next_connection_id: std.atomic.Value(u32) = .init(1);
 var handshake_slots: Io.Semaphore = .{ .permits = max_concurrent_handshakes };
 
 pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: session.Session, preface: session.Preface, raw_reactor: *session.RawReactor, io: Io) !void {
+    diagnostics.setThreadName("xz-vless-init");
+    defer diagnostics.setThreadName("xray-zig");
     const connection_id = next_connection_id.fetchAdd(1, .monotonic);
     const settings = switch (outbound.settings) {
         .vless => |vless| vless,
@@ -53,12 +56,15 @@ pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: sessio
         try writeInitialVisionPayload(client, &upstream, &traffic_state, preface, io);
         log.trace("vless {d} initial-ready\n", .{connection_id});
         try upstream.flush();
+        diagnostics.setThreadName("xz-vless-wait");
         waitResponseHeader(client, &upstream, &traffic_state, io) catch |err| {
             log.warn("vless {d} response wait failed: {s}\n", .{ connection_id, @errorName(err) });
             return err;
         };
         log.trace("vless {d} response-ready\n", .{connection_id});
-        try vision.bridge(client, &upstream, &traffic_state, raw_reactor, io);
+        logEstablished(connection_id, sess.target, traffic_state.is_tls);
+        diagnostics.setThreadName("xz-vision-scan");
+        try vision.bridge(client, &upstream, &traffic_state, sess.target, raw_reactor, io);
         log.trace("vless {d} bridge-returned\n", .{connection_id});
         return;
     }
@@ -68,6 +74,19 @@ pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: sessio
     try readResponseHeader(&upstream, io);
 
     try session.bridgeOutbound(client, &upstream, io);
+}
+
+fn logEstablished(connection_id: u32, target: session.Target, client_tls: bool) void {
+    switch (target) {
+        .address => |address| log.info(
+            "vless {d} established target={f} client_tls={}\n",
+            .{ connection_id, address, client_tls },
+        ),
+        .host => |host| log.info(
+            "vless {d} established target={s}:{d} client_tls={}\n",
+            .{ connection_id, host.name.bytes, host.port, client_tls },
+        ),
+    }
 }
 
 const ResponseHeaderState = struct {

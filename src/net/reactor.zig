@@ -5,6 +5,7 @@ const net = Io.net;
 
 const linux = std.os.linux;
 const posix = std.posix;
+const diagnostics = @import("../diagnostics.zig");
 
 const buffer_size = 16 * 1024;
 const cancellation_poll_ms = 1000;
@@ -141,6 +142,7 @@ pub const Reactor = struct {
 
         while (true) {
             self.takePending(&active_head);
+            diagnostics.setRawReactorCount(self.active_count);
             if (self.stopped.load(.acquire)) return;
 
             self.poll_fds[0] = .{
@@ -195,6 +197,7 @@ pub const Reactor = struct {
                     link = &connection.next;
                 }
             }
+            diagnostics.setRawReactorCount(self.active_count);
         }
     }
 

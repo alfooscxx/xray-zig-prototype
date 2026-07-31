@@ -1,4 +1,4 @@
-pub const version = "0.0.6";
+pub const version = "0.0.7";
 
 pub const config = @import("config/mod.zig");
 pub const core = @import("core/mod.zig");
