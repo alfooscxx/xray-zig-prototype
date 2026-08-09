@@ -1,0 +1,21 @@
+# xray-zig-quick profile for the 154 MiB MIPS router.
+# Relative paths are resolved from this file's directory.
+
+Config = ../xray-zig.json
+Binary = /usr/bin/xray-zig
+LanInterface = br-lan
+
+# These match the field-tested router capacity split.
+MemoryBudgetMiB = 70
+WorkerLimit = 80
+RawConnectionLimit = 240
+
+# Install REDIRECT rules for every corresponding inbound found in Config.
+IPv4 = yes
+IPv6 = yes
+HijackDNS = yes
+
+# Keep TCP services hosted by the router itself out of the redirect inbound.
+BypassLocal = yes
+
+# The default log is /var/run/xray-zig-quick/router.log on tmpfs.

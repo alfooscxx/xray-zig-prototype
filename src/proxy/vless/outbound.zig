@@ -21,6 +21,7 @@ pub const Error = error{
 const max_initial_tls_record_len = 18 * 1024;
 const max_response_header_len = 2 + std.math.maxInt(u8);
 const max_concurrent_handshakes = 32;
+const initialization_timeout_seconds = 15;
 var next_connection_id: std.atomic.Value(u32) = .init(1);
 var handshake_slots: Io.Semaphore = .{ .permits = max_concurrent_handshakes };
 
@@ -223,12 +224,21 @@ fn connect(upstream: *session.OutboundConnection, outbound: *const config.Outbou
     try handshake_slots.wait(io);
     defer handshake_slots.post(io);
 
-    const tcp = try session.connectHostOrIp(settings.address, settings.port, io);
+    const deadline = Io.Clock.Timestamp.fromNow(io, .{
+        .raw = Io.Duration.fromSeconds(initialization_timeout_seconds),
+        .clock = .awake,
+    });
+    const tcp = try session.connectHostOrIpTimeout(
+        settings.address,
+        settings.port,
+        io,
+        .{ .deadline = deadline },
+    );
     errdefer tcp.close(io);
 
     if (outbound.stream.security) |security| {
         if (std.mem.eql(u8, security, "reality")) {
-            try upstream.initReality(tcp, outbound.stream.reality.?, io);
+            try upstream.initReality(tcp, outbound.stream.reality.?, io, deadline);
             return;
         }
     }

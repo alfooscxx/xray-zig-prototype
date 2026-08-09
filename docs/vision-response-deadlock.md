@@ -126,6 +126,14 @@ Three immediate 128-client runs then completed 128/128, with the two stable
 fresh-process runs taking 6.55 and 6.38 seconds. The first measured run reached
 70.2 MiB peak RSS at 129 process threads on x86.
 
+TCP connect and REALITY/TLS initialization now also share one 15-second
+monotonic deadline after a connection acquires a handshake permit. The
+deadline-aware handshake reader and writer poll the socket on the connection's
+existing worker, so a peer that accepts TCP and then stops responding cannot
+retain a permit indefinitely and no timer worker is added for each handshake.
+After REALITY initialization succeeds, normal established-connection timeouts
+apply instead.
+
 ## Resource Comparison
 
 Measurements on a 154 MiB MIPS32 target showed that an isolated Zig allowance

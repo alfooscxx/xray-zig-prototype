@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const net = Io.net;
+const posix = std.posix;
 
 const reality = @import("../transport/reality/client.zig");
 pub const RawReactor = @import("reactor.zig").Reactor;
@@ -8,6 +10,7 @@ pub const RawReactor = @import("reactor.zig").Reactor;
 pub const max_preface_len = 2048;
 pub const response_header_timeout_ms = 60 * 1000;
 pub const connection_idle_timeout_ms = 300 * 1000;
+const deadline_cancellation_poll_ns = std.time.ns_per_s;
 
 pub const Target = union(enum) {
     address: net.IpAddress,
@@ -59,19 +62,215 @@ pub fn targetFromHostBytes(host: []const u8, port: u16) !Target {
 }
 
 pub fn connectHostOrIp(host: []const u8, port: u16, io: Io) !net.Stream {
-    return connectTarget(try targetFromHostBytes(host, port), io);
+    return connectTargetTimeout(try targetFromHostBytes(host, port), io, .none);
+}
+
+pub fn connectHostOrIpTimeout(host: []const u8, port: u16, io: Io, timeout: Io.Timeout) !net.Stream {
+    return connectTargetTimeout(try targetFromHostBytes(host, port), io, timeout);
 }
 
 pub fn connectTarget(target: Target, io: Io) !net.Stream {
+    return connectTargetTimeout(target, io, .none);
+}
+
+pub fn connectTargetTimeout(target: Target, io: Io, timeout: Io.Timeout) !net.Stream {
     const options: net.IpAddress.ConnectOptions = .{
         .mode = .stream,
         .protocol = .tcp,
     };
 
-    return switch (target) {
+    const deadline = timeout.toTimestamp(io) orelse return switch (target) {
         .address => |address| address.connect(io, options),
         .host => |host| host.name.connect(io, host.port, options),
     };
+
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+
+    return switch (target) {
+        .address => |address| connectIpDeadline(address, io, deadline),
+        .host => |host| connectHostDeadline(host, io, deadline),
+    };
+}
+
+fn connectHostDeadline(host: HostTarget, io: Io, deadline: Io.Clock.Timestamp) !net.Stream {
+    var canonical_name_buffer: [net.HostName.max_len]u8 = undefined;
+    var lookup_buffer: [32]net.HostName.LookupResult = undefined;
+    var lookup_queue: Io.Queue(net.HostName.LookupResult) = .init(&lookup_buffer);
+    try host.name.lookup(io, &lookup_queue, .{
+        .port = host.port,
+        .canonical_name_buffer = &canonical_name_buffer,
+    });
+
+    var last_error: ?net.IpAddress.ConnectError = null;
+    while (lookup_queue.getOneUncancelable(io)) |result| switch (result) {
+        .canonical_name => {},
+        .address => |address| {
+            return connectIpDeadline(address, io, deadline) catch |err| {
+                last_error = err;
+                continue;
+            };
+        },
+    } else |err| switch (err) {
+        error.Closed => return last_error orelse error.UnknownHostName,
+    }
+}
+
+fn connectIpDeadline(address: net.IpAddress, io: Io, deadline: Io.Clock.Timestamp) net.IpAddress.ConnectError!net.Stream {
+    const family: posix.sa_family_t = switch (address) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    };
+    const socket_fd = openTcpSocket(family, io) catch |err| return err;
+    errdefer _ = posix.system.close(socket_fd);
+
+    switch (address) {
+        .ip4 => |ip4| {
+            var socket_address: posix.sockaddr.in = .{
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = @bitCast(ip4.bytes),
+            };
+            try beginConnect(socket_fd, @ptrCast(&socket_address), @sizeOf(posix.sockaddr.in), io);
+        },
+        .ip6 => |ip6| {
+            var socket_address: posix.sockaddr.in6 = .{
+                .port = std.mem.nativeToBig(u16, ip6.port),
+                .flowinfo = ip6.flow,
+                .addr = ip6.bytes,
+                .scope_id = ip6.interface.index,
+            };
+            try beginConnect(socket_fd, @ptrCast(&socket_address), @sizeOf(posix.sockaddr.in6), io);
+        },
+    }
+
+    try waitConnected(socket_fd, io, deadline);
+    try setBlocking(socket_fd);
+    return .{ .socket = .{ .handle = socket_fd, .address = address } };
+}
+
+fn openTcpSocket(family: posix.sa_family_t, io: Io) net.IpAddress.ConnectError!posix.socket_t {
+    while (true) {
+        const rc = posix.system.socket(
+            family,
+            posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+            posix.IPPROTO.TCP,
+        );
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => try io.checkCancel(),
+            .ACCES => return error.AccessDenied,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .INVAL => return error.ProtocolUnsupportedBySystem,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
+            .PROTOTYPE => return error.SocketModeUnsupported,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn beginConnect(
+    socket_fd: posix.socket_t,
+    address: *const posix.sockaddr,
+    address_len: posix.socklen_t,
+    io: Io,
+) net.IpAddress.ConnectError!void {
+    while (true) switch (posix.errno(posix.system.connect(socket_fd, address, address_len))) {
+        .SUCCESS, .ISCONN => return,
+        .INTR => try io.checkCancel(),
+        .AGAIN, .INPROGRESS, .ALREADY => return,
+        else => |err| return connectError(err),
+    };
+}
+
+fn waitConnected(socket_fd: posix.socket_t, io: Io, deadline: Io.Clock.Timestamp) net.IpAddress.ConnectError!void {
+    var descriptor = [1]posix.pollfd{.{
+        .fd = socket_fd,
+        .events = posix.POLL.OUT,
+        .revents = 0,
+    }};
+
+    while (true) {
+        try io.checkCancel();
+        const remaining_ns = deadline.durationFromNow(io).raw.toNanoseconds();
+        if (remaining_ns <= 0) return error.Timeout;
+        const poll_ns = @min(remaining_ns, deadline_cancellation_poll_ns);
+        var poll_timeout: posix.timespec = .{
+            .sec = @intCast(@divTrunc(poll_ns, std.time.ns_per_s)),
+            .nsec = @intCast(@mod(poll_ns, std.time.ns_per_s)),
+        };
+        const ready = posix.ppoll(&descriptor, &poll_timeout, null) catch |err| switch (err) {
+            error.SignalInterrupt => continue,
+            else => |e| return e,
+        };
+        if (ready == 0) continue;
+
+        var socket_error: i32 = 0;
+        var error_len: posix.socklen_t = @sizeOf(@TypeOf(socket_error));
+        const rc = posix.system.getsockopt(
+            socket_fd,
+            posix.SOL.SOCKET,
+            posix.SO.ERROR,
+            @ptrCast(&socket_error),
+            &error_len,
+        );
+        if (posix.errno(rc) != .SUCCESS or error_len != @sizeOf(@TypeOf(socket_error))) {
+            return error.Unexpected;
+        }
+        if (socket_error == 0) return;
+        return connectError(@enumFromInt(socket_error));
+    }
+}
+
+fn setBlocking(socket_fd: posix.socket_t) net.IpAddress.ConnectError!void {
+    const get_rc = posix.system.fcntl(socket_fd, posix.F.GETFL, @as(usize, 0));
+    if (posix.errno(get_rc) != .SUCCESS) return error.Unexpected;
+    const nonblock = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+    const set_rc = posix.system.fcntl(socket_fd, posix.F.SETFL, get_rc & ~nonblock);
+    if (posix.errno(set_rc) != .SUCCESS) return error.Unexpected;
+}
+
+fn connectError(err: posix.E) net.IpAddress.ConnectError {
+    return switch (err) {
+        .ADDRNOTAVAIL => error.AddressUnavailable,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .AGAIN, .INPROGRESS => error.WouldBlock,
+        .ALREADY => error.ConnectionPending,
+        .CONNREFUSED => error.ConnectionRefused,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .HOSTUNREACH => error.HostUnreachable,
+        .NETUNREACH => error.NetworkUnreachable,
+        .TIMEDOUT => error.Timeout,
+        .ACCES, .PERM => error.AccessDenied,
+        .NETDOWN => error.NetworkDown,
+        else => error.Unexpected,
+    };
+}
+
+test "TCP connect deadline uses a nonblocking POSIX connection" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{
+        .stack_size = 1024 * 1024,
+        .concurrent_limit = .limited(2),
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var listen_address: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try listen_address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+
+    const deadline = Io.Clock.Timestamp.fromNow(io, .{
+        .raw = Io.Duration.fromSeconds(1),
+        .clock = .awake,
+    });
+    const stream = try connectTargetTimeout(.{ .address = listener.socket.address }, io, .{ .deadline = deadline });
+    defer stream.close(io);
+
+    const accepted = try listener.accept(io);
+    accepted.close(io);
 }
 
 pub const OutboundConnection = union(enum) {
@@ -82,9 +281,9 @@ pub const OutboundConnection = union(enum) {
         self.* = .{ .plain = stream };
     }
 
-    pub fn initReality(self: *OutboundConnection, stream: net.Stream, settings: anytype, io: Io) !void {
+    pub fn initReality(self: *OutboundConnection, stream: net.Stream, settings: anytype, io: Io, deadline: ?Io.Clock.Timestamp) !void {
         self.* = .{ .reality = undefined };
-        try self.reality.init(stream, settings, io);
+        try self.reality.initDeadline(stream, settings, io, deadline);
     }
 
     pub fn close(self: *OutboundConnection, io: Io) void {

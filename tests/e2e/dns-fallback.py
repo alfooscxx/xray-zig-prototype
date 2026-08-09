@@ -39,7 +39,7 @@ def response_for(query):
     return header + query[12:end] + answer
 
 
-class FallbackServer:
+class DirectDnsServer:
     def __init__(self):
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp.bind(("127.0.0.1", 0))
@@ -53,7 +53,7 @@ class FallbackServer:
         self.tcp_queries = 0
 
     def start(self):
-        threading.Thread(target=self.drop_udp, daemon=True).start()
+        threading.Thread(target=self.answer_udp, daemon=True).start()
         threading.Thread(target=self.accept_tcp, daemon=True).start()
 
     def close(self):
@@ -61,11 +61,12 @@ class FallbackServer:
         self.udp.close()
         self.tcp.close()
 
-    def drop_udp(self):
+    def answer_udp(self):
         while not self.stop.is_set():
             try:
-                self.udp.recvfrom(4096)
+                query, peer = self.udp.recvfrom(4096)
                 self.udp_queries += 1
+                self.udp.sendto(response_for(query), peer)
             except OSError:
                 return
 
@@ -123,7 +124,7 @@ def main():
     if not xray_zig.is_file():
         raise SystemExit(f"xray-zig not found: {xray_zig}")
 
-    upstream = FallbackServer()
+    upstream = DirectDnsServer()
     upstream.start()
     inbound_port = pick_port(socket.SOCK_DGRAM)
 
@@ -165,7 +166,7 @@ def main():
             elapsed = time.monotonic() - started
             if elapsed > 3:
                 raise RuntimeError(f"DNS fallback was serialized or stalled: {elapsed:.3f}s")
-            if upstream.udp_queries != 0 or upstream.tcp_queries < QUERY_COUNT:
+            if upstream.udp_queries < QUERY_COUNT or upstream.tcp_queries != 0:
                 raise RuntimeError(
                     f"unexpected transport counts: udp={upstream.udp_queries} tcp={upstream.tcp_queries}"
                 )

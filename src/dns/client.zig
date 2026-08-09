@@ -220,6 +220,52 @@ pub fn exchange(
     if (packet.len > response_capacity) return error.DnsResponseTooLarge;
     const upstream_address = upstream.parseAddress(server.resolver) catch return error.UnsupportedDnsUpstream;
 
+    if (std.mem.eql(u8, server.outbound_tag, "direct")) {
+        const udp_response = try exchangeDirectUdp(packet, upstream_address, response_buffer, io);
+        if (udp_response.len < 3 or udp_response[2] & 0x02 == 0) return udp_response;
+    }
+
+    return exchangeTcp(packet, domain, server, upstream_address, dispatcher, response_buffer, io);
+}
+
+fn exchangeDirectUdp(
+    packet: []const u8,
+    upstream_address: net.IpAddress,
+    response_buffer: []u8,
+    io: Io,
+) ![]const u8 {
+    var local_address: net.IpAddress = switch (upstream_address) {
+        .ip4 => .{ .ip4 = net.Ip4Address.unspecified(0) },
+        .ip6 => .{ .ip6 = net.Ip6Address.unspecified(0) },
+    };
+    var socket = try local_address.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer socket.close(io);
+
+    try socket.send(io, &upstream_address, packet);
+    const message = try socket.receiveTimeout(io, response_buffer, .{
+        .duration = .{
+            .raw = Io.Duration.fromSeconds(query_timeout_seconds),
+            .clock = .awake,
+        },
+    });
+    if (!std.meta.eql(message.from, upstream_address)) return error.InvalidDnsResponse;
+    if (message.data.len < 2 or packet.len < 2 or
+        !std.mem.eql(u8, message.data[0..2], packet[0..2]))
+    {
+        return error.InvalidDnsResponse;
+    }
+    return message.data;
+}
+
+fn exchangeTcp(
+    packet: []const u8,
+    domain: []const u8,
+    server: *const config.DnsServer,
+    upstream_address: net.IpAddress,
+    dispatcher: session.Dispatcher,
+    response_buffer: []u8,
+    io: Io,
+) ![]const u8 {
     var pair = try createLoopbackPair(io);
     defer pair[0].close(io);
 

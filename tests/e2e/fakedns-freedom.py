@@ -54,38 +54,29 @@ def response_for(query):
 
 class DnsServer:
     def __init__(self):
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(("127.0.0.1", 0))
         self.port = self.socket.getsockname()[1]
-        self.socket.listen()
         self.stop = threading.Event()
         self.queries = 0
 
     def start(self):
-        threading.Thread(target=self.accept, daemon=True).start()
+        threading.Thread(target=self.answer, daemon=True).start()
 
     def close(self):
         self.stop.set()
         self.socket.close()
 
-    def accept(self):
+    def answer(self):
         while not self.stop.is_set():
             try:
-                connection, _ = self.socket.accept()
+                query, peer = self.socket.recvfrom(4096)
             except OSError:
                 return
-            threading.Thread(target=self.answer, args=(connection,), daemon=True).start()
-
-    def answer(self, connection):
-        with connection:
             try:
-                length = struct.unpack("!H", recv_exactly(connection, 2))[0]
-                query = recv_exactly(connection, length)
-                response = response_for(query)
-                connection.sendall(struct.pack("!H", len(response)) + response)
+                self.socket.sendto(response_for(query), peer)
                 self.queries += 1
-            except (EOFError, OSError):
+            except OSError:
                 return
 
 

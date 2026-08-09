@@ -14,6 +14,7 @@ const X25519 = std.crypto.dh.X25519;
 const tls = std.crypto.tls;
 
 const xray_client_version = [3]u8{ 26, 6, 1 };
+const deadline_cancellation_poll_ns = std.time.ns_per_s;
 
 pub const Error = error{
     InvalidRealityPublicKey,
@@ -54,8 +55,8 @@ pub fn parseSettings(settings: config.RealitySettings) !ParsedSettings {
 
 pub const Client = struct {
     stream: net.Stream,
-    stream_reader: net.Stream.Reader,
-    stream_writer: net.Stream.Writer,
+    stream_reader: DeadlineStreamReader,
+    stream_writer: DeadlineStreamWriter,
     tls_client: RealityTlsClient,
     tls_read_buffer: [RealityTlsClient.min_buffer_len]u8,
     tls_write_buffer: [RealityTlsClient.min_buffer_len]u8,
@@ -65,6 +66,16 @@ pub const Client = struct {
     direct_write: bool = false,
 
     pub fn init(self: *Client, stream: net.Stream, settings: config.RealitySettings, io: Io) !void {
+        return self.initDeadline(stream, settings, io, null);
+    }
+
+    pub fn initDeadline(
+        self: *Client,
+        stream: net.Stream,
+        settings: config.RealitySettings,
+        io: Io,
+        deadline: ?Io.Clock.Timestamp,
+    ) !void {
         const parsed = try parseSettings(settings);
         if (parsed.server_name.len > std.math.maxInt(u16)) return error.InvalidRealityServerName;
 
@@ -91,8 +102,8 @@ pub const Client = struct {
         entropy[32..64].* = sealSessionId(auth_key, entropy[0..32].*, hello, plain_session_id);
 
         self.stream = stream;
-        self.stream_reader = stream.reader(io, &self.socket_read_buffer);
-        self.stream_writer = stream.writer(io, &self.socket_write_buffer);
+        self.stream_reader = .init(stream, io, &self.socket_read_buffer, deadline);
+        self.stream_writer = .init(stream, io, &self.socket_write_buffer, deadline);
         self.tls_client = RealityTlsClient.init(
             &self.stream_reader.interface,
             &self.stream_writer.interface,
@@ -113,6 +124,8 @@ pub const Client = struct {
             error.ReadFailed => self.stream_reader.err orelse err,
             else => |e| e,
         };
+        self.stream_reader.deadline = null;
+        self.stream_writer.deadline = null;
     }
 
     pub fn close(self: *Client, io: Io) void {
@@ -223,6 +236,132 @@ pub const Client = struct {
     }
 };
 
+const DeadlineStreamReader = struct {
+    io: Io,
+    interface: Io.Reader,
+    stream: net.Stream,
+    err: ?anyerror = null,
+    deadline: ?Io.Clock.Timestamp,
+
+    fn init(stream: net.Stream, io: Io, buffer: []u8, deadline: ?Io.Clock.Timestamp) DeadlineStreamReader {
+        return .{
+            .io = io,
+            .interface = .{
+                .vtable = &.{
+                    .stream = streamImpl,
+                    .readVec = readVec,
+                },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .stream = stream,
+            .deadline = deadline,
+        };
+    }
+
+    fn streamImpl(reader: *Io.Reader, writer: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const dest = limit.slice(try writer.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try readVec(reader, &data);
+        writer.advance(n);
+        return n;
+    }
+
+    fn readVec(reader: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const self: *DeadlineStreamReader = @alignCast(@fieldParentPtr("interface", reader));
+        var iovecs_buffer: [8][]u8 = undefined;
+        const dest_n, const data_size = try reader.writableVector(&iovecs_buffer, data);
+        const dest = iovecs_buffer[0..dest_n];
+        std.debug.assert(dest[0].len > 0);
+
+        waitReady(self.io, self.stream.socket.handle, std.posix.POLL.IN, self.deadline) catch |err| {
+            self.err = err;
+            return error.ReadFailed;
+        };
+        const n = self.io.vtable.netRead(self.io.userdata, self.stream.socket.handle, dest) catch |err| {
+            self.err = err;
+            return error.ReadFailed;
+        };
+        if (n == 0) return error.EndOfStream;
+        if (n > data_size) {
+            self.interface.end += n - data_size;
+            return data_size;
+        }
+        return n;
+    }
+};
+
+const DeadlineStreamWriter = struct {
+    io: Io,
+    interface: Io.Writer,
+    stream: net.Stream,
+    err: ?anyerror = null,
+    deadline: ?Io.Clock.Timestamp,
+
+    fn init(stream: net.Stream, io: Io, buffer: []u8, deadline: ?Io.Clock.Timestamp) DeadlineStreamWriter {
+        return .{
+            .io = io,
+            .interface = .{
+                .vtable = &.{ .drain = drain },
+                .buffer = buffer,
+            },
+            .stream = stream,
+            .deadline = deadline,
+        };
+    }
+
+    fn drain(writer: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *DeadlineStreamWriter = @alignCast(@fieldParentPtr("interface", writer));
+        waitReady(self.io, self.stream.socket.handle, std.posix.POLL.OUT, self.deadline) catch |err| {
+            self.err = err;
+            return error.WriteFailed;
+        };
+        const n = self.io.vtable.netWrite(
+            self.io.userdata,
+            self.stream.socket.handle,
+            writer.buffered(),
+            data,
+            splat,
+        ) catch |err| {
+            self.err = err;
+            return error.WriteFailed;
+        };
+        return writer.consume(n);
+    }
+};
+
+fn waitReady(
+    io: Io,
+    handle: net.Socket.Handle,
+    events: i16,
+    deadline: ?Io.Clock.Timestamp,
+) !void {
+    const end = deadline orelse return;
+    var descriptor = [1]std.posix.pollfd{.{
+        .fd = handle,
+        .events = events,
+        .revents = 0,
+    }};
+
+    while (true) {
+        try io.checkCancel();
+        const remaining_ns = end.durationFromNow(io).raw.toNanoseconds();
+        if (remaining_ns <= 0) return error.Timeout;
+        const poll_ns = @min(remaining_ns, deadline_cancellation_poll_ns);
+        var timeout: std.posix.timespec = .{
+            .sec = @intCast(@divTrunc(poll_ns, std.time.ns_per_s)),
+            .nsec = @intCast(@mod(poll_ns, std.time.ns_per_s)),
+        };
+        const ready = std.posix.ppoll(&descriptor, &timeout, null) catch |err| switch (err) {
+            error.SignalInterrupt => continue,
+            else => |e| return e,
+        };
+        if (ready == 0) continue;
+        return;
+    }
+}
+
 fn hasCompleteTlsRecord(bytes: []const u8) bool {
     if (bytes.len < tls.record_header_len) return false;
     const record_len = std.mem.readInt(u16, bytes[3..5], .big);
@@ -328,6 +467,42 @@ test "recognizes complete buffered TLS records" {
     try std.testing.expect(!hasCompleteTlsRecord(&.{ 0x17, 0x03, 0x03, 0x00 }));
     try std.testing.expect(!hasCompleteTlsRecord(&.{ 0x17, 0x03, 0x03, 0x00, 0x03, 0xaa, 0xbb }));
     try std.testing.expect(hasCompleteTlsRecord(&.{ 0x17, 0x03, 0x03, 0x00, 0x03, 0xaa, 0xbb, 0xcc }));
+}
+
+test "REALITY initialization times out when the peer stalls" {
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{
+        .stack_size = 1024 * 1024,
+        .concurrent_limit = .limited(2),
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var handles: [2]std.posix.socket_t = undefined;
+    while (true) switch (std.posix.errno(std.posix.system.socketpair(
+        std.posix.AF.UNIX,
+        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+        0,
+        &handles,
+    ))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        else => return error.SystemResources,
+    };
+    defer _ = std.posix.system.close(handles[0]);
+    defer _ = std.posix.system.close(handles[1]);
+    const address = net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    const stream: net.Stream = .{ .socket = .{ .handle = handles[0], .address = address } };
+    const deadline = Io.Clock.Timestamp.fromNow(io, .{
+        .raw = Io.Duration.fromMilliseconds(100),
+        .clock = .awake,
+    });
+    var client: Client = undefined;
+    try std.testing.expectError(error.Timeout, client.initDeadline(stream, .{
+        .server_name = "www.google.com",
+        .public_key = "E59WjnvZcQMu7tR7_BgyhycuEdBS-CtKxfImRCdAvFM",
+        .short_id = "0123456789abcdef",
+        .fingerprint = .firefox,
+    }, io, deadline));
 }
 
 test "keeps parsed fingerprint and cipher profiles" {

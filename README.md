@@ -17,6 +17,7 @@
 - `tests/fixtures/`: small configs used by parser/runtime checks.
 - `tests/e2e/reality-xray.sh`: opt-in harness against a real Xray binary.
 - `tests/field/`: mixed HTTPS, sustained-transfer, fragmented-WSS, and router-resource harnesses.
+- `contrib/xray-zig-quick`: `wg-quick`-style process and transparent-firewall controller.
 - `docs/`: protocol notes and implementation plans.
 
 The current failure records are `docs/vision-response-deadlock.md`,
@@ -129,5 +130,11 @@ mips-linux-gnu-strip --strip-all -o zig-out-mips/bin/xray-zig zig-out-mips-relea
 ```
 
 Verify `readelf -A zig-out-mips/bin/xray-zig` reports MIPS32r2 and soft float before publishing it.
+
+For a router deployment, [`contrib/xray-zig-quick`](contrib/xray-zig-quick)
+provides transactional `check`, `up`, `status`, and `down` commands around the
+xray-zig process and its IPv4/IPv6 transparent firewall rules. See
+[`docs/xray-zig-quick.md`](docs/xray-zig-quick.md) for the device profile and
+installation procedure.
 
 The executable creates a bounded Zig `Io.Threaded` runtime rather than using the standard unlimited concurrent pool. Worker stacks are 1 MiB and at most 128 concurrent workers are allowed. Each bidirectional bridge uses one poll-driven connection worker. Full pools apply listener backpressure instead of resetting accepted clients, and at most 32 VLESS/REALITY handshakes run at once to bound CPU and ClientHello bursts. The limits are important on 32-bit targets: Zig's default 16 MiB stack reservation can exhaust the address space, while the earlier two-worker bridge saturated a 64-worker pool at about 30 live connections. A 512 KiB stack corrupted MIPS TLS workers under concurrent load and is not supported.

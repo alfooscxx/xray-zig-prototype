@@ -1,0 +1,529 @@
+#!/bin/sh
+# A small wg-quick-style lifecycle helper for xray-zig gateway deployments.
+
+set -eu
+umask 077
+
+program=${0##*/}
+config_dir=${XRAY_ZIG_QUICK_CONFIG_DIR:-/etc/xray-zig/quick}
+state_dir=${XRAY_ZIG_QUICK_STATE_DIR:-/var/run/xray-zig-quick}
+ready_timeout=${XRAY_ZIG_QUICK_READY_TIMEOUT:-10}
+iptables_bin=${XRAY_ZIG_QUICK_IPTABLES:-iptables}
+ip6tables_bin=${XRAY_ZIG_QUICK_IP6TABLES:-ip6tables}
+skip_root=${XRAY_ZIG_QUICK_SKIP_ROOT:-no}
+
+profile=
+name=
+chain=
+lock_dir=
+rollback=no
+
+config=
+binary=xray-zig
+lan_interfaces=
+enable_ipv4=yes
+enable_ipv6=yes
+hijack_dns=yes
+bypass_local=yes
+memory_budget_mib=70
+worker_limit=80
+raw_connection_limit=240
+log_file=
+
+summary=
+inbound_count=0
+redirect_port4=
+redirect_port6=
+dns_port4=
+dns_port6=
+
+say() {
+    printf '%s\n' "$*"
+}
+
+die() {
+    printf '%s: %s\n' "$program" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat >&2 <<EOF
+Usage: $program {up|down|status|check} PROFILE
+
+PROFILE is a path or a name resolved as $config_dir/PROFILE.conf.
+EOF
+    exit 2
+}
+
+trim() {
+    printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+absolute_file() {
+    target=$1
+    target_dir=${target%/*}
+    target_base=${target##*/}
+    if [ "$target_dir" = "$target" ]; then
+        target_dir=.
+    elif [ -z "$target_dir" ]; then
+        target_dir=/
+    fi
+    (CDPATH= cd -- "$target_dir" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$target_base")
+}
+
+resolve_profile() {
+    requested=$1
+    case $requested in
+        */*|*.conf) profile=$requested ;;
+        *) profile=$config_dir/$requested.conf ;;
+    esac
+    [ -f "$profile" ] || die "profile not found: $profile"
+    profile=$(absolute_file "$profile") || die "cannot resolve profile: $profile"
+    name=${profile##*/}
+    name=${name%.conf}
+    validate_name "$name" "profile name"
+    make_chain
+}
+
+resolve_name() {
+    requested=$1
+    case $requested in
+        */*) requested=${requested##*/} ;;
+    esac
+    name=${requested%.conf}
+    validate_name "$name" "profile name"
+    make_chain
+}
+
+validate_name() {
+    value=$1
+    label=$2
+    [ -n "$value" ] || die "$label is empty"
+    case $value in
+        *[!A-Za-z0-9_.+-]*) die "$label contains unsupported characters: $value" ;;
+    esac
+}
+
+make_chain() {
+    checksum=$(printf '%s' "$name" | cksum | awk '{print $1}')
+    chain=XZQ_$checksum
+}
+
+normalize_bool() {
+    value=$1
+    label=$2
+    case $value in
+        yes|true|1) printf 'yes\n' ;;
+        no|false|0) printf 'no\n' ;;
+        *) die "$label must be yes or no" ;;
+    esac
+}
+
+validate_uint() {
+    value=$1
+    label=$2
+    case $value in
+        ''|*[!0-9]*) die "$label must be a positive integer" ;;
+    esac
+    [ "$value" -gt 0 ] || die "$label must be a positive integer"
+}
+
+parse_profile() {
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        line=$(trim "$raw")
+        case $line in
+            ''|'#'*) continue ;;
+            *=*) ;;
+            *) die "invalid profile line: $raw" ;;
+        esac
+        key=$(trim "${line%%=*}")
+        value=$(trim "${line#*=}")
+        case $key in
+            Config) config=$value ;;
+            Binary) binary=$value ;;
+            LanInterface) lan_interfaces=$value ;;
+            IPv4) enable_ipv4=$(normalize_bool "$value" IPv4) ;;
+            IPv6) enable_ipv6=$(normalize_bool "$value" IPv6) ;;
+            HijackDNS) hijack_dns=$(normalize_bool "$value" HijackDNS) ;;
+            BypassLocal) bypass_local=$(normalize_bool "$value" BypassLocal) ;;
+            MemoryBudgetMiB) memory_budget_mib=$value ;;
+            WorkerLimit) worker_limit=$value ;;
+            RawConnectionLimit) raw_connection_limit=$value ;;
+            LogFile) log_file=$value ;;
+            *) die "unknown profile key: $key" ;;
+        esac
+    done <"$profile"
+
+    [ -n "$config" ] || die "Config is required in $profile"
+    [ -n "$lan_interfaces" ] || die "LanInterface is required in $profile"
+    validate_uint "$memory_budget_mib" MemoryBudgetMiB
+    validate_uint "$worker_limit" WorkerLimit
+    validate_uint "$raw_connection_limit" RawConnectionLimit
+
+    profile_base=${profile%/*}
+    case $config in
+        /*) ;;
+        *) config=$profile_base/$config ;;
+    esac
+    [ -f "$config" ] || die "xray-zig config not found: $config"
+    config=$(absolute_file "$config") || die "cannot resolve config: $config"
+
+    case $binary in
+        */*)
+            case $binary in
+                /*) ;;
+                *) binary=$profile_base/$binary ;;
+            esac
+            [ -x "$binary" ] || die "xray-zig binary is not executable: $binary"
+            binary=$(absolute_file "$binary") || die "cannot resolve binary: $binary"
+            ;;
+        *)
+            binary=$(command -v "$binary" 2>/dev/null) || die "xray-zig binary not found: $binary"
+            ;;
+    esac
+
+    if [ -z "$log_file" ]; then
+        log_file=$state_dir/$name.log
+    elif [ "${log_file#/}" = "$log_file" ]; then
+        log_file=$profile_base/$log_file
+    fi
+
+    normalized_interfaces=$(printf '%s' "$lan_interfaces" | tr ',' ' ')
+    lan_interfaces=
+    for iface in $normalized_interfaces; do
+        validate_name "$iface" "LAN interface"
+        if [ -z "$lan_interfaces" ]; then
+            lan_interfaces=$iface
+        else
+            lan_interfaces="$lan_interfaces $iface"
+        fi
+    done
+    [ -n "$lan_interfaces" ] || die "LanInterface is empty"
+}
+
+require_root() {
+    [ "$skip_root" = yes ] && return
+    [ "$(id -u)" -eq 0 ] || die "this command must run as root"
+}
+
+acquire_lock() {
+    mkdir -p "$state_dir"
+    lock_dir=$state_dir/$name.lock
+    mkdir "$lock_dir" 2>/dev/null || die "another operation is in progress for $name"
+}
+
+release_lock() {
+    if [ -n "$lock_dir" ]; then
+        rmdir "$lock_dir" 2>/dev/null || true
+        lock_dir=
+    fi
+}
+
+state_path() {
+    printf '%s/%s.%s\n' "$state_dir" "$name" "$1"
+}
+
+read_state() {
+    state_key=$1
+    state_file=$(state_path "$state_key")
+    [ -f "$state_file" ] || return 1
+    IFS= read -r state_value <"$state_file" || true
+    printf '%s\n' "$state_value"
+}
+
+write_state() {
+    printf '%s\n' "$2" >"$(state_path "$1")"
+}
+
+clear_state() {
+    for suffix in pid start lan v4 v6; do
+        rm -f "$(state_path "$suffix")"
+    done
+}
+
+process_start_time() {
+    pid=$1
+    [ -r "/proc/$pid/stat" ] || return 1
+    awk '{print $22}' "/proc/$pid/stat"
+}
+
+process_is_ours() {
+    pid=$(read_state pid 2>/dev/null) || return 1
+    saved_start=$(read_state start 2>/dev/null) || return 1
+    case $pid in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    current_start=$(process_start_time "$pid" 2>/dev/null) || return 1
+    [ "$current_start" = "$saved_start" ]
+}
+
+discover_inbounds() {
+    summary=$($binary check -config "$config") || die "xray-zig rejected $config"
+    inbound_count=$(printf '%s\n' "$summary" | awk '$1 == "inbound" {n++} END {print n + 0}')
+    [ "$inbound_count" -gt 0 ] || die "xray-zig reported no inbounds"
+
+    while IFS='|' read -r protocol endpoint; do
+        [ -n "$protocol" ] || continue
+        port=${endpoint##*:}
+        address=${endpoint%:*}
+        case $port in
+            ''|*[!0-9]*) die "cannot parse inbound endpoint: $endpoint" ;;
+        esac
+        family=4
+        case $address in
+            *:*) family=6 ;;
+        esac
+        case $protocol:$family in
+            redirect:4)
+                [ -z "$redirect_port4" ] || die "multiple IPv4 redirect inbounds are unsupported"
+                if [ "$enable_ipv4" = yes ] && [ "$address" != 0.0.0.0 ]; then
+                    die "IPv4 redirect inbound must listen on 0.0.0.0 for gateway use"
+                fi
+                redirect_port4=$port
+                ;;
+            redirect:6)
+                [ -z "$redirect_port6" ] || die "multiple IPv6 redirect inbounds are unsupported"
+                if [ "$enable_ipv6" = yes ] && [ "$address" != :: ]; then
+                    die "IPv6 redirect inbound must listen on :: for gateway use"
+                fi
+                redirect_port6=$port
+                ;;
+            dns:4)
+                [ -z "$dns_port4" ] || die "multiple IPv4 DNS inbounds are unsupported"
+                if [ "$enable_ipv4" = yes ] && [ "$hijack_dns" = yes ] && [ "$address" != 0.0.0.0 ]; then
+                    die "IPv4 DNS inbound must listen on 0.0.0.0 when HijackDNS is enabled"
+                fi
+                dns_port4=$port
+                ;;
+            dns:6)
+                [ -z "$dns_port6" ] || die "multiple IPv6 DNS inbounds are unsupported"
+                if [ "$enable_ipv6" = yes ] && [ "$hijack_dns" = yes ] && [ "$address" != :: ]; then
+                    die "IPv6 DNS inbound must listen on :: when HijackDNS is enabled"
+                fi
+                dns_port6=$port
+                ;;
+        esac
+    done <<EOF
+$(printf '%s\n' "$summary" | awk '$1 == "inbound" {print $3 "|" $5}')
+EOF
+
+    [ "$enable_ipv4" = yes ] || {
+        redirect_port4=
+        dns_port4=
+    }
+    [ "$enable_ipv6" = yes ] || {
+        redirect_port6=
+        dns_port6=
+    }
+    [ "$hijack_dns" = yes ] || {
+        dns_port4=
+        dns_port6=
+    }
+    [ -n "$redirect_port4$redirect_port6" ] || die "no enabled redirect inbound was found"
+}
+
+firewall_tool_exists() {
+    command -v "$1" >/dev/null 2>&1 || die "required firewall tool not found: $1"
+}
+
+firewall_down_family() {
+    tool=$1
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        printf '%s: cannot remove firewall rules; tool not found: %s\n' "$program" "$tool" >&2
+        return 1
+    fi
+    for iface in $lan_interfaces; do
+        if "$tool" -t nat -C PREROUTING -i "$iface" -j "$chain" 2>/dev/null; then
+            "$tool" -t nat -D PREROUTING -i "$iface" -j "$chain" || return 1
+        fi
+    done
+    if "$tool" -t nat -L "$chain" >/dev/null 2>&1; then
+        "$tool" -t nat -F "$chain" || return 1
+        "$tool" -t nat -X "$chain" || return 1
+    fi
+    return 0
+}
+
+firewall_down() {
+    active_v4=${1:-}
+    active_v6=${2:-}
+    if [ "$active_v4" = yes ]; then
+        firewall_down_family "$iptables_bin" || return 1
+    fi
+    if [ "$active_v6" = yes ]; then
+        firewall_down_family "$ip6tables_bin" || return 1
+    fi
+    return 0
+}
+
+firewall_up_family() {
+    tool=$1
+    redirect_port=$2
+    dns_port=$3
+
+    "$tool" -t nat -N "$chain" || return 1
+    if [ -n "$dns_port" ]; then
+        "$tool" -t nat -A "$chain" -p udp --dport 53 -j REDIRECT --to-ports "$dns_port" || return 1
+    fi
+    if [ "$bypass_local" = yes ]; then
+        "$tool" -t nat -A "$chain" -m addrtype --dst-type LOCAL -j RETURN || return 1
+    fi
+    "$tool" -t nat -A "$chain" -p tcp -j REDIRECT --to-ports "$redirect_port" || return 1
+    for iface in $lan_interfaces; do
+        "$tool" -t nat -I PREROUTING 1 -i "$iface" -j "$chain" || return 1
+    done
+    return 0
+}
+
+stop_process() {
+    process_is_ours || return 0
+    pid=$(read_state pid)
+    kill "$pid" 2>/dev/null || true
+    attempts=0
+    while kill -0 "$pid" 2>/dev/null && [ "$attempts" -lt 10 ]; do
+        sleep 1
+        attempts=$((attempts + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        say "forcing xray-zig process $pid to stop"
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+}
+
+rollback_up() {
+    active_v4=no
+    active_v6=no
+    [ -n "$redirect_port4" ] && active_v4=yes
+    [ -n "$redirect_port6" ] && active_v6=yes
+    if ! firewall_down "$active_v4" "$active_v6"; then
+        printf '%s: firewall rollback failed; leaving xray-zig running for a safe retry\n' "$program" >&2
+        return 1
+    fi
+    stop_process
+    clear_state
+}
+
+on_exit() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ "$rollback" = yes ]; then
+        rollback_up || true
+    fi
+    release_lock
+    exit "$status"
+}
+
+wait_until_ready() {
+    elapsed=0
+    while [ "$elapsed" -lt "$ready_timeout" ]; do
+        process_is_ours || return 1
+        ready=$(grep -c ' inbound .* listening on ' "$log_file" 2>/dev/null || true)
+        [ "$ready" -ge "$inbound_count" ] && return 0
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 1
+}
+
+do_check() {
+    resolve_profile "$1"
+    parse_profile
+    discover_inbounds
+    printf '%s\n' "$summary"
+    say "quick profile ok: name=$name lan=$lan_interfaces ipv4_redirect=${redirect_port4:-off} ipv6_redirect=${redirect_port6:-off} ipv4_dns=${dns_port4:-off} ipv6_dns=${dns_port6:-off}"
+}
+
+do_up() {
+    require_root
+    resolve_profile "$1"
+    parse_profile
+    acquire_lock
+    trap on_exit EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if process_is_ours; then
+        die "$name is already up"
+    fi
+    stale_lan=$(read_state lan 2>/dev/null || true)
+    stale_v4=$(read_state v4 2>/dev/null || true)
+    stale_v6=$(read_state v6 2>/dev/null || true)
+    if [ -n "$stale_lan" ]; then
+        lan_interfaces=$stale_lan
+        firewall_down "$stale_v4" "$stale_v6" || die "cannot clean stale firewall state for $name"
+        parse_profile
+    fi
+    clear_state
+
+    discover_inbounds
+    [ -z "$redirect_port4" ] || firewall_tool_exists "$iptables_bin"
+    [ -z "$redirect_port6" ] || firewall_tool_exists "$ip6tables_bin"
+
+    : >"$log_file" || die "cannot write log: $log_file"
+    XRAY_ZIG_MEMORY_BUDGET_MIB=$memory_budget_mib \
+    XRAY_ZIG_WORKER_LIMIT=$worker_limit \
+    XRAY_ZIG_RAW_CONNECTION_LIMIT=$raw_connection_limit \
+        "$binary" run -config "$config" >>"$log_file" 2>&1 </dev/null &
+    pid=$!
+    write_state pid "$pid"
+    start=$(process_start_time "$pid") || die "xray-zig exited during startup; see $log_file"
+    write_state start "$start"
+    rollback=yes
+    write_state lan "$lan_interfaces"
+    write_state v4 "$([ -n "$redirect_port4" ] && printf yes || printf no)"
+    write_state v6 "$([ -n "$redirect_port6" ] && printf yes || printf no)"
+    wait_until_ready || die "xray-zig inbounds were not ready after ${ready_timeout}s; see $log_file"
+
+    if [ -n "$redirect_port4" ]; then
+        firewall_up_family "$iptables_bin" "$redirect_port4" "$dns_port4" || die "cannot install IPv4 firewall rules"
+    fi
+    if [ -n "$redirect_port6" ]; then
+        firewall_up_family "$ip6tables_bin" "$redirect_port6" "$dns_port6" || die "cannot install IPv6 firewall rules"
+    fi
+    rollback=no
+    say "$name is up (pid $pid, log $log_file)"
+}
+
+do_down() {
+    require_root
+    resolve_name "$1"
+    acquire_lock
+    trap on_exit EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    lan_interfaces=$(read_state lan 2>/dev/null || true)
+    [ -n "$lan_interfaces" ] || die "$name is not up"
+    active_v4=$(read_state v4 2>/dev/null || true)
+    active_v6=$(read_state v6 2>/dev/null || true)
+    firewall_down "$active_v4" "$active_v6" || die "cannot remove firewall rules for $name; xray-zig was left running"
+    stop_process
+    clear_state
+    say "$name is down"
+}
+
+do_status() {
+    resolve_name "$1"
+    if process_is_ours; then
+        pid=$(read_state pid)
+        lan_interfaces=$(read_state lan 2>/dev/null || true)
+        say "$name is up (pid $pid, lan $lan_interfaces)"
+        return 0
+    fi
+    say "$name is down"
+    return 1
+}
+
+[ "$#" -eq 2 ] || usage
+command=$1
+requested_profile=$2
+case $command in
+    up) do_up "$requested_profile" ;;
+    down) do_down "$requested_profile" ;;
+    status) do_status "$requested_profile" ;;
+    check) do_check "$requested_profile" ;;
+    *) usage ;;
+esac

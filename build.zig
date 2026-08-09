@@ -47,6 +47,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    const quick_tests_cmd = b.addSystemCommand(&.{ "sh", "tests/xray-zig-quick.sh" });
+    const quick_tests_step = b.step("test-quick", "Run xray-zig-quick lifecycle tests");
+    quick_tests_step.dependOn(&quick_tests_cmd.step);
+    test_step.dependOn(quick_tests_step);
+
     const e2e_reality_cmd = b.addSystemCommand(&.{ "bash", "tests/e2e/reality-xray.sh" });
     e2e_reality_cmd.addArtifactArg(exe);
     e2e_reality_cmd.has_side_effects = true;
