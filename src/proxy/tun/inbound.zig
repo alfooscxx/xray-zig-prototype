@@ -65,9 +65,24 @@ const Flow = struct {
     state_mutex: Io.Mutex = .init,
     ack_condition: Io.Condition = .init,
     state: tcp.State,
+    ref_count: std.atomic.Value(usize) = .init(1),
 
     fn initializeQueue(self: *Flow) void {
         self.queue = .init(&self.queue_storage);
+    }
+
+    fn retain(self: *Flow) void {
+        const previous = self.ref_count.fetchAdd(1, .monotonic);
+        std.debug.assert(previous != 0);
+    }
+
+    fn release(self: *Flow) void {
+        const previous = self.ref_count.fetchSub(1, .release);
+        std.debug.assert(previous != 0);
+        if (previous == 1) {
+            _ = self.ref_count.load(.acquire);
+            self.manager.allocator.destroy(self);
+        }
     }
 
     fn processSegment(self: *Flow, segment: *const OwnedSegment, io: Io) !tcp.ReceiveResult {
@@ -218,6 +233,7 @@ const FlowManager = struct {
     device: *Device,
     max_connections: usize,
     flows: FlowMap,
+    timer_snapshot: []*Flow,
     mutex: Io.Mutex = .init,
     group: Io.Group = .init,
     next_isn: std.atomic.Value(u32) = .init(0x13579bdf),
@@ -227,19 +243,25 @@ const FlowManager = struct {
         dispatcher: session.Dispatcher,
         device: *Device,
         max_connections: usize,
-    ) FlowManager {
+    ) !FlowManager {
         return .{
             .allocator = allocator,
             .dispatcher = dispatcher,
             .device = device,
             .max_connections = max_connections,
             .flows = FlowMap.init(allocator),
+            .timer_snapshot = try allocator.alloc(*Flow, max_connections),
         };
+    }
+
+    fn start(self: *FlowManager, io: Io) !void {
+        try self.group.concurrent(io, retransmissionPump, .{ self, io });
     }
 
     fn deinit(self: *FlowManager, io: Io) void {
         self.group.cancel(io);
         std.debug.assert(self.flows.count() == 0);
+        self.allocator.free(self.timer_snapshot);
         self.flows.deinit();
     }
 
@@ -292,11 +314,11 @@ const FlowManager = struct {
         self.mutex.unlock(io);
 
         flow.sendTx(syn_ack, io) catch |err| {
-            self.removeAndDestroy(flow, io);
+            self.removeAndRelease(flow, io);
             return err;
         };
         self.group.concurrent(io, runFlow, .{ flow, io }) catch |err| {
-            self.removeAndDestroy(flow, io);
+            self.removeAndRelease(flow, io);
             try self.sendReset(segment, io);
             return err;
         };
@@ -318,12 +340,27 @@ const FlowManager = struct {
         );
     }
 
-    fn removeAndDestroy(self: *FlowManager, flow: *Flow, io: Io) void {
+    fn removeAndRelease(self: *FlowManager, flow: *Flow, io: Io) void {
+        terminateFlow(flow, io);
         self.mutex.lockUncancelable(io);
-        _ = self.flows.remove(flow.key);
+        const removed = self.flows.remove(flow.key);
         self.mutex.unlock(io);
-        flow.queue.close(io);
-        self.allocator.destroy(flow);
+        if (removed) flow.release();
+    }
+
+    fn snapshotFlows(self: *FlowManager, io: Io) usize {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        var count: usize = 0;
+        var iterator = self.flows.valueIterator();
+        while (iterator.next()) |flow_ptr| {
+            const flow = flow_ptr.*;
+            flow.retain();
+            self.timer_snapshot[count] = flow;
+            count += 1;
+        }
+        return count;
     }
 };
 
@@ -342,8 +379,9 @@ pub fn run(
     try attach(tun_file, settings.name);
 
     var device: Device = .{ .file = tun_file, .mtu = settings.mtu };
-    var manager = FlowManager.init(allocator, dispatcher, &device, settings.max_connections);
+    var manager = try FlowManager.init(allocator, dispatcher, &device, settings.max_connections);
     defer manager.deinit(io);
+    try manager.start(io);
 
     {
         try log_mutex.lock(io);
@@ -386,11 +424,8 @@ fn attach(file: Io.File, requested_name: []const u8) !void {
 }
 
 fn runFlow(flow: *Flow, io: Io) Io.Cancelable!void {
-    defer flow.manager.removeAndDestroy(flow, io);
+    defer flow.manager.removeAndRelease(flow, io);
     diagnostics.setThreadName("xz-tun-flow");
-
-    var retransmit_future = io.concurrent(retransmissionPump, .{ flow, io }) catch return;
-    defer _ = retransmit_future.cancel(io) catch {};
 
     var preface_buffer: [session.max_preface_len]u8 = undefined;
     const preface_len = waitForPreface(flow, &preface_buffer, io) catch |err| switch (err) {
@@ -408,16 +443,9 @@ fn runFlow(flow: *Flow, io: Io) Io.Cancelable!void {
     defer _ = dispatch_future.cancel(io) catch {};
     defer pair[1].close(io);
 
-    const Result = union(enum) {
-        inbound: Io.Cancelable!void,
-        outbound: Io.Cancelable!void,
-    };
-    var results: [2]Result = undefined;
-    var select: Io.Select(Result) = .init(io, &results);
-    defer select.cancelDiscard();
-    select.concurrent(.inbound, inboundPump, .{ flow, pair[1], io }) catch return;
-    select.concurrent(.outbound, outboundPump, .{ flow, pair[1], io }) catch return;
-    _ = try select.await();
+    var outbound_future = io.concurrent(outboundPump, .{ flow, pair[1], io }) catch return;
+    defer _ = outbound_future.cancel(io) catch {};
+    try inboundPump(flow, pair[1], io);
 }
 
 fn waitForPreface(flow: *Flow, buffer: *[session.max_preface_len]u8, io: Io) !usize {
@@ -508,29 +536,34 @@ fn dispatchFlow(stream: net.Stream, flow: *Flow, preface: []const u8, io: Io) Io
     };
 }
 
-fn retransmissionPump(flow: *Flow, io: Io) Io.Cancelable!void {
+fn retransmissionPump(manager: *FlowManager, io: Io) Io.Cancelable!void {
     while (true) {
         try io.sleep(Io.Duration.fromMilliseconds(retransmission_poll_ms), .awake);
-        try flow.state_mutex.lock(io);
-        const now_ms = nowMilliseconds(io);
-        _ = flow.state.expired(now_ms);
-        const retry = flow.state.retransmitDue(now_ms);
-        const terminal = flow.state.phase == .terminal;
-        if (terminal) flow.ack_condition.broadcast(io);
-        flow.state_mutex.unlock(io);
-
-        if (terminal) {
-            flow.queue.close(io);
-            return;
+        const count = manager.snapshotFlows(io);
+        for (manager.timer_snapshot[0..count]) |flow| {
+            defer flow.release();
+            pollRetransmission(flow, io) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => terminateFlow(flow, io),
+            };
         }
-        if (retry) |segment| flow.sendTx(segment, io) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-            else => {
-                terminateFlow(flow, io);
-                return;
-            },
-        };
     }
+}
+
+fn pollRetransmission(flow: *Flow, io: Io) !void {
+    try flow.state_mutex.lock(io);
+    const now_ms = nowMilliseconds(io);
+    _ = flow.state.expired(now_ms);
+    const retry = flow.state.retransmitDue(now_ms);
+    const terminal = flow.state.phase == .terminal;
+    if (terminal) flow.ack_condition.broadcast(io);
+    flow.state_mutex.unlock(io);
+
+    if (terminal) {
+        flow.queue.close(io);
+        return;
+    }
+    if (retry) |segment| try flow.sendTx(segment, io);
 }
 
 fn terminateFlow(flow: *Flow, io: Io) void {
@@ -578,4 +611,63 @@ fn createLocalPair() ![2]net.Stream {
         .{ .socket = .{ .handle = fds[0], .address = address } },
         .{ .socket = .{ .handle = fds[1], .address = address } },
     };
+}
+
+test "shared timer expires a flow without a per-flow timer task" {
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var manager: FlowManager = undefined;
+    const now_ms = nowMilliseconds(io);
+    var state = tcp.State.init(1, 2, 65535, 1460, now_ms -| tcp.handshake_timeout_ms);
+    _ = state.queueSynAck(now_ms -| tcp.handshake_timeout_ms);
+    var flow: Flow = .{
+        .key = .{
+            .version = .ip4,
+            .source = [_]u8{0} ** 16,
+            .destination = [_]u8{0} ** 16,
+            .source_port = 1,
+            .destination_port = 2,
+        },
+        .inbound_tag = null,
+        .manager = &manager,
+        .state = state,
+    };
+    flow.initializeQueue();
+
+    try pollRetransmission(&flow, io);
+    try std.testing.expectEqual(tcp.Phase.terminal, flow.state.phase);
+    try std.testing.expectError(error.Closed, flow.queue.getOne(io));
+}
+
+test "timer snapshot retains flows until polling finishes" {
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var device: Device = undefined;
+    var manager = try FlowManager.init(std.testing.allocator, undefined, &device, 1);
+    defer manager.deinit(io);
+    const flow = try std.testing.allocator.create(Flow);
+    flow.* = .{
+        .key = .{
+            .version = .ip4,
+            .source = [_]u8{0} ** 16,
+            .destination = [_]u8{0} ** 16,
+            .source_port = 1,
+            .destination_port = 2,
+        },
+        .inbound_tag = null,
+        .manager = &manager,
+        .state = tcp.State.init(1, 2, 65535, 1460, nowMilliseconds(io)),
+    };
+    flow.initializeQueue();
+    try manager.flows.put(flow.key, flow);
+
+    try std.testing.expectEqual(@as(usize, 1), manager.snapshotFlows(io));
+    try std.testing.expectEqual(@as(usize, 2), flow.ref_count.load(.acquire));
+    manager.timer_snapshot[0].release();
+    try std.testing.expectEqual(@as(usize, 1), flow.ref_count.load(.acquire));
+    manager.removeAndRelease(flow, io);
 }
