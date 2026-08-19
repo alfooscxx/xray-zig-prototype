@@ -70,15 +70,34 @@ For REALITY, TLS, or Vision changes, run unit tests, the real-Xray e2e harness,
 and the deterministic delayed-preface field regression documented in
 `docs/vision-response-deadlock.md`.
 
-Build a MIPS32r2 O32 soft-float artifact with:
+## Field Router Access
+
+The active field router is the AArch64 GL.iNet GL-MT6000. Communicate with it
+only through OpenSSH (`ssh`/`scp`) using an operator-supplied `ROUTER_SSH`
+destination. Do not infer the target from the default gateway, and do not use
+HTTP administration endpoints, command injection, RCE helpers, FTP, or legacy
+deployment scripts.
+
+The old MIPS router is now only an optical bridge. Do not deploy binaries or
+configs to it, run tests or commands on it, install packages, or change its
+routes, firewall, services, or boot state. Access it only when the user
+explicitly requests work on the bridge itself.
+
+Before any field write or test, use SSH for a read-only identity check and stop
+unless the target reports AArch64. Keep test artifacts and state under a unique
+temporary path, preserve existing services, and remove temporary processes,
+addresses, routes, and files afterwards. Firewall and boot changes require an
+explicit user request. See `docs/router-field-access.md`.
+
+Build the active router artifact with:
 
 ```sh
-zig build -Dtarget=mips-linux-musleabi -Dcpu=mips32r2 -Doptimize=ReleaseFast --prefix zig-out-mips-release
-mkdir -p zig-out-mips/bin
-mips-linux-gnu-strip --strip-all -o zig-out-mips/bin/xray-zig zig-out-mips-release/bin/xray-zig
+zig build -Dtarget=aarch64-linux-musl -Dcpu=cortex_a53 -Doptimize=ReleaseFast --prefix zig-out-aarch64-release
 ```
 
-Verify `readelf -A` reports MIPS32r2 and soft float before publishing.
+Verify the artifact is an AArch64 statically linked ELF before publishing it.
+MIPS builds in older documents are historical benchmark instructions, not a
+deployment target.
 
 ## Coding Style
 

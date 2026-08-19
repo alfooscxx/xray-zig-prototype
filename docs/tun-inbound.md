@@ -33,7 +33,9 @@ not bring the link up, assign addresses, or install routes. This keeps every
 network change visible during experiments and avoids coupling runtime config to
 OpenWrt firewall or boot policy.
 
-For a narrow router-local IPv4 probe:
+Run field commands on the active AArch64 router through SSH as described in
+`router-field-access.md`. Never send these commands to the legacy MIPS optical
+bridge. For a narrow router-local IPv4 probe:
 
 ```sh
 xray-zig run -config /tmp/tun.json
@@ -79,7 +81,9 @@ UDP session is opened and no UDP Vision mode is attempted.
 
 ## GL-MT6000 Experiment
 
-The first field run used a GL.iNet GL-MT6000 with OpenWrt 25.12.5, Linux
+The active field router is a GL.iNet GL-MT6000 accessed only through SSH. The
+legacy MIPS device is only an optical bridge and was not involved in this
+experiment. The first field run used OpenWrt 25.12.5, Linux
 6.12.94, and `aarch64_cortex-a53`. The router needed the matching `kmod-tun`
 package before `/dev/net/tun` appeared. No firewall or boot scripts were
 changed.

@@ -135,15 +135,17 @@ verifies bounded concurrent DNS-over-TCP through explicit outbound dispatch.
 
 Performance must be measured with `-Doptimize=ReleaseFast`; the default Debug build is intentionally not optimized. See `docs/performance.md` for the current real-server CPU, throughput, latency, and memory baseline.
 
-Build a MIPS32r2 O32 soft-float artifact with:
+The active field router is an AArch64 GL.iNet GL-MT6000. Build its artifact
+with:
 
 ```sh
-zig build -Dtarget=mips-linux-musleabi -Dcpu=mips32r2 -Doptimize=ReleaseFast --prefix zig-out-mips-release
-mkdir -p zig-out-mips/bin
-mips-linux-gnu-strip --strip-all -o zig-out-mips/bin/xray-zig zig-out-mips-release/bin/xray-zig
+zig build -Dtarget=aarch64-linux-musl -Dcpu=cortex_a53 -Doptimize=ReleaseFast --prefix zig-out-aarch64-release
 ```
 
-Verify `readelf -A zig-out-mips/bin/xray-zig` reports MIPS32r2 and soft float before publishing it.
+Verify the result is an AArch64 statically linked ELF. Field access is SSH-only;
+see [`docs/router-field-access.md`](docs/router-field-access.md). The old MIPS
+router is an optical bridge and is not a deployment or test target. MIPS
+commands in dated performance documents describe historical measurements only.
 
 For a router deployment, [`contrib/xray-zig-quick`](contrib/xray-zig-quick)
 provides transactional `check`, `up`, `status`, and `down` commands around the
