@@ -39,11 +39,24 @@ pub const Inbound = struct {
     listen: []const u8,
     port: u16,
     protocol: []const u8,
+    tun: ?TunInboundSettings,
 
     pub fn deinit(self: *Inbound, allocator: std.mem.Allocator) void {
         if (self.tag) |tag| allocator.free(tag);
         allocator.free(self.listen);
         allocator.free(self.protocol);
+        if (self.tun) |*tun| tun.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const TunInboundSettings = struct {
+    name: []const u8,
+    mtu: u16,
+    max_connections: u16,
+
+    pub fn deinit(self: *TunInboundSettings, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
         self.* = undefined;
     }
 };
@@ -284,6 +297,10 @@ pub const ParseConfigError = error{
     UserMustBeObject,
     MissingInboundPort,
     MissingInboundProtocol,
+    MissingTunSettings,
+    MissingTunName,
+    TunMustNotHaveListenOrPort,
+    UnsupportedTunSetting,
     MissingOutboundProtocol,
     MissingVlessAddress,
     MissingVlessPort,
@@ -298,6 +315,9 @@ pub const ParseConfigError = error{
     MissingDnsFallbackServer,
     MissingRouteOutboundTag,
     InvalidPort,
+    InvalidTunName,
+    InvalidTunMtu,
+    InvalidTunConnectionLimit,
     InvalidDnsTtl,
     UnsupportedPortFormat,
     UnsupportedIpRule,
@@ -360,6 +380,9 @@ fn parseInbound(allocator: std.mem.Allocator, value: std.json.Value) !Inbound {
 
     const protocol = try requiredString(allocator, object, "protocol", error.MissingInboundProtocol);
     errdefer allocator.free(protocol);
+    const is_tun = std.mem.eql(u8, protocol, "tun");
+    if (is_tun and (object.get("listen") != null or object.get("port") != null))
+        return error.TunMustNotHaveListenOrPort;
 
     const listen = try optionalString(allocator, object, "listen") orelse try allocator.dupe(u8, "127.0.0.1");
     errdefer allocator.free(listen);
@@ -367,11 +390,53 @@ fn parseInbound(allocator: std.mem.Allocator, value: std.json.Value) !Inbound {
     const tag = try optionalString(allocator, object, "tag");
     errdefer if (tag) |owned| allocator.free(owned);
 
+    var tun = if (is_tun)
+        try parseTunInboundSettings(allocator, object.get("settings"))
+    else
+        null;
+    errdefer if (tun) |*owned| owned.deinit(allocator);
+
     return .{
         .tag = tag,
         .listen = listen,
-        .port = try requiredPort(object, "port", error.MissingInboundPort),
+        .port = if (is_tun) 0 else try requiredPort(object, "port", error.MissingInboundPort),
         .protocol = protocol,
+        .tun = tun,
+    };
+}
+
+fn parseTunInboundSettings(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) !?TunInboundSettings {
+    const value = maybe_value orelse return error.MissingTunSettings;
+    if (value != .object) return error.SettingsMustBeObject;
+    const object = &value.object;
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.eql(u8, key, "name") and
+            !std.mem.eql(u8, key, "mtu") and
+            !std.mem.eql(u8, key, "maxConnections"))
+        {
+            return error.UnsupportedTunSetting;
+        }
+    }
+
+    const name = try requiredString(allocator, object, "name", error.MissingTunName);
+    errdefer allocator.free(name);
+    if (name.len == 0 or name.len >= 16) return error.InvalidTunName;
+    for (name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.')
+            return error.InvalidTunName;
+    }
+
+    const mtu = try optionalUnsigned(u16, object, "mtu", 1500, error.InvalidTunMtu);
+    if (mtu < 1280 or mtu > 1500) return error.InvalidTunMtu;
+    const max_connections = try optionalUnsigned(u16, object, "maxConnections", 128, error.InvalidTunConnectionLimit);
+    if (max_connections == 0 or max_connections > 4096) return error.InvalidTunConnectionLimit;
+
+    return .{
+        .name = name,
+        .mtu = mtu,
+        .max_connections = max_connections,
     };
 }
 
@@ -767,6 +832,19 @@ fn requiredPort(object: *const std.json.ObjectMap, key: []const u8, missing_erro
     };
 }
 
+fn optionalUnsigned(
+    comptime T: type,
+    object: *const std.json.ObjectMap,
+    key: []const u8,
+    default: T,
+    invalid_error: anyerror,
+) !T {
+    const value = object.get(key) orelse return default;
+    if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(T))
+        return invalid_error;
+    return @intCast(value.integer);
+}
+
 fn parsePort(port: i64) !u16 {
     if (port <= 0 or port > 65535) return error.InvalidPort;
     return @intCast(port);
@@ -922,6 +1000,65 @@ test "defaults inbound listen address to loopback" {
     defer cfg.deinit();
 
     try std.testing.expectEqualStrings("127.0.0.1", cfg.inbounds[0].listen);
+}
+
+test "parses TCP-only TUN inbound without a listen port" {
+    const source =
+        \\{
+        \\  "inbounds": [
+        \\    {
+        \\      "tag": "tun-in",
+        \\      "protocol": "tun",
+        \\      "settings": {"name": "xray0", "mtu": 1400, "maxConnections": 64}
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var cfg = try parse(std.testing.allocator, source);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(u16, 0), cfg.inbounds[0].port);
+    try std.testing.expectEqualStrings("xray0", cfg.inbounds[0].tun.?.name);
+    try std.testing.expectEqual(@as(u16, 1400), cfg.inbounds[0].tun.?.mtu);
+    try std.testing.expectEqual(@as(u16, 64), cfg.inbounds[0].tun.?.max_connections);
+}
+
+test "defaults TUN MTU and connection limit" {
+    const source =
+        \\{"inbounds":[{"protocol":"tun","settings":{"name":"xray0"}}]}
+    ;
+    var cfg = try parse(std.testing.allocator, source);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u16, 1500), cfg.inbounds[0].tun.?.mtu);
+    try std.testing.expectEqual(@as(u16, 128), cfg.inbounds[0].tun.?.max_connections);
+}
+
+test "rejects invalid TUN settings" {
+    try std.testing.expectError(
+        error.MissingTunSettings,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"tun\"}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidTunName,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"tun\",\"settings\":{\"name\":\"bad/name\"}}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidTunMtu,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"tun\",\"settings\":{\"name\":\"xray0\",\"mtu\":9000}}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidTunConnectionLimit,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"tun\",\"settings\":{\"name\":\"xray0\",\"maxConnections\":0}}]}"),
+    );
+    try std.testing.expectError(
+        error.TunMustNotHaveListenOrPort,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"tun\",\"port\":1234,\"settings\":{\"name\":\"xray0\"}}]}"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedTunSetting,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"tun\",\"settings\":{\"name\":\"xray0\",\"udp\":true}}]}"),
+    );
 }
 
 test "parses dns config without enabling fakedns" {

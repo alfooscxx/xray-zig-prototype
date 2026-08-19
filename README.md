@@ -78,6 +78,7 @@ router measurements, Firefox cipher ordering, and the Safexcel/AF_ALG result.
 Supported:
 
 - Transparent TCP `redirect` inbounds for IPv4 and IPv6.
+- Experimental real Linux TUN inbound with an IPv4/IPv6 TCP-only userspace endpoint.
 - Local `dns` inbound with IPv4 and IPv6 FakeDNS integration.
 - SOCKS inbound for tests and manual probes.
 - VLESS outbound over raw TCP with REALITY.
@@ -95,7 +96,7 @@ Out of scope for now:
 - UDP proxying and UDP Vision modes.
 - xHTTP, gRPC, WebSocket, and other Xray transports.
 - Full Xray JSON compatibility.
-- TUN/TProxy setup and live iptables/ip6tables integration.
+- Automatic TUN routes, TProxy setup, and live iptables/ip6tables integration.
 - Server mode.
 
 ## Native Config Notes
@@ -113,6 +114,9 @@ The config format is explicit and narrower than Xray JSON:
 - VLESS REALITY users may set `flow: "xtls-rprx-vision"`.
 - REALITY `cipherPolicy` defaults to `"firefox"`. Set it to `"chacha20-only"` on software-AES targets. This changes the advertised cipher-suite fingerprint and requires server-side ChaCha20 support, but still offers TLS 1.3 and TLS 1.2 and never offers ECH.
 - `redirect` is the supported transparent inbound protocol; `dokodemo-door` is not accepted.
+- `tun` uses `settings.name`, optional `mtu`, and optional
+  `maxConnections`; it never installs addresses, routes, firewall rules, or
+  boot hooks. See [`docs/tun-inbound.md`](docs/tun-inbound.md).
 
 `field-config-test.json` is a real-server client fixture for the current native API. `field-config-test-server.json` records the matching Xray server-side config used for interoperability testing.
 
@@ -131,15 +135,17 @@ verifies bounded concurrent DNS-over-TCP through explicit outbound dispatch.
 
 Performance must be measured with `-Doptimize=ReleaseFast`; the default Debug build is intentionally not optimized. See `docs/performance.md` for the current real-server CPU, throughput, latency, and memory baseline.
 
-Build a MIPS32r2 O32 soft-float artifact with:
+The active field router is an AArch64 GL.iNet GL-MT6000. Build its artifact
+with:
 
 ```sh
-zig build -Dtarget=mips-linux-musleabi -Dcpu=mips32r2 -Doptimize=ReleaseFast --prefix zig-out-mips-release
-mkdir -p zig-out-mips/bin
-mips-linux-gnu-strip --strip-all -o zig-out-mips/bin/xray-zig zig-out-mips-release/bin/xray-zig
+zig build -Dtarget=aarch64-linux-musl -Dcpu=cortex_a53 -Doptimize=ReleaseFast --prefix zig-out-aarch64-release
 ```
 
-Verify `readelf -A zig-out-mips/bin/xray-zig` reports MIPS32r2 and soft float before publishing it.
+Verify the result is an AArch64 statically linked ELF. Field access is SSH-only;
+see [`docs/router-field-access.md`](docs/router-field-access.md). The old MIPS
+router is an optical bridge and is not a deployment or test target. MIPS
+commands in dated performance documents describe historical measurements only.
 
 For a router deployment, [`contrib/xray-zig-quick`](contrib/xray-zig-quick)
 provides transactional `check`, `up`, `status`, and `down` commands around the
@@ -147,4 +153,19 @@ xray-zig process and its IPv4/IPv6 transparent firewall rules. See
 [`docs/xray-zig-quick.md`](docs/xray-zig-quick.md) for the device profile and
 installation procedure.
 
-The executable creates a bounded Zig `Io.Threaded` runtime rather than using the standard unlimited concurrent pool. Worker stacks are 1 MiB and at most 128 concurrent workers are allowed. Each bidirectional bridge uses one poll-driven connection worker. Full pools apply listener backpressure instead of resetting accepted clients, and at most 32 VLESS/REALITY handshakes run at once to bound CPU and ClientHello bursts. The limits are important on 32-bit targets: Zig's default 16 MiB stack reservation can exhaust the address space, while the earlier two-worker bridge saturated a 64-worker pool at about 30 live connections. A 512 KiB stack corrupted MIPS TLS workers under concurrent load and is not supported.
+The active GL-MT6000 TUN deployment uses a `procd` service with live-only
+nftables and policy-routing state. See
+[`docs/openwrt-tun-service.md`](docs/openwrt-tun-service.md).
+
+The executable creates a bounded Zig `Io.Threaded` runtime rather than using
+the standard unlimited concurrent pool. Workers have 1 MiB stacks, are created
+lazily, and remain until process shutdown. The default 512 MiB process budget
+derives the worker and raw-reactor capacities instead of applying a fixed
+worker ceiling; `XRAY_ZIG_MEMORY_BUDGET_MIB`, `XRAY_ZIG_WORKER_LIMIT`, and
+`XRAY_ZIG_RAW_CONNECTION_LIMIT` can override the sizing inputs. Full pools
+apply listener backpressure instead of resetting accepted clients, and at most
+32 VLESS/REALITY handshakes run at once. TUN uses three concurrent tasks per
+active proxied flow plus one shared retransmission timer. The 1 MiB stack is
+retained because smaller stacks previously corrupted deep TLS workers; stack
+pages are demand-paged and do not become RSS merely because the capacity is
+large.

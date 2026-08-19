@@ -31,9 +31,13 @@ Supported:
 - TLS 1.3 and TLS 1.2 with no ECH or GREASE ECH.
 - Optional `chacha20-only` REALITY policy for software-AES targets.
 - `freedom`, `blackhole`, and minimal TCP `dns` outbounds.
+- Experimental IPv4/IPv6 TCP-only `tun` inbound on Linux.
 
-The runtime uses 1 MiB stacks, a 128-worker cap, listener backpressure, and a
-32-session VLESS/REALITY handshake limit. See
+The runtime uses lazily created 1 MiB-stack workers. Its default 512 MiB memory
+budget derives the worker and raw-reactor limits instead of imposing a fixed
+worker cap; explicit environment limits remain supported. Workers do not
+retire before process shutdown. The runtime also has listener backpressure and
+a 32-session VLESS/REALITY handshake limit. See
 `docs/vision-response-deadlock.md` before changing the connection lifecycle.
 The DNS inbound processes at most 16 queries concurrently. Each selected query
 uses DNS-over-TCP through its rule's `outboundTag`; see `docs/dns-servfail.md`.
@@ -43,7 +47,8 @@ Missing or intentionally out of scope:
 - UDP proxying and UDP Vision modes.
 - xHTTP, gRPC, WebSocket, and other Xray transports.
 - Full Xray JSON compatibility.
-- TUN/TProxy and iptables/ip6tables setup.
+- TProxy and general-purpose firewall setup. The active GL-MT6000 TUN service
+  owns one documented live-only nftables/policy-routing profile outside UCI.
 - Server mode.
 
 Redirect selects the original-destination socket option from the listener's
@@ -70,15 +75,39 @@ For REALITY, TLS, or Vision changes, run unit tests, the real-Xray e2e harness,
 and the deterministic delayed-preface field regression documented in
 `docs/vision-response-deadlock.md`.
 
-Build a MIPS32r2 O32 soft-float artifact with:
+## Field Router Access
+
+The active field router is the AArch64 GL.iNet GL-MT6000. Communicate with it
+only through OpenSSH (`ssh`/`scp`) using an operator-supplied `ROUTER_SSH`
+destination. Do not infer the target from the default gateway, and do not use
+HTTP administration endpoints, command injection, RCE helpers, FTP, or legacy
+deployment scripts.
+
+The old MIPS router is now only an optical bridge. Do not deploy binaries or
+configs to it, run tests or commands on it, install packages, or change its
+routes, firewall, services, or boot state. Access it only when the user
+explicitly requests work on the bridge itself.
+
+Before any field write or test, use SSH for a read-only identity check and stop
+unless the target reports AArch64. Keep test artifacts and state under a unique
+temporary path, preserve existing services, and remove temporary processes,
+addresses, routes, and files afterwards. Firewall and boot changes require an
+explicit user request. See `docs/router-field-access.md`.
+
+Build the active router artifact with:
 
 ```sh
-zig build -Dtarget=mips-linux-musleabi -Dcpu=mips32r2 -Doptimize=ReleaseFast --prefix zig-out-mips-release
-mkdir -p zig-out-mips/bin
-mips-linux-gnu-strip --strip-all -o zig-out-mips/bin/xray-zig zig-out-mips-release/bin/xray-zig
+zig build -Dtarget=aarch64-linux-musl -Dcpu=cortex_a53 -Doptimize=ReleaseFast --prefix zig-out-aarch64-release
 ```
 
-Verify `readelf -A` reports MIPS32r2 and soft float before publishing.
+Verify the artifact is an AArch64 statically linked ELF before publishing it.
+MIPS builds in older documents are historical benchmark instructions, not a
+deployment target.
+
+The active deployment runs `/etc/init.d/xray-zig` under `procd`, keeps both
+SOCKS and `xray0` TUN inbounds, and uses the live-only rules documented in
+`docs/openwrt-tun-service.md`. Do not write the TUN rules into `/etc/config`
+unless the user explicitly requests persistent UCI firewall configuration.
 
 ## Coding Style
 

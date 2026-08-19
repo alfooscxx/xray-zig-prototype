@@ -5,8 +5,7 @@ const xray = @import("xray_zig");
 
 const max_config_bytes = 16 * 1024 * 1024;
 const worker_stack_size = 1024 * 1024;
-const default_memory_budget_mib = 70;
-const default_worker_limit = 128;
+const default_memory_budget_mib = 512;
 const raw_connections_per_worker = 5;
 const estimated_raw_connection_kib = 112;
 const estimated_worker_kib = estimated_raw_connection_kib * raw_connections_per_worker;
@@ -107,25 +106,40 @@ fn runtimeCapacity(environ: *const std.process.Environ.Map) !RuntimeCapacity {
         default_memory_budget_mib,
         max_memory_budget_mib,
     );
-    const requested_workers = try parseEnvironmentLimit(
+    const requested_workers = try parseEnvironmentLimitOptional(
         environ,
         "XRAY_ZIG_WORKER_LIMIT",
-        default_worker_limit,
         max_requested_capacity,
     );
-    const default_raw_limit = std.math.mul(
-        usize,
-        requested_workers,
-        raw_connections_per_worker,
-    ) catch return error.InvalidRuntimeCapacity;
-    const requested_raw = try parseEnvironmentLimit(
+    const requested_raw = try parseEnvironmentLimitOptional(
         environ,
         "XRAY_ZIG_RAW_CONNECTION_LIMIT",
-        default_raw_limit,
         max_requested_capacity,
     );
 
-    return calculateCapacity(memory_budget_mib, requested_workers, requested_raw);
+    if (requested_workers == null and requested_raw == null) {
+        return calculateAutomaticCapacity(memory_budget_mib);
+    }
+
+    if (requested_workers) |workers| {
+        const raw_connections = requested_raw orelse std.math.mul(
+            usize,
+            workers,
+            raw_connections_per_worker,
+        ) catch return error.InvalidRuntimeCapacity;
+        return calculateCapacity(memory_budget_mib, workers, raw_connections);
+    }
+
+    const raw_connections = requested_raw.?;
+    const budget_kib = std.math.mul(usize, memory_budget_mib, 1024) catch
+        return error.InvalidRuntimeCapacity;
+    const raw_kib = std.math.mul(usize, raw_connections, estimated_raw_connection_kib) catch
+        return error.InvalidRuntimeCapacity;
+    const requested_from_remainder = if (raw_kib < budget_kib)
+        @max(@as(usize, 1), (budget_kib - raw_kib) / estimated_worker_kib)
+    else
+        1;
+    return calculateCapacity(memory_budget_mib, requested_from_remainder, raw_connections);
 }
 
 fn parseEnvironmentLimit(
@@ -139,6 +153,40 @@ fn parseEnvironmentLimit(
         return error.InvalidRuntimeCapacity;
     if (parsed == 0 or parsed > maximum) return error.InvalidRuntimeCapacity;
     return parsed;
+}
+
+fn parseEnvironmentLimitOptional(
+    environ: *const std.process.Environ.Map,
+    name: []const u8,
+    maximum: usize,
+) !?usize {
+    const value = environ.get(name) orelse return null;
+    const parsed = std.fmt.parseUnsigned(usize, value, 10) catch
+        return error.InvalidRuntimeCapacity;
+    if (parsed == 0 or parsed > maximum) return error.InvalidRuntimeCapacity;
+    return parsed;
+}
+
+fn calculateAutomaticCapacity(memory_budget_mib: usize) !RuntimeCapacity {
+    if (memory_budget_mib == 0) return error.InvalidRuntimeCapacity;
+    const budget_kib = std.math.mul(usize, memory_budget_mib, 1024) catch
+        return error.InvalidRuntimeCapacity;
+    const raw_bundle_kib = std.math.mul(
+        usize,
+        raw_connections_per_worker,
+        estimated_raw_connection_kib,
+    ) catch return error.InvalidRuntimeCapacity;
+    const bundle_kib = std.math.add(usize, estimated_worker_kib, raw_bundle_kib) catch
+        return error.InvalidRuntimeCapacity;
+    const workers = budget_kib / bundle_kib;
+    if (workers == 0) return error.MemoryBudgetTooSmall;
+    const raw_connections = std.math.mul(usize, workers, raw_connections_per_worker) catch
+        return error.InvalidRuntimeCapacity;
+    return .{
+        .memory_budget_mib = memory_budget_mib,
+        .worker_limit = workers,
+        .raw_connection_limit = raw_connections,
+    };
 }
 
 fn calculateCapacity(
@@ -226,6 +274,15 @@ fn printSummary(writer: *Io.Writer, cfg: *const xray.config.Config) !void {
         cfg.outbounds.len,
     });
     for (cfg.inbounds) |inbound| {
+        if (std.mem.eql(u8, inbound.protocol, "tun")) {
+            const settings = inbound.tun.?;
+            try writer.print("inbound {s}: tun device {s} mtu {d}\n", .{
+                inbound.tag orelse "-",
+                settings.name,
+                settings.mtu,
+            });
+            continue;
+        }
         try writer.print("inbound {s}: {s} on {s}:{d}\n", .{
             inbound.tag orelse "-",
             inbound.protocol,
@@ -241,7 +298,21 @@ fn printSummary(writer: *Io.Writer, cfg: *const xray.config.Config) !void {
     }
 }
 
-test "default runtime capacity splits 70 MiB equally across connection states" {
+test "automatic runtime capacity is derived from the memory budget" {
+    const capacity = try calculateAutomaticCapacity(70);
+    try std.testing.expectEqual(@as(usize, 70), capacity.memory_budget_mib);
+    try std.testing.expectEqual(@as(usize, 64), capacity.worker_limit);
+    try std.testing.expectEqual(@as(usize, 320), capacity.raw_connection_limit);
+}
+
+test "automatic 512 MiB capacity has no fixed worker ceiling" {
+    const capacity = try calculateAutomaticCapacity(512);
+    try std.testing.expectEqual(@as(usize, 512), capacity.memory_budget_mib);
+    try std.testing.expectEqual(@as(usize, 468), capacity.worker_limit);
+    try std.testing.expectEqual(@as(usize, 2340), capacity.raw_connection_limit);
+}
+
+test "explicit runtime requests are proportionally bounded by memory" {
     const capacity = try calculateCapacity(70, 128, 640);
     try std.testing.expectEqual(@as(usize, 70), capacity.memory_budget_mib);
     try std.testing.expectEqual(@as(usize, 64), capacity.worker_limit);

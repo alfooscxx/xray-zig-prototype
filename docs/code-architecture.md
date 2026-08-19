@@ -23,26 +23,30 @@ not pass an arena allocator to the raw reactor: arena `destroy` is a no-op.
 ## Runtime Concurrency
 
 `src/main.zig` owns a bounded `Io.Threaded` instance with 1 MiB worker stacks.
-Do not replace it with `init.io`: Zig 0.16's default concurrent pool is
-unlimited and reserves 16 MiB per worker, which exhausted a 32-bit target's
-virtual address space under mixed transparent traffic. Smaller 256 KiB and 512
-KiB stacks are unsafe in the MIPS TLS/crypto path.
+Workers are created only when concurrency is needed, so the configured
+capacity does not allocate all stacks or their RSS at startup. Zig 0.16 keeps
+created workers until `Io.Threaded.deinit`, however, so a burst leaves a warm
+pool and its touched stack pages resident. Do not replace it with `init.io`:
+the default pool is unlimited and reserves 16 MiB per worker. Smaller 256 KiB
+and 512 KiB stacks previously corrupted deep TLS/crypto workers, so reducing
+the stack is not used as an RSS optimization.
 
 The worker and raw-reactor limits cover different connection states. Lowering
 the worker limit does not increase reactor capacity: it reduces the number of
 connections that can initialize or remain in a non-direct bridge. The
 32-permit REALITY semaphore already bounds the CPU-heavy handshake phase.
-`XRAY_ZIG_MEMORY_BUDGET_MIB` defaults to 70 MiB and is shared with the router
-watchdog. The runtime models an initialization worker as 560 KiB and a raw
-connection as 112 KiB, reflecting the measured approximately 5:1 resident
-memory ratio. Requested limits are proportionally reduced until their combined
-estimate fits the budget. With the default requests of 128 workers and five raw
-connections per worker, the initial effective limits are 64 workers and 320
-raw connections.
+`XRAY_ZIG_MEMORY_BUDGET_MIB` defaults to 512 MiB. The runtime models an
+initialization worker as 560 KiB and a raw connection as 112 KiB, reflecting
+the measured approximately 5:1 resident-memory ratio. Without explicit caps it
+derives both limits directly from the budget while reserving five raw slots per
+worker: 512 MiB selects 468 workers and 2,340 raw slots, while 70 MiB selects
+64 and 320. The pool and raw connection buffers are both lazy; these values are
+admission ceilings, not startup allocations.
 
-`XRAY_ZIG_WORKER_LIMIT` and `XRAY_ZIG_RAW_CONNECTION_LIMIT` override the
-requested counts. When the raw limit is omitted, it is five times the requested
-worker limit. The selected budget and effective counts are logged at startup.
+`XRAY_ZIG_WORKER_LIMIT` and `XRAY_ZIG_RAW_CONNECTION_LIMIT` override automatic
+sizing. When an explicit worker limit omits the raw limit, raw capacity is five
+times the worker request. Explicit requests that exceed the budget are reduced
+proportionally. The selected budget and effective counts are logged at startup.
 This model is an admission-sizing estimate, not an allocator-enforced RSS
 limit; the watchdog remains responsible for terminating a process that exceeds
 the same budget. The process raises its soft descriptor limit to the permitted
@@ -50,9 +54,9 @@ hard limit before starting the runtime. Each raw connection still requires two
 file descriptors and two 16 KiB buffers, so field validation must sample both
 FD use and RSS.
 
-The production router controller requests 80 workers and 240 raw connections
-within the same 70 MiB budget. A 64/320 field run passed all traffic but emitted
-126 worker-capacity warnings. The 80/240 run passed the same 32-request mixed
+The legacy small-router controller requests 80 workers and 240 raw connections
+within its explicit 70 MiB budget. A 64/320 field run passed all traffic but
+emitted 126 worker-capacity warnings. The 80/240 run passed the same 32-request mixed
 HTTPS matrix and four 4 MiB transfers, emitted 16 warnings, and reached 5.342
 MiB/s. The final 0.0.5 run repeated 32/32 and 4/4, reached 5.678 MiB/s, emitted
 four warnings, and peaked at 37.1 MiB RSS. A 96/160 run eliminated capacity
@@ -61,6 +65,13 @@ one Fastly TLS handshake. The 80/240 split is therefore the production default
 pending longer observation.
 
 Each accepted TCP connection gets one handler worker. Bidirectional plain, REALITY, and Vision bridges poll the client and upstream sockets from that handler, then drain any userspace reader/TLS buffers before polling again. This keeps a live connection to one worker. If the pool limit is reached, a TCP inbound holds one accepted stream, retries scheduling every 10 ms, and leaves later connections in the kernel listen backlog. It must not run the handler synchronously on the accept worker because a long-lived connection would stall that listener indefinitely.
+
+The TUN endpoint uses three concurrent tasks per active proxied flow: the flow
+owner also runs the uplink pump, one task runs the downlink pump, and one runs
+the selected outbound dispatcher. All TUN flows share one 50 ms retransmission
+and expiry task. This replaced the earlier five-task design; the AArch64 field
+run in `tun-tcp-field-test-2026-08-20.md` measured the resulting capacity and
+RSS reduction.
 
 The response-header phase has a 60-second inactivity timeout, and established
 worker and raw-reactor bridges have a 300-second inactivity timeout. These
@@ -131,6 +142,10 @@ Each protocol owns its wire format:
 - `src/proxy/redirect/inbound.zig`: transparent TCP accept and original destination lookup.
 - `src/proxy/dns/inbound.zig`: DNS inbound request handling.
 - `src/proxy/socks/inbound.zig`: SOCKS5 test/manual inbound.
+- `src/proxy/tun/inbound.zig`: Linux TUN ownership, bounded TCP flow state,
+  and `AF_UNIX` stream adaptation for the dispatcher.
+- `src/proxy/tun/packet.zig`: IPv4/IPv6 TCP parsing, packet construction,
+  per-family MSS, and checksum handling.
 - `src/proxy/vless/outbound.zig`: VLESS request/response headers and REALITY connection setup.
 - `src/proxy/vless/vision.zig`: Vision padding, unpadding, TLS detection, and direct-copy state tracking.
 - `src/proxy/freedom/outbound.zig`: direct TCP outbound.
