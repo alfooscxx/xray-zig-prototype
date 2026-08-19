@@ -65,3 +65,41 @@ ACKs, duplicate ACK fast retransmit, and retry exhaustion. Live HTTPS exercised
 the timer-enabled engine but did not deliberately drop packets. The router had
 no `tc`/netem binary or netem module. No package installation or temporary
 firewall drop rule was used, so a controlled live-loss test remains pending.
+
+## Worker refactor follow-up
+
+Commit `c167f08` replaced every per-flow retransmission task with one shared
+TUN timer and folded the uplink pump into the flow owner. It also made runtime
+capacity derive from the process memory budget. The default 512 MiB setting
+selected 468 workers and 2,340 lazy raw-connection slots. The tested AArch64
+binary SHA-256 was
+`d2a34a3921e2ee953d44855486deb4421aca197feef7b5d031408cf1a7e920e0`.
+
+At idle the configured 468-worker process had only four threads and 1,868 KiB
+RSS, confirming that capacity does not preallocate workers or resident stacks.
+After IPv4 and IPv6 smoke tests it had nine threads and 4,244 KiB RSS.
+
+| Workload | Result | Sampler elapsed | Process CPU | Peak RSS | Peak threads | Peak FDs |
+|---|---:|---:|---:|---:|---:|---:|
+| IPv4, 32 by 2 MiB | 32/32 | 5 s | 3.49 s | 39,716 KiB | 100 | 98 |
+| IPv4, 64 by 1 MiB | 64/64 | 5 s | 4.28 s | 82,188 KiB | 196 | 194 |
+| IPv4, 128 by 512 KiB | 127/128 | 17 s | 5.57 s | 161,304 KiB | 388 | 329 |
+
+The comparable pre-refactor successful 32-flow run needed 163 threads and
+56,728 KiB RSS. The refactor reduced threads by 38.7% and peak RSS by 30.0%
+without increasing the five-second sampler interval. No run logged
+`ConcurrencyUnavailable`, and every run returned to five FDs.
+
+The single 128-flow TUN failure was not a worker-capacity failure. A direct
+128-flow control run against the same endpoint failed three TLS connections;
+the TUN run failed one. A later 96-flow TUN run and its direct control each
+failed one endpoint TLS connection. The TUN process logged two REALITY
+initialization timeouts across the high-concurrency sequence but remained
+healthy.
+
+Zig `Io.Threaded` does not retire workers. After the largest burst, the idle
+process retained 388 threads, 168,164 KiB RSS, and 501,544 KiB virtual size,
+while FDs returned to five. The 1 MiB stack is demand-paged rather than charged
+fully to RSS, but touched pages stay resident until process exit. Reducing
+per-flow tasks therefore saves real memory without reintroducing the TLS stack
+overflow risk of smaller worker stacks.

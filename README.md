@@ -153,4 +153,15 @@ xray-zig process and its IPv4/IPv6 transparent firewall rules. See
 [`docs/xray-zig-quick.md`](docs/xray-zig-quick.md) for the device profile and
 installation procedure.
 
-The executable creates a bounded Zig `Io.Threaded` runtime rather than using the standard unlimited concurrent pool. Worker stacks are 1 MiB and at most 128 concurrent workers are allowed. Each bidirectional bridge uses one poll-driven connection worker. Full pools apply listener backpressure instead of resetting accepted clients, and at most 32 VLESS/REALITY handshakes run at once to bound CPU and ClientHello bursts. The limits are important on 32-bit targets: Zig's default 16 MiB stack reservation can exhaust the address space, while the earlier two-worker bridge saturated a 64-worker pool at about 30 live connections. A 512 KiB stack corrupted MIPS TLS workers under concurrent load and is not supported.
+The executable creates a bounded Zig `Io.Threaded` runtime rather than using
+the standard unlimited concurrent pool. Workers have 1 MiB stacks, are created
+lazily, and remain until process shutdown. The default 512 MiB process budget
+derives the worker and raw-reactor capacities instead of applying a fixed
+worker ceiling; `XRAY_ZIG_MEMORY_BUDGET_MIB`, `XRAY_ZIG_WORKER_LIMIT`, and
+`XRAY_ZIG_RAW_CONNECTION_LIMIT` can override the sizing inputs. Full pools
+apply listener backpressure instead of resetting accepted clients, and at most
+32 VLESS/REALITY handshakes run at once. TUN uses three concurrent tasks per
+active proxied flow plus one shared retransmission timer. The 1 MiB stack is
+retained because smaller stacks previously corrupted deep TLS workers; stack
+pages are demand-paged and do not become RSS merely because the capacity is
+large.

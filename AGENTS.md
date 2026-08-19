@@ -32,8 +32,11 @@ Supported:
 - Optional `chacha20-only` REALITY policy for software-AES targets.
 - `freedom`, `blackhole`, and minimal TCP `dns` outbounds.
 
-The runtime uses 1 MiB stacks, a 128-worker cap, listener backpressure, and a
-32-session VLESS/REALITY handshake limit. See
+The runtime uses lazily created 1 MiB-stack workers. Its default 512 MiB memory
+budget derives the worker and raw-reactor limits instead of imposing a fixed
+worker cap; explicit environment limits remain supported. Workers do not
+retire before process shutdown. The runtime also has listener backpressure and
+a 32-session VLESS/REALITY handshake limit. See
 `docs/vision-response-deadlock.md` before changing the connection lifecycle.
 The DNS inbound processes at most 16 queries concurrently. Each selected query
 uses DNS-over-TCP through its rule's `outboundTag`; see `docs/dns-servfail.md`.

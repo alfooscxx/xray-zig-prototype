@@ -20,6 +20,13 @@ retransmit. Timeout and fast retransmit reduce the congestion window. Half-open
 flows expire after 20 seconds and otherwise-idle flows after five minutes, so
 neither state nor dispatcher work can remain live forever without traffic.
 
+One manager-wide 50 ms timer snapshots live flows under the flow-map lock,
+retains them while polling, and releases them afterwards. Retransmission is not
+a per-flow worker. The flow owner performs the TUN-to-dispatcher pump directly;
+only the dispatcher and reverse pump are separate tasks. This keeps the active
+cost at three executor tasks per proxied flow plus one timer for the entire TUN
+inbound.
+
 Sequence comparisons use wrapping 32-bit arithmetic. Ordered uplink payload is
 accepted immediately. A retransmit overlapping the current receive sequence is
 trimmed so only new bytes reach the dispatcher. Future out-of-order data is not
