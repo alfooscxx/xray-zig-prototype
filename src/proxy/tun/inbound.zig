@@ -10,6 +10,7 @@ const log = @import("../../log.zig");
 const session = @import("../../net/session.zig");
 const sniff = @import("../../net/sniff.zig");
 pub const packet = @import("packet.zig");
+pub const tcp = @import("tcp.zig");
 
 const linux = std.os.linux;
 const tun_set_iff = 0x400454ca;
@@ -17,6 +18,7 @@ const iff_tun: u16 = 0x0001;
 const iff_no_pi: u16 = 0x1000;
 const advertised_window: u16 = 65535;
 const segment_queue_len = 16;
+const retransmission_poll_ms = 50;
 
 pub const Error = error{
     TunRequiresLinux,
@@ -30,6 +32,7 @@ const OwnedSegment = struct {
     acknowledgment: u32,
     flags: packet.Flags,
     window: u16,
+    maximum_segment_size: ?u16,
     payload_len: u16,
     payload: [packet.max_tcp_payload]u8,
 
@@ -40,6 +43,7 @@ const OwnedSegment = struct {
             .acknowledgment = segment.acknowledgment,
             .flags = segment.flags,
             .window = segment.window,
+            .maximum_segment_size = segment.maximum_segment_size,
             .payload_len = @intCast(segment.payload.len),
             .payload = undefined,
         };
@@ -60,108 +64,103 @@ const Flow = struct {
     queue: Io.Queue(OwnedSegment) = undefined,
     state_mutex: Io.Mutex = .init,
     ack_condition: Io.Condition = .init,
-    client_next: u32,
-    server_next: u32,
-    server_acked: u32,
-    client_window: u32,
-    client_fin: bool = false,
-    reset: bool = false,
+    state: tcp.State,
 
     fn initializeQueue(self: *Flow) void {
         self.queue = .init(&self.queue_storage);
     }
 
-    fn observeAck(self: *Flow, segment: *const OwnedSegment, io: Io) !void {
+    fn processSegment(self: *Flow, segment: *const OwnedSegment, io: Io) !tcp.ReceiveResult {
         try self.state_mutex.lock(io);
-        defer self.state_mutex.unlock(io);
-        self.client_window = segment.window;
-        if (segment.flags.ack and sequenceAfter(segment.acknowledgment, self.server_acked) and
-            !sequenceAfter(segment.acknowledgment, self.server_next))
-        {
-            self.server_acked = segment.acknowledgment;
+        const previous_una = self.state.send_una;
+        const previous_window = self.state.send_window;
+        const result = self.state.onSegment(
+            segment.sequence,
+            segment.acknowledgment,
+            segment.flags,
+            segment.window,
+            segment.payload_len,
+            nowMilliseconds(io),
+        );
+        const acknowledgment = self.state.recv_next;
+        const sequence = self.state.send_next;
+        const terminal = self.state.phase == .terminal;
+        if (previous_una != self.state.send_una or previous_window != self.state.send_window or result.reset or terminal) {
             self.ack_condition.broadcast(io);
         }
-        if (segment.flags.rst) {
-            self.reset = true;
-            self.ack_condition.broadcast(io);
+        self.state_mutex.unlock(io);
+
+        if (result.fast_retransmit) |retry| try self.sendTx(retry, io);
+        if (result.send_ack) {
+            try self.manager.device.writeTcp(self.key, sequence, acknowledgment, .{ .ack = true }, &.{}, io);
+        }
+        if (terminal) self.queue.close(io);
+        return result;
+    }
+
+    fn resendSynAck(self: *Flow, io: Io) !void {
+        try self.state_mutex.lock(io);
+        const syn = if (self.state.tx_count != 0 and self.state.tx[0].flags.syn) self.state.tx[0] else null;
+        const sequence = self.state.send_next;
+        const acknowledgment = self.state.recv_next;
+        self.state_mutex.unlock(io);
+        if (syn) |segment| {
+            try self.sendTx(segment, io);
+        } else {
+            try self.manager.device.writeTcp(self.key, sequence, acknowledgment, .{ .ack = true }, &.{}, io);
         }
     }
 
-    fn acceptClientData(self: *Flow, segment: *const OwnedSegment, io: Io) !bool {
+    fn sendTx(self: *Flow, segment: tcp.TxSegment, io: Io) !void {
         try self.state_mutex.lock(io);
-        defer self.state_mutex.unlock(io);
-        if (segment.sequence != self.client_next) return false;
-        self.client_next +%= segment.payload_len;
-        if (segment.flags.fin) {
-            self.client_next +%= 1;
-            self.client_fin = true;
-        }
-        return true;
-    }
-
-    fn sendAck(self: *Flow, io: Io) !void {
-        try self.state_mutex.lock(io);
-        const sequence = self.server_next;
-        const acknowledgment = self.client_next;
+        const acknowledgment = self.state.recv_next;
         self.state_mutex.unlock(io);
-        try self.manager.device.writeTcp(self.key, sequence, acknowledgment, .{ .ack = true }, &.{}, io);
-    }
-
-    fn sendSynAck(self: *Flow, io: Io) !void {
-        try self.state_mutex.lock(io);
-        const sequence = self.server_next -% 1;
-        const acknowledgment = self.client_next;
-        self.state_mutex.unlock(io);
-        try self.manager.device.writeTcp(self.key, sequence, acknowledgment, .{ .syn = true, .ack = true }, &.{}, io);
+        try self.manager.device.writeTcp(
+            self.key,
+            segment.sequence,
+            acknowledgment,
+            segment.flags,
+            segment.bytes(),
+            io,
+        );
     }
 
     fn sendData(self: *Flow, bytes: []const u8, io: Io) !void {
         var offset: usize = 0;
         while (offset < bytes.len) {
             try self.state_mutex.lock(io);
-            while (!self.reset and self.client_window <= self.server_next -% self.server_acked) {
+            var queued: ?tcp.TxSegment = null;
+            while (self.state.phase != .terminal) {
+                queued = self.state.queueData(bytes[offset..], nowMilliseconds(io));
+                if (queued != null) break;
                 try self.ack_condition.wait(io, &self.state_mutex);
             }
-            if (self.reset) {
+            if (self.state.phase == .terminal) {
                 self.state_mutex.unlock(io);
                 return error.ConnectionResetByPeer;
             }
-            const outstanding = self.server_next -% self.server_acked;
-            const available: usize = @intCast(self.client_window - outstanding);
-            const len = @min(bytes.len - offset, available, packet.tcpPayloadLimit(self.key.version));
-            const sequence = self.server_next;
-            const acknowledgment = self.client_next;
-            self.server_next +%= @intCast(len);
             self.state_mutex.unlock(io);
-
-            try self.manager.device.writeTcp(
-                self.key,
-                sequence,
-                acknowledgment,
-                .{ .ack = true, .psh = true },
-                bytes[offset..][0..len],
-                io,
-            );
-            offset += len;
+            try self.sendTx(queued.?, io);
+            offset += queued.?.payload_len;
         }
     }
 
     fn sendFinAndWait(self: *Flow, io: Io) !void {
         try self.state_mutex.lock(io);
-        if (self.reset) {
-            self.state_mutex.unlock(io);
-            return;
+        var fin: ?tcp.TxSegment = null;
+        while (self.state.phase != .terminal and !self.state.local_fin_sent) {
+            fin = self.state.queueFin(nowMilliseconds(io));
+            if (fin != null) break;
+            try self.ack_condition.wait(io, &self.state_mutex);
         }
-        const sequence = self.server_next;
-        const acknowledgment = self.client_next;
-        self.server_next +%= 1;
-        const expected_ack = self.server_next;
+        const terminal = self.state.phase == .terminal;
         self.state_mutex.unlock(io);
-        try self.manager.device.writeTcp(self.key, sequence, acknowledgment, .{ .fin = true, .ack = true }, &.{}, io);
+        if (terminal) return;
+        if (fin) |segment| try self.sendTx(segment, io);
 
         try self.state_mutex.lock(io);
         defer self.state_mutex.unlock(io);
-        while (!self.reset and self.server_acked != expected_ack) {
+        while (self.state.phase != .terminal) {
             try self.ack_condition.wait(io, &self.state_mutex);
         }
     }
@@ -196,7 +195,7 @@ const Device = struct {
     ) !void {
         var buffer: [packet.max_mtu]u8 = undefined;
         const identification: u16 = @truncate(self.next_identification.fetchAdd(1, .monotonic));
-        const bytes = try packet.build(
+        const bytes = try packet.buildForMtu(
             buffer[0..self.mtu],
             key,
             sequence,
@@ -205,6 +204,7 @@ const Device = struct {
             advertised_window,
             payload,
             identification,
+            self.mtu,
         );
         try self.write_mutex.lock(io);
         defer self.write_mutex.unlock(io);
@@ -268,14 +268,20 @@ const FlowManager = struct {
             return err;
         };
         const isn = self.next_isn.fetchAdd(0x9e3779b9, .monotonic);
+        const local_mss: u16 = @intCast(packet.tcpPayloadLimitForMtu(segment.key.version, self.device.mtu));
+        var tcp_state = tcp.State.init(
+            segment.sequence,
+            isn,
+            segment.window,
+            @min(local_mss, segment.maximum_segment_size orelse local_mss),
+            nowMilliseconds(io),
+        );
+        const syn_ack = tcp_state.queueSynAck(nowMilliseconds(io)) orelse unreachable;
         flow.* = .{
             .key = segment.key,
             .inbound_tag = inbound_tag,
             .manager = self,
-            .client_next = segment.sequence +% 1,
-            .server_next = isn +% 1,
-            .server_acked = isn,
-            .client_window = segment.window,
+            .state = tcp_state,
         };
         flow.initializeQueue();
         self.flows.put(segment.key, flow) catch |err| {
@@ -285,7 +291,7 @@ const FlowManager = struct {
         };
         self.mutex.unlock(io);
 
-        flow.sendSynAck(io) catch |err| {
+        flow.sendTx(syn_ack, io) catch |err| {
             self.removeAndDestroy(flow, io);
             return err;
         };
@@ -383,6 +389,9 @@ fn runFlow(flow: *Flow, io: Io) Io.Cancelable!void {
     defer flow.manager.removeAndDestroy(flow, io);
     diagnostics.setThreadName("xz-tun-flow");
 
+    var retransmit_future = io.concurrent(retransmissionPump, .{ flow, io }) catch return;
+    defer _ = retransmit_future.cancel(io) catch {};
+
     var preface_buffer: [session.max_preface_len]u8 = undefined;
     const preface_len = waitForPreface(flow, &preface_buffer, io) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
@@ -414,21 +423,18 @@ fn runFlow(flow: *Flow, io: Io) Io.Cancelable!void {
 fn waitForPreface(flow: *Flow, buffer: *[session.max_preface_len]u8, io: Io) !usize {
     while (true) {
         const segment = try flow.queue.getOne(io);
-        try flow.observeAck(&segment, io);
-        if (segment.flags.rst) return error.ConnectionResetByPeer;
+        const result = try flow.processSegment(&segment, io);
+        if (result.reset) return error.ConnectionResetByPeer;
         if (segment.flags.syn) {
-            try flow.sendSynAck(io);
+            try flow.resendSynAck(io);
             continue;
         }
-        if (segment.payload_len == 0 and !segment.flags.fin) continue;
-        if (!try flow.acceptClientData(&segment, io)) {
-            try flow.sendAck(io);
-            continue;
-        }
-        try flow.sendAck(io);
-        if (segment.flags.fin and segment.payload_len == 0) return error.EndOfStream;
-        @memcpy(buffer[0..segment.payload_len], segment.bytes());
-        return segment.payload_len;
+        if (result.accepted_fin and result.payload_len == 0) return error.EndOfStream;
+        if (result.payload_len == 0) continue;
+        const start: usize = result.payload_skip;
+        const len: usize = result.payload_len;
+        @memcpy(buffer[0..len], segment.bytes()[start..][0..len]);
+        return len;
     }
 }
 
@@ -442,35 +448,27 @@ fn inboundPump(flow: *Flow, bridge: net.Stream, io: Io) Io.Cancelable!void {
             error.Canceled => return error.Canceled,
             error.Closed => return,
         };
-        try flow.observeAck(&segment, io);
-        if (segment.flags.rst) return;
+        const result = flow.processSegment(&segment, io) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return,
+        };
+        if (result.reset) return;
         if (segment.flags.syn) {
-            flow.sendSynAck(io) catch |err| switch (err) {
+            flow.resendSynAck(io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => return,
             };
             continue;
         }
-        if (segment.payload_len != 0 or segment.flags.fin) {
-            if (!try flow.acceptClientData(&segment, io)) {
-                flow.sendAck(io) catch |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    else => return,
-                };
-                continue;
-            }
-            if (segment.payload_len != 0) {
-                output.writeAll(segment.bytes()) catch return;
-                output.flush() catch return;
-            }
-            flow.sendAck(io) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => return,
-            };
-            if (segment.flags.fin and !send_shutdown) {
-                bridge.shutdown(io, .send) catch {};
-                send_shutdown = true;
-            }
+        if (result.payload_len != 0) {
+            const start: usize = result.payload_skip;
+            const len: usize = result.payload_len;
+            output.writeAll(segment.bytes()[start..][0..len]) catch return;
+            output.flush() catch return;
+        }
+        if (result.accepted_fin and !send_shutdown) {
+            bridge.shutdown(io, .send) catch {};
+            send_shutdown = true;
         }
     }
 }
@@ -510,6 +508,43 @@ fn dispatchFlow(stream: net.Stream, flow: *Flow, preface: []const u8, io: Io) Io
     };
 }
 
+fn retransmissionPump(flow: *Flow, io: Io) Io.Cancelable!void {
+    while (true) {
+        try io.sleep(Io.Duration.fromMilliseconds(retransmission_poll_ms), .awake);
+        try flow.state_mutex.lock(io);
+        const now_ms = nowMilliseconds(io);
+        _ = flow.state.expired(now_ms);
+        const retry = flow.state.retransmitDue(now_ms);
+        const terminal = flow.state.phase == .terminal;
+        if (terminal) flow.ack_condition.broadcast(io);
+        flow.state_mutex.unlock(io);
+
+        if (terminal) {
+            flow.queue.close(io);
+            return;
+        }
+        if (retry) |segment| flow.sendTx(segment, io) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {
+                terminateFlow(flow, io);
+                return;
+            },
+        };
+    }
+}
+
+fn terminateFlow(flow: *Flow, io: Io) void {
+    flow.state_mutex.lockUncancelable(io);
+    flow.state.phase = .terminal;
+    flow.ack_condition.broadcast(io);
+    flow.state_mutex.unlock(io);
+    flow.queue.close(io);
+}
+
+fn nowMilliseconds(io: Io) u64 {
+    return @intCast(@max(@as(i64, 0), Io.Timestamp.now(io, .awake).toMilliseconds()));
+}
+
 fn targetForKey(key: packet.FlowKey) net.IpAddress {
     return switch (key.version) {
         .ip4 => .{ .ip4 = .{
@@ -543,14 +578,4 @@ fn createLocalPair() ![2]net.Stream {
         .{ .socket = .{ .handle = fds[0], .address = address } },
         .{ .socket = .{ .handle = fds[1], .address = address } },
     };
-}
-
-fn sequenceAfter(a: u32, b: u32) bool {
-    return @as(i32, @bitCast(a -% b)) > 0;
-}
-
-test "TCP sequence comparison handles wraparound" {
-    try std.testing.expect(sequenceAfter(1, 0));
-    try std.testing.expect(sequenceAfter(1, 0xfffffff0));
-    try std.testing.expect(!sequenceAfter(0xfffffff0, 1));
 }

@@ -9,9 +9,22 @@ pub const Version = enum(u8) {
 };
 
 pub fn tcpPayloadLimit(version: Version) usize {
+    return tcpPayloadLimitForMtu(version, max_mtu);
+}
+
+pub fn tcpPayloadLimitForMtu(version: Version, mtu: u16) usize {
+    const header_len: u16 = switch (version) {
+        .ip4 => 20 + 20,
+        .ip6 => 40 + 20,
+    };
+    if (mtu <= header_len) return 0;
+    return mtu - header_len;
+}
+
+pub fn minimumMtu(version: Version) u16 {
     return switch (version) {
-        .ip4 => max_mtu - 20 - 20,
-        .ip6 => max_mtu - 40 - 20,
+        .ip4 => 40,
+        .ip6 => 60,
     };
 }
 
@@ -60,6 +73,7 @@ pub const Segment = struct {
     acknowledgment: u32,
     flags: Flags,
     window: u16,
+    maximum_segment_size: ?u16,
     payload: []const u8,
 };
 
@@ -145,8 +159,30 @@ fn parseTcp(key_template: FlowKey, tcp: []const u8) ParseError!Segment {
         .acknowledgment = std.mem.readInt(u32, tcp[8..12], .big),
         .flags = @bitCast(tcp[13]),
         .window = std.mem.readInt(u16, tcp[14..16], .big),
+        .maximum_segment_size = try parseMaximumSegmentSize(tcp[20..tcp_header_len]),
         .payload = tcp[tcp_header_len..],
     };
+}
+
+fn parseMaximumSegmentSize(options: []const u8) ParseError!?u16 {
+    var offset: usize = 0;
+    while (offset < options.len) {
+        const kind = options[offset];
+        if (kind == 0) break;
+        if (kind == 1) {
+            offset += 1;
+            continue;
+        }
+        if (offset + 2 > options.len) return error.InvalidTcpHeader;
+        const len = options[offset + 1];
+        if (len < 2 or offset + len > options.len) return error.InvalidTcpHeader;
+        if (kind == 2) {
+            if (len != 4) return error.InvalidTcpHeader;
+            return std.mem.readInt(u16, options[offset + 2 ..][0..2], .big);
+        }
+        offset += len;
+    }
+    return null;
 }
 
 pub fn build(
@@ -159,10 +195,25 @@ pub fn build(
     payload: []const u8,
     identification: u16,
 ) ![]const u8 {
+    return buildForMtu(output, key, sequence, acknowledgment, flags, window, payload, identification, max_mtu);
+}
+
+pub fn buildForMtu(
+    output: []u8,
+    key: FlowKey,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: Flags,
+    window: u16,
+    payload: []const u8,
+    identification: u16,
+    mtu: u16,
+) ![]const u8 {
     const ip_header_len: usize = if (key.version == .ip4) 20 else 40;
     const tcp_header_len: usize = if (flags.syn) 24 else 20;
     const total_len = ip_header_len + tcp_header_len + payload.len;
-    if (total_len > output.len or total_len > max_mtu) return error.PacketTooLarge;
+    if (mtu > max_mtu or mtu < minimumMtu(key.version)) return error.InvalidMtu;
+    if (total_len > output.len or total_len > mtu) return error.PacketTooLarge;
     const packet = output[0..total_len];
     @memset(packet, 0);
 
@@ -196,7 +247,7 @@ pub fn build(
     if (flags.syn) {
         tcp[20] = 2;
         tcp[21] = 4;
-        const mss: u16 = @intCast(tcpPayloadLimit(key.version));
+        const mss: u16 = @intCast(tcpPayloadLimitForMtu(key.version, mtu));
         std.mem.writeInt(u16, tcp[22..24], mss, .big);
     }
     @memcpy(tcp[tcp_header_len..], payload);
@@ -281,6 +332,7 @@ test "builds and parses an IPv6 SYN-ACK" {
     try std.testing.expectEqual(Version.ip6, parsed.key.version);
     try std.testing.expect(parsed.flags.syn);
     try std.testing.expect(parsed.flags.ack);
+    try std.testing.expectEqual(@as(?u16, 1440), parsed.maximum_segment_size);
     try std.testing.expectEqual(@as(usize, 0), parsed.payload.len);
 }
 
@@ -300,6 +352,23 @@ test "IPv6 payload limit preserves a 1500-byte packet" {
         error.PacketTooLarge,
         build(&buffer, key, 10, 20, .{ .ack = true }, 65535, (&([_]u8{0} ** 1441)), 0),
     );
+}
+
+test "configured MTU controls payload size and advertised MSS" {
+    const key: FlowKey = .{
+        .version = .ip4,
+        .source = .{ 192, 0, 2, 10 } ++ ([_]u8{0} ** 12),
+        .destination = .{ 198, 51, 100, 20 } ++ ([_]u8{0} ** 12),
+        .source_port = 50000,
+        .destination_port = 443,
+    };
+    var buffer: [max_mtu]u8 = undefined;
+    const syn = try buildForMtu(&buffer, key, 1, 2, .{ .syn = true, .ack = true }, 65535, &.{}, 1, 1280);
+    try std.testing.expectEqual(@as(u16, 1240), std.mem.readInt(u16, syn[42..44], .big));
+    try std.testing.expectEqual(@as(?u16, 1240), (try parse(syn)).maximum_segment_size);
+    const payload = [_]u8{0} ** 1240;
+    try std.testing.expectEqual(@as(usize, 1280), (try buildForMtu(&buffer, key, 1, 2, .{ .ack = true }, 65535, &payload, 1, 1280)).len);
+    try std.testing.expectError(error.PacketTooLarge, buildForMtu(&buffer, key, 1, 2, .{ .ack = true }, 65535, &([_]u8{0} ** 1241), 1, 1280));
 }
 
 test "rejects UDP explicitly" {
