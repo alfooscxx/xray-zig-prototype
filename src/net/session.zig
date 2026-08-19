@@ -6,6 +6,15 @@ const posix = std.posix;
 
 const reality = @import("../transport/reality/client.zig");
 pub const RawReactor = @import("reactor.zig").Reactor;
+pub const datagram = @import("datagram.zig");
+
+test {
+    _ = datagram;
+    _ = @import("../proxy/tun/udp_packet.zig");
+    _ = @import("../proxy/tun/udp.zig");
+    _ = @import("../proxy/freedom/udp.zig");
+    _ = @import("../proxy/vless/udp.zig");
+}
 
 pub const max_preface_len = 2048;
 pub const response_header_timeout_ms = 60 * 1000;
