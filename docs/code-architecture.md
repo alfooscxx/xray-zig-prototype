@@ -149,8 +149,13 @@ VLESS limits concurrent TCP plus REALITY initialization to 32 sessions. This bou
 
 - TLS 1.3 and TLS 1.2 are offered.
 - ECH and GREASE ECH are never emitted.
-- Firefox-like fingerprints are supported; generic `firefox` maps to a no-ECH profile.
+- Firefox-like fingerprints are supported; generic `firefox` maps to the Firefox 148 no-ECH profile.
 - `realitySettings.cipherPolicy` defaults to `firefox`. The explicit `chacha20-only` policy restricts TLS 1.3 and TLS 1.2 suites to ChaCha20 for software-AES CPUs; it intentionally changes the cipher-suite portion of the browser fingerprint.
+
+On AArch64, Zig selects AES instructions and PMULL-backed GHASH at compile
+time. Builds for Cortex-A53 OpenWRT routers must pass `-Dcpu=cortex_a53`;
+generic AArch64 builds retain the software AES fallback. Field measurements
+and the kernel Safexcel/AF_ALG status are in `docs/arm64-aes-gcm.md`.
 
 `src/transport/tls/client.zig` is a small TLS client used by REALITY. REALITY certificate verification checks the Ed25519 certificate signature as `HMAC-SHA512(public_key, auth_key)`, matching Xray's REALITY client behavior.
 

@@ -122,9 +122,9 @@ pub fn buildHandshake(out: []u8, options: BuildOptions, key_material: *const Key
     try writeU16(&writer, 0);
     switch (options.fingerprint) {
         .firefox,
-        .hellofirefox_105,
-        => try writeFirefox105Extensions(&writer, options, key_material),
-        .hellofirefox_148 => try writeFirefox148Extensions(&writer, options, key_material),
+        .hellofirefox_148,
+        => try writeFirefox148Extensions(&writer, options, key_material),
+        .hellofirefox_105 => try writeFirefox105Extensions(&writer, options, key_material),
         .hellofirefox_120 => try writeFirefox120Extensions(&writer, options, key_material),
         else => unreachable,
     }
@@ -416,6 +416,7 @@ test "builds Firefox 148 ClientHello shape" {
     }, &key_material);
 
     try std.testing.expectEqual(@as(u8, @intFromEnum(tls.HandshakeType.client_hello)), hello[0]);
+    try std.testing.expectEqual(@as(u16, 0x1301), firstCipherSuite(hello));
     try std.testing.expect(cipherSuitePresent(hello, 0xc02b));
     try std.testing.expect(cipherSuitePresent(hello, 0x1301));
     try std.testing.expect(cipherSuitePresent(hello, 0x1302));
@@ -425,6 +426,28 @@ test "builds Firefox 148 ClientHello shape" {
     try std.testing.expect(supportedVersionPresent(hello, @intFromEnum(tls.ProtocolVersion.tls_1_3)));
     try std.testing.expect(supportedVersionPresent(hello, @intFromEnum(tls.ProtocolVersion.tls_1_2)));
     try std.testing.expect(!extensionPresent(hello, 0xfe0d));
+}
+
+test "generic Firefox tracks the explicit Firefox 148 profile" {
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*byte, i| byte.* = @intCast((i * 29 + 7) & 0xff);
+    entropy[32..64].* = [_]u8{0} ** 32;
+    const key_material = try KeyMaterial.init(entropy[64..240]);
+
+    var generic_buffer: [4096]u8 = undefined;
+    const generic = try buildHandshake(&generic_buffer, .{
+        .host = "www.example.com",
+        .entropy = &entropy,
+        .fingerprint = .firefox,
+    }, &key_material);
+    var explicit_buffer: [4096]u8 = undefined;
+    const explicit = try buildHandshake(&explicit_buffer, .{
+        .host = "www.example.com",
+        .entropy = &entropy,
+        .fingerprint = .hellofirefox_148,
+    }, &key_material);
+
+    try std.testing.expectEqualSlices(u8, explicit, generic);
 }
 
 test "chacha20-only policy preserves TLS versions without AES or ECH" {
@@ -489,6 +512,11 @@ fn cipherSuitePresent(hello: []const u8, suite: u16) bool {
         if (readU16(hello[index..][0..2]) == suite) return true;
     }
     return false;
+}
+
+fn firstCipherSuite(hello: []const u8) u16 {
+    const index = clientHelloCipherSuitesOffset(hello) + 2;
+    return readU16(hello[index..][0..2]);
 }
 
 fn extensionPresent(hello: []const u8, extension_type: u16) bool {

@@ -87,6 +87,14 @@ pub const SslKeyLog = struct {
 /// at least this amount.
 pub const min_buffer_len = tls.max_ciphertext_record_len;
 
+pub fn cipherSuiteName(c: *const Client) []const u8 {
+    return @tagName(std.meta.activeTag(c.application_cipher));
+}
+
+pub fn protocolVersionName(c: *const Client) []const u8 {
+    return @tagName(c.tls_version);
+}
+
 pub const Options = struct {
     /// How to perform host verification of server certificates.
     host: union(enum) {

@@ -3,6 +3,7 @@ const Io = std.Io;
 const net = Io.net;
 
 const config = @import("../../config/mod.zig");
+const log = @import("../../log.zig");
 const client_hello = @import("../tls/client_hello.zig");
 const RealityTlsClient = @import("../tls/client.zig");
 const tls_cipher_policy = @import("../tls/cipher_policy.zig");
@@ -124,6 +125,16 @@ pub const Client = struct {
             error.ReadFailed => self.stream_reader.err orelse err,
             else => |e| e,
         };
+        log.trace(
+            "reality tls={s} cipher={s} aes_hardware={} fingerprint={s} policy={s}\n",
+            .{
+                self.tls_client.protocolVersionName(),
+                self.tls_client.cipherSuiteName(),
+                std.crypto.core.aes.has_hardware_support,
+                parsed.fingerprint.name(),
+                @tagName(parsed.cipher_policy),
+            },
+        );
         self.stream_reader.deadline = null;
         self.stream_writer.deadline = null;
     }

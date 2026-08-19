@@ -63,6 +63,16 @@ python3 tests/field/fragmented-wss.py --target-host VPS_IP --server-name VPS_IP.
 The WSS server is `tests/field/wss-echo-server.py`. It is a temporary sidecar and does not require restarting or reconfiguring Xray. See `docs/performance.md` for benchmark results and a matched Go comparison.
 The delayed command deterministically exercises the empty initial Vision frame that previously deadlocked while waiting for the VLESS response. See `docs/vision-response-deadlock.md` for symptoms, root cause, and before/after evidence.
 
+For Cortex-A53 arm64 OpenWRT targets with the AES and PMULL CPU features, use
+the CPU-specific build so Zig selects its hardware AES-GCM implementation:
+
+```sh
+zig build -Dtarget=aarch64-linux-musl -Dcpu=cortex_a53 -Doptimize=ReleaseFast --prefix zig-out-arm64-release
+```
+
+See [`docs/arm64-aes-gcm.md`](docs/arm64-aes-gcm.md) for disassembly checks,
+router measurements, Firefox cipher ordering, and the Safexcel/AF_ALG result.
+
 ## Current Runtime Scope
 
 Supported:
@@ -72,7 +82,7 @@ Supported:
 - SOCKS inbound for tests and manual probes.
 - VLESS outbound over raw TCP with REALITY.
 - `xtls-rprx-vision` client flow for VLESS over REALITY.
-- Firefox-like TLS ClientHello generation with TLS 1.3 and TLS 1.2 enabled and no ECH/GREASE ECH extension.
+- Firefox 148-compatible TLS ClientHello generation with TLS 1.3 and TLS 1.2 enabled and no ECH/GREASE ECH extension.
 - Explicit REALITY cipher policy, including a ChaCha20-only mode for CPUs without fast AES.
 - REALITY certificate authentication using the derived auth key.
 - `freedom`, `blackhole`, and minimal TCP `dns` outbounds.
