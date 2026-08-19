@@ -226,6 +226,15 @@ fn printSummary(writer: *Io.Writer, cfg: *const xray.config.Config) !void {
         cfg.outbounds.len,
     });
     for (cfg.inbounds) |inbound| {
+        if (std.mem.eql(u8, inbound.protocol, "tun")) {
+            const settings = inbound.tun.?;
+            try writer.print("inbound {s}: tun device {s} mtu {d}\n", .{
+                inbound.tag orelse "-",
+                settings.name,
+                settings.mtu,
+            });
+            continue;
+        }
         try writer.print("inbound {s}: {s} on {s}:{d}\n", .{
             inbound.tag orelse "-",
             inbound.protocol,

@@ -15,6 +15,7 @@ const blackhole = @import("../proxy/blackhole/outbound.zig");
 const freedom = @import("../proxy/freedom/outbound.zig");
 const redirect = @import("../proxy/redirect/inbound.zig");
 const socks = @import("../proxy/socks/inbound.zig");
+const tun = @import("../proxy/tun/inbound.zig");
 const reality = @import("../transport/reality/client.zig");
 const vless = @import("../proxy/vless/outbound.zig");
 
@@ -65,6 +66,10 @@ pub const Runtime = struct {
             if (std.mem.eql(u8, inbound.protocol, "dns")) {
                 const dns_cfg = self.cfg.dns orelse return error.MissingDnsConfig;
                 try group.concurrent(io, runDnsInbound, .{ inbound, dns_cfg, if (fake_dns_store) |*store| store else null, dispatch_interface, io, log_writer, &log_mutex });
+                continue;
+            }
+            if (std.mem.eql(u8, inbound.protocol, "tun")) {
+                try group.concurrent(io, runTunInbound, .{ inbound, dispatch_interface, self.allocator, io, log_writer, &log_mutex });
                 continue;
             }
             return error.UnsupportedInboundProtocol;
@@ -139,6 +144,14 @@ fn runDnsInbound(inbound: config.Inbound, dns_cfg: config.DnsConfig, fake_dns: ?
     };
 }
 
+fn runTunInbound(inbound: config.Inbound, dispatcher: session.Dispatcher, allocator: std.mem.Allocator, io: Io, log_writer: *Io.Writer, log_mutex: *Io.Mutex) Io.Cancelable!void {
+    diagnostics.setThreadName("xz-tun-listen");
+    tun.run(inbound, dispatcher, allocator, io, log_writer, log_mutex) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return,
+    };
+}
+
 fn dispatchThunk(context: *anyopaque, client: net.Stream, sess: session.Session, preface: session.Preface, io: Io) anyerror!void {
     const runtime: *Runtime = @ptrCast(@alignCast(context));
     try runtime.dispatch(client, sess, preface, io);
@@ -156,6 +169,11 @@ pub fn validate(cfg: *const config.Config) !void {
         if (std.mem.eql(u8, inbound.protocol, "dns")) {
             const dns_cfg = cfg.dns orelse return error.MissingDnsConfig;
             if (dns_cfg.servers.len == 0) return error.MissingDnsServers;
+            continue;
+        }
+        if (std.mem.eql(u8, inbound.protocol, "tun")) {
+            if (builtin.os.tag != .linux) return error.TunRequiresLinux;
+            if (inbound.tun == null) return error.MissingTunSettings;
             continue;
         }
         return error.UnsupportedInboundProtocol;

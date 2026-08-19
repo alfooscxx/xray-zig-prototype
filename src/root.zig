@@ -21,6 +21,7 @@ pub const proxy = struct {
     pub const freedom = @import("proxy/freedom/outbound.zig");
     pub const redirect = @import("proxy/redirect/inbound.zig");
     pub const socks = @import("proxy/socks/inbound.zig");
+    pub const tun = @import("proxy/tun/inbound.zig");
     pub const vless = @import("proxy/vless/outbound.zig");
 };
 pub const routing = @import("routing/mod.zig");
@@ -47,6 +48,8 @@ test {
     _ = proxy.freedom;
     _ = proxy.redirect;
     _ = proxy.socks;
+    _ = proxy.tun;
+    _ = proxy.tun.packet;
     _ = proxy.vless;
     _ = routing;
     _ = transport.reality;

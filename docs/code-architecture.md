@@ -131,6 +131,10 @@ Each protocol owns its wire format:
 - `src/proxy/redirect/inbound.zig`: transparent TCP accept and original destination lookup.
 - `src/proxy/dns/inbound.zig`: DNS inbound request handling.
 - `src/proxy/socks/inbound.zig`: SOCKS5 test/manual inbound.
+- `src/proxy/tun/inbound.zig`: Linux TUN ownership, bounded TCP flow state,
+  and `AF_UNIX` stream adaptation for the dispatcher.
+- `src/proxy/tun/packet.zig`: IPv4/IPv6 TCP parsing, packet construction,
+  per-family MSS, and checksum handling.
 - `src/proxy/vless/outbound.zig`: VLESS request/response headers and REALITY connection setup.
 - `src/proxy/vless/vision.zig`: Vision padding, unpadding, TLS detection, and direct-copy state tracking.
 - `src/proxy/freedom/outbound.zig`: direct TCP outbound.

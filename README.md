@@ -78,6 +78,7 @@ router measurements, Firefox cipher ordering, and the Safexcel/AF_ALG result.
 Supported:
 
 - Transparent TCP `redirect` inbounds for IPv4 and IPv6.
+- Experimental real Linux TUN inbound with an IPv4/IPv6 TCP-only userspace endpoint.
 - Local `dns` inbound with IPv4 and IPv6 FakeDNS integration.
 - SOCKS inbound for tests and manual probes.
 - VLESS outbound over raw TCP with REALITY.
@@ -95,7 +96,7 @@ Out of scope for now:
 - UDP proxying and UDP Vision modes.
 - xHTTP, gRPC, WebSocket, and other Xray transports.
 - Full Xray JSON compatibility.
-- TUN/TProxy setup and live iptables/ip6tables integration.
+- Automatic TUN routes, TProxy setup, and live iptables/ip6tables integration.
 - Server mode.
 
 ## Native Config Notes
@@ -113,6 +114,9 @@ The config format is explicit and narrower than Xray JSON:
 - VLESS REALITY users may set `flow: "xtls-rprx-vision"`.
 - REALITY `cipherPolicy` defaults to `"firefox"`. Set it to `"chacha20-only"` on software-AES targets. This changes the advertised cipher-suite fingerprint and requires server-side ChaCha20 support, but still offers TLS 1.3 and TLS 1.2 and never offers ECH.
 - `redirect` is the supported transparent inbound protocol; `dokodemo-door` is not accepted.
+- `tun` uses `settings.name`, optional `mtu`, and optional
+  `maxConnections`; it never installs addresses, routes, firewall rules, or
+  boot hooks. See [`docs/tun-inbound.md`](docs/tun-inbound.md).
 
 `field-config-test.json` is a real-server client fixture for the current native API. `field-config-test-server.json` records the matching Xray server-side config used for interoperability testing.
 
