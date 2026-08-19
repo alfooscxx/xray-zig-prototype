@@ -64,17 +64,16 @@ policies automatically.
 ## Current TCP Scope
 
 The inbound supports IPv4 and IPv6 TCP handshakes, ordered payload delivery,
-window tracking, half-close/FIN, RST, TCP/IP checksums, per-family MSS, and TLS
-domain sniffing from the first payload. Each flow is bridged to the existing
-dispatcher with a local `AF_UNIX` socket pair.
+bounded downlink retransmission, cumulative and partial ACK processing, fast
+retransmit, basic congestion-window tracking, half-close/FIN, RST, TCP/IP
+checksums, per-family MSS, and TLS domain sniffing from the first payload. Each
+flow is bridged to the existing dispatcher with a local `AF_UNIX` socket pair.
 
 This is an experimental compact TCP endpoint, not a complete production
-netstack. It does not yet implement downlink retransmission, congestion
-control, PMTU discovery, TCP SACK/timestamps, IPv4 fragmentation, or IPv6
-extension headers. It is suitable for the local/router experiments documented
-below, where the TUN boundary itself is lossless. Loss after packets leave the
-router can still require downlink retransmission, so routed LAN deployment
-needs that work before being treated as production-ready.
+netstack. It does not yet implement out-of-order receive reassembly, SACK,
+window scaling, timestamps, an RTT-derived RTO, PMTU discovery, TCP persist,
+IPv4 fragmentation, or IPv6 extension headers. See `tun-tcp-design.md` for the
+state-engine details and remaining limitations.
 
 UDP is deliberately unsupported. UDP packets are recognized and dropped; no
 UDP session is opened and no UDP Vision mode is attempted.
@@ -98,3 +97,6 @@ ReleaseFast build. A temporary `xray0` handled:
 
 Both address families reached Vision raw handoff. Temporary host routes and
 interface addresses were removed with the test process.
+
+The retransmission-engine field run and its executor-capacity finding are
+recorded in `tun-tcp-field-test-2026-08-20.md`.
