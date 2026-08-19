@@ -153,6 +153,10 @@ xray-zig process and its IPv4/IPv6 transparent firewall rules. See
 [`docs/xray-zig-quick.md`](docs/xray-zig-quick.md) for the device profile and
 installation procedure.
 
+The active GL-MT6000 TUN deployment uses a `procd` service with live-only
+nftables and policy-routing state. See
+[`docs/openwrt-tun-service.md`](docs/openwrt-tun-service.md).
+
 The executable creates a bounded Zig `Io.Threaded` runtime rather than using
 the standard unlimited concurrent pool. Workers have 1 MiB stacks, are created
 lazily, and remain until process shutdown. The default 512 MiB process budget

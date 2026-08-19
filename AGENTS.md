@@ -31,6 +31,7 @@ Supported:
 - TLS 1.3 and TLS 1.2 with no ECH or GREASE ECH.
 - Optional `chacha20-only` REALITY policy for software-AES targets.
 - `freedom`, `blackhole`, and minimal TCP `dns` outbounds.
+- Experimental IPv4/IPv6 TCP-only `tun` inbound on Linux.
 
 The runtime uses lazily created 1 MiB-stack workers. Its default 512 MiB memory
 budget derives the worker and raw-reactor limits instead of imposing a fixed
@@ -46,7 +47,8 @@ Missing or intentionally out of scope:
 - UDP proxying and UDP Vision modes.
 - xHTTP, gRPC, WebSocket, and other Xray transports.
 - Full Xray JSON compatibility.
-- TUN/TProxy and iptables/ip6tables setup.
+- TProxy and general-purpose firewall setup. The active GL-MT6000 TUN service
+  owns one documented live-only nftables/policy-routing profile outside UCI.
 - Server mode.
 
 Redirect selects the original-destination socket option from the listener's
@@ -101,6 +103,11 @@ zig build -Dtarget=aarch64-linux-musl -Dcpu=cortex_a53 -Doptimize=ReleaseFast --
 Verify the artifact is an AArch64 statically linked ELF before publishing it.
 MIPS builds in older documents are historical benchmark instructions, not a
 deployment target.
+
+The active deployment runs `/etc/init.d/xray-zig` under `procd`, keeps both
+SOCKS and `xray0` TUN inbounds, and uses the live-only rules documented in
+`docs/openwrt-tun-service.md`. Do not write the TUN rules into `/etc/config`
+unless the user explicitly requests persistent UCI firewall configuration.
 
 ## Coding Style
 
