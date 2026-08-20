@@ -11,11 +11,13 @@ const estimated_raw_connection_kib = 112;
 const estimated_worker_kib = estimated_raw_connection_kib * raw_connections_per_worker;
 const max_memory_budget_mib = 4096;
 const max_requested_capacity = 1_000_000;
+const default_reality_handshake_limit = 32;
 
 const RuntimeCapacity = struct {
     memory_budget_mib: usize,
     worker_limit: usize,
     raw_connection_limit: usize,
+    reality_handshake_limit: usize,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -86,11 +88,12 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "run")) {
         try xray.core.validate(&cfg);
         try stdout.print(
-            "runtime capacity: memory_budget_mib={d} heavy_workers={d} io_uring_raw_connections={d}\n",
+            "runtime capacity: memory_budget_mib={d} heavy_workers={d} io_uring_raw_connections={d} reality_handshakes={d}\n",
             .{
                 capacity.memory_budget_mib,
                 capacity.worker_limit,
                 capacity.raw_connection_limit,
+                capacity.reality_handshake_limit,
             },
         );
         try stdout.flush();
@@ -100,6 +103,7 @@ pub fn main(init: std.process.Init) !void {
             .cfg = &cfg,
             .allocator = init.gpa,
             .raw_connection_limit = capacity.raw_connection_limit,
+            .reality_handshake_slots = .{ .permits = capacity.reality_handshake_limit },
             // Raw connections are page-sized, long-lived allocations. Freeing
             // them should unmap their storage instead of retaining it in the
             // ReleaseFast SMP allocator's caches.
@@ -131,9 +135,17 @@ fn runtimeCapacity(environ: *const std.process.Environ.Map) !RuntimeCapacity {
         "XRAY_ZIG_RAW_CONNECTION_LIMIT",
         max_requested_capacity,
     );
+    const reality_handshake_limit = try parseEnvironmentLimit(
+        environ,
+        "XRAY_ZIG_REALITY_HANDSHAKE_LIMIT",
+        default_reality_handshake_limit,
+        max_requested_capacity,
+    );
 
     if (requested_workers == null and requested_raw == null) {
-        return calculateAutomaticCapacity(memory_budget_mib);
+        var capacity = try calculateAutomaticCapacity(memory_budget_mib);
+        capacity.reality_handshake_limit = reality_handshake_limit;
+        return capacity;
     }
 
     if (requested_workers) |workers| {
@@ -142,7 +154,9 @@ fn runtimeCapacity(environ: *const std.process.Environ.Map) !RuntimeCapacity {
             workers,
             raw_connections_per_worker,
         ) catch return error.InvalidRuntimeCapacity;
-        return calculateCapacity(memory_budget_mib, workers, raw_connections);
+        var capacity = try calculateCapacity(memory_budget_mib, workers, raw_connections);
+        capacity.reality_handshake_limit = reality_handshake_limit;
+        return capacity;
     }
 
     const raw_connections = requested_raw.?;
@@ -154,7 +168,9 @@ fn runtimeCapacity(environ: *const std.process.Environ.Map) !RuntimeCapacity {
         @max(@as(usize, 1), (budget_kib - raw_kib) / estimated_worker_kib)
     else
         1;
-    return calculateCapacity(memory_budget_mib, requested_from_remainder, raw_connections);
+    var capacity = try calculateCapacity(memory_budget_mib, requested_from_remainder, raw_connections);
+    capacity.reality_handshake_limit = reality_handshake_limit;
+    return capacity;
 }
 
 fn parseEnvironmentLimit(
@@ -204,6 +220,7 @@ fn calculateAutomaticCapacity(memory_budget_mib: usize) !RuntimeCapacity {
         .memory_budget_mib = memory_budget_mib,
         .worker_limit = workers,
         .raw_connection_limit = raw_connections,
+        .reality_handshake_limit = default_reality_handshake_limit,
     };
 }
 
@@ -229,6 +246,7 @@ fn calculateCapacity(
         .memory_budget_mib = memory_budget_mib,
         .worker_limit = requested_workers,
         .raw_connection_limit = requested_raw,
+        .reality_handshake_limit = default_reality_handshake_limit,
     };
 
     var workers: usize = @intCast(
@@ -256,6 +274,7 @@ fn calculateCapacity(
         .memory_budget_mib = memory_budget_mib,
         .worker_limit = workers,
         .raw_connection_limit = raw_connections,
+        .reality_handshake_limit = default_reality_handshake_limit,
     };
 }
 
@@ -345,6 +364,24 @@ test "automatic 512 MiB capacity has no fixed worker ceiling" {
     try std.testing.expectEqual(@as(usize, 512), capacity.memory_budget_mib);
     try std.testing.expectEqual(@as(usize, 468), capacity.worker_limit);
     try std.testing.expectEqual(@as(usize, 2340), capacity.raw_connection_limit);
+    try std.testing.expectEqual(@as(usize, 32), capacity.reality_handshake_limit);
+}
+
+test "REALITY handshake capacity is configurable through the environment" {
+    var environ: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("XRAY_ZIG_REALITY_HANDSHAKE_LIMIT", "64");
+
+    const capacity = try runtimeCapacity(&environ);
+    try std.testing.expectEqual(@as(usize, 64), capacity.reality_handshake_limit);
+}
+
+test "REALITY handshake capacity rejects zero" {
+    var environ: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("XRAY_ZIG_REALITY_HANDSHAKE_LIMIT", "0");
+
+    try std.testing.expectError(error.InvalidRuntimeCapacity, runtimeCapacity(&environ));
 }
 
 test "explicit runtime requests are proportionally bounded by memory" {

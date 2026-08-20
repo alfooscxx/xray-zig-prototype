@@ -163,8 +163,9 @@ lazily, and remain until process shutdown. The default 512 MiB process budget
 derives the heavy-worker and io_uring raw-reactor capacities instead of applying a fixed
 worker ceiling; `XRAY_ZIG_MEMORY_BUDGET_MIB`, `XRAY_ZIG_WORKER_LIMIT`, and
 `XRAY_ZIG_RAW_CONNECTION_LIMIT` can override the sizing inputs. Full pools
-apply listener backpressure instead of resetting accepted clients, and at most
-32 VLESS/REALITY handshakes run at once. TUN uses temporary workers only for
+apply listener backpressure instead of resetting accepted clients. The
+`XRAY_ZIG_REALITY_HANDSHAKE_LIMIT` limit defaults to 32; the GL-MT6000 service
+profile raises it to 64. TUN uses temporary workers only for
 preface/routing and outbound handshake; established payload and its shared
 retransmission timer run on low-level io_uring reactors. The 1 MiB stack is
 retained because smaller stacks previously corrupted deep TLS workers; stack

@@ -34,7 +34,9 @@ the stack is not used as an RSS optimization.
 The heavy-worker and raw-reactor limits cover different connection states. Lowering
 the worker limit does not increase reactor capacity: it reduces the number of
 connections that can initialize or remain in a non-direct bridge. The
-32-permit REALITY semaphore already bounds the CPU-heavy handshake phase.
+runtime-owned REALITY semaphore bounds the CPU-heavy handshake phase. Its
+`XRAY_ZIG_REALITY_HANDSHAKE_LIMIT` setting defaults to 32 and can be raised
+independently of established-connection capacity.
 `XRAY_ZIG_MEMORY_BUDGET_MIB` defaults to 512 MiB. The runtime models an
 initialization worker as 560 KiB and a raw connection as 112 KiB, reflecting
 the measured approximately 5:1 resident-memory ratio. Without explicit caps it
@@ -49,7 +51,8 @@ times the worker request. Explicit requests that exceed the budget are reduced
 proportionally. One low-level io_uring shard is bounded to 4,095 raw bridges;
 larger explicit raw requests fail instead of silently changing admission. The
 selected counts are logged as `heavy_workers` and
-`io_uring_raw_connections`.
+`io_uring_raw_connections`; the selected handshake limit is logged as
+`reality_handshakes`.
 This model is an admission-sizing estimate, not an allocator-enforced RSS
 limit; the watchdog remains responsible for terminating a process that exceeds
 the same budget. The process raises its soft descriptor limit to the permitted

@@ -26,6 +26,7 @@ pub const Runtime = struct {
     allocator: std.mem.Allocator,
     reactor_allocator: std.mem.Allocator = std.heap.page_allocator,
     raw_connection_limit: usize = 256,
+    reality_handshake_slots: Io.Semaphore = .{ .permits = 32 },
     reactor: ?*raw_reactor.Reactor = null,
 
     pub fn run(self: *Runtime, io: Io, log_writer: *Io.Writer) !void {
@@ -147,7 +148,7 @@ pub const Runtime = struct {
             return;
         }
         if (std.mem.eql(u8, outbound.protocol, "vless")) {
-            try vless.handle(outbound, client, sess, preface, reactor, io);
+            try vless.handle(outbound, client, sess, preface, reactor, &self.reality_handshake_slots, io);
             return;
         }
         return error.UnsupportedOutboundProtocol;
