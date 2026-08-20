@@ -9,6 +9,7 @@ pub const dns = struct {
     pub const upstream = @import("dns/upstream.zig");
 };
 pub const net = struct {
+    pub const reactor = @import("net/reactor.zig");
     pub const session = @import("net/session.zig");
     pub const sniff = @import("net/sniff.zig");
 };
@@ -45,6 +46,7 @@ test {
     _ = dns.protocol;
     _ = dns.upstream;
     _ = net.session;
+    _ = net.reactor;
     _ = net.sniff;
     _ = proxy.blackhole;
     _ = proxy.dns.inbound;

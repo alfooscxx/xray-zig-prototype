@@ -1,7 +1,8 @@
 # TUN TCP State Engine
 
 The TCP side of the TUN inbound is split into two layers. `inbound.zig` owns the
-single TUN reader, flow map, dispatcher bridge, and asynchronous timers.
+single TUN reader, flow map, dispatcher bridge, and one protocol-owned
+`io_uring` data-plane reactor.
 `tcp.zig` is a deterministic state engine. It has no allocator, socket, or
 clock dependency; callers supply monotonic milliseconds and turn returned
 segments into TUN writes. This keeps a future UDP demultiplexer from needing a
@@ -20,12 +21,21 @@ retransmit. Timeout and fast retransmit reduce the congestion window. Half-open
 flows expire after 20 seconds and otherwise-idle flows after five minutes, so
 neither state nor dispatcher work can remain live forever without traffic.
 
-One manager-wide 50 ms timer snapshots live flows under the flow-map lock,
-retains them while polling, and releases them afterwards. Retransmission is not
-a per-flow worker. The flow owner performs the TUN-to-dispatcher pump directly;
-only the dispatcher and reverse pump are separate tasks. This keeps the active
-cost at three executor tasks per proxied flow plus one timer for the entire TUN
-inbound.
+The flow owner waits for enough client payload to sniff and route, creates an
+`AF_UNIX` bridge, starts one temporary dispatcher task, and hands the other end
+to the reactor. The owner then exits. The reactor submits at most one receive
+and one send operation per bridge and uses an `eventfd` for TUN-reader handoff.
+Its one 50 ms monotonic `io_uring` timeout drives every flow's retransmission
+and idle expiry. After the outbound reaches Vision raw handoff, both sides of
+the userspace bridge are reactor-owned and the established TUN flow holds no
+per-flow executor worker.
+
+The uplink queue and reactor buffer are bounded. A full bridge buffer stops the
+reactor from consuming TUN segments, so their payload is not acknowledged and
+normal TCP retransmission supplies backpressure. Downlink reads stop while
+buffered bytes are waiting for the peer window or congestion window. CQEs are
+canceled and the ring is closed before flow storage is released; kernel I/O
+never retains a pointer into a destroyed flow.
 
 Sequence comparisons use wrapping 32-bit arithmetic. Ordered uplink payload is
 accepted immediately. A retransmit overlapping the current receive sequence is

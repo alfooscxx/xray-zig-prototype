@@ -86,7 +86,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "run")) {
         try xray.core.validate(&cfg);
         try stdout.print(
-            "runtime capacity: memory_budget_mib={d} workers={d} raw_connections={d}\n",
+            "runtime capacity: memory_budget_mib={d} heavy_workers={d} io_uring_raw_connections={d}\n",
             .{
                 capacity.memory_budget_mib,
                 capacity.worker_limit,
@@ -195,8 +195,11 @@ fn calculateAutomaticCapacity(memory_budget_mib: usize) !RuntimeCapacity {
         return error.InvalidRuntimeCapacity;
     const workers = budget_kib / bundle_kib;
     if (workers == 0) return error.MemoryBudgetTooSmall;
-    const raw_connections = std.math.mul(usize, workers, raw_connections_per_worker) catch
-        return error.InvalidRuntimeCapacity;
+    const raw_connections = @min(
+        std.math.mul(usize, workers, raw_connections_per_worker) catch
+            return error.InvalidRuntimeCapacity,
+        xray.net.reactor.max_connections_per_ring,
+    );
     return .{
         .memory_budget_mib = memory_budget_mib,
         .worker_limit = workers,
@@ -211,6 +214,8 @@ fn calculateCapacity(
 ) !RuntimeCapacity {
     if (memory_budget_mib == 0 or requested_workers == 0 or requested_raw == 0)
         return error.InvalidRuntimeCapacity;
+    if (requested_raw > xray.net.reactor.max_connections_per_ring)
+        return error.RawReactorCapacityTooLarge;
 
     const budget_kib = std.math.mul(usize, memory_budget_mib, 1024) catch
         return error.InvalidRuntimeCapacity;
@@ -360,4 +365,13 @@ test "runtime capacity rejects a zero memory budget" {
         error.InvalidRuntimeCapacity,
         calculateCapacity(0, 1, 1),
     );
+}
+
+test "runtime capacity bounds one io_uring shard" {
+    try std.testing.expectError(
+        error.RawReactorCapacityTooLarge,
+        calculateCapacity(4096, 128, xray.net.reactor.max_connections_per_ring + 1),
+    );
+    const automatic = try calculateAutomaticCapacity(4096);
+    try std.testing.expectEqual(xray.net.reactor.max_connections_per_ring, automatic.raw_connection_limit);
 }

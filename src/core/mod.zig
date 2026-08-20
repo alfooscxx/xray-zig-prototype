@@ -5,6 +5,7 @@ const net = Io.net;
 
 const config = @import("../config/mod.zig");
 const diagnostics = @import("../diagnostics.zig");
+const log = @import("../log.zig");
 const fakedns = @import("../dns/fakedns.zig");
 const routing = @import("../routing/mod.zig");
 const raw_reactor = @import("../net/reactor.zig");
@@ -148,7 +149,10 @@ pub const Runtime = struct {
 
 fn runRawReactor(reactor: *raw_reactor.Reactor) Io.Cancelable!void {
     diagnostics.setRawReactorCount(0);
-    try reactor.run();
+    reactor.run() catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => log.err("raw io_uring reactor stopped: {s}\n", .{@errorName(err)}),
+    };
 }
 
 fn runSocksInbound(inbound: config.Inbound, dispatcher: session.Dispatcher, io: Io, log_writer: *Io.Writer, log_mutex: *Io.Mutex) Io.Cancelable!void {
@@ -179,7 +183,7 @@ fn runTunInbound(inbound: config.Inbound, dispatcher: session.Dispatcher, alloca
     diagnostics.setThreadName("xz-tun-listen");
     tun.run(inbound, dispatcher, allocator, io, log_writer, log_mutex) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
-        else => return,
+        else => log.err("tun inbound stopped: {s}\n", .{@errorName(err)}),
     };
 }
 
