@@ -12,6 +12,47 @@ route_mark=0x7872
 route_mark_mask=0xffff
 nft_table=xray_zig_tun
 nft_comment=xray-zig-tun
+fake4_prefix=198.18.0.0/15
+fake6_prefix=fc00::/18
+dns_server='/#/127.0.0.1#1053'
+
+fake_dns_enabled() {
+    jsonfilter -q -i "$config" -e '@.dns.fakeDns' >/dev/null 2>&1
+}
+
+wait_dnsmasq() {
+    dns_attempt=0
+    while ! pidof dnsmasq >/dev/null 2>&1; do
+        dns_attempt=$((dns_attempt + 1))
+        [ "$dns_attempt" -lt 15 ] || return 1
+        sleep 1
+    done
+}
+
+cleanup_dns() {
+    dns_changed=no
+    if uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | grep -Fqx "$dns_server"; then
+        uci -q del_list dhcp.@dnsmasq[0].server="$dns_server" || true
+        dns_changed=yes
+    fi
+    if [ "$(uci -q get dhcp.@dnsmasq[0].rebind_protection 2>/dev/null || echo 1)" != 1 ]; then
+        uci set dhcp.@dnsmasq[0].rebind_protection=1
+        dns_changed=yes
+    fi
+    [ "$dns_changed" = yes ] || return 0
+    uci commit dhcp
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    wait_dnsmasq || true
+}
+
+setup_dns() {
+    uci -q del_list dhcp.@dnsmasq[0].server="$dns_server" 2>/dev/null || true
+    uci add_list dhcp.@dnsmasq[0].server="$dns_server"
+    uci set dhcp.@dnsmasq[0].rebind_protection=0
+    uci commit dhcp
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    wait_dnsmasq
+}
 
 remove_fw4_rules() {
     handles=$(nft -a list chain inet fw4 forward 2>/dev/null |
@@ -22,12 +63,19 @@ remove_fw4_rules() {
 }
 
 cleanup_network() {
+    ip route del local "$fake4_prefix" dev lo table local 2>/dev/null || true
+    ip -6 route del local "$fake6_prefix" dev lo table local 2>/dev/null || true
     nft delete table inet "$nft_table" 2>/dev/null || true
     remove_fw4_rules
     while ip rule del priority "$rule_priority" fwmark "$route_mark/$route_mark_mask" lookup "$route_table" 2>/dev/null; do :; done
     while ip -6 rule del priority "$rule_priority" fwmark "$route_mark/$route_mark_mask" lookup "$route_table" 2>/dev/null; do :; done
     ip route del default dev "$tun_name" table "$route_table" 2>/dev/null || true
     ip -6 route del default dev "$tun_name" table "$route_table" 2>/dev/null || true
+}
+
+setup_fakedns_network() {
+    ip route replace local "$fake4_prefix" dev lo table local
+    ip -6 route replace local "$fake6_prefix" dev lo table local
 }
 
 setup_network() {
@@ -49,6 +97,7 @@ setup_network() {
 }
 
 if [ "${1:-}" = cleanup ]; then
+    cleanup_dns
     cleanup_network
     exit 0
 fi
@@ -66,6 +115,7 @@ stop_child() {
 on_exit() {
     status=$?
     trap - EXIT INT TERM
+    cleanup_dns
     cleanup_network
     if [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then
         kill -TERM "$child" 2>/dev/null || true
@@ -77,7 +127,13 @@ on_exit() {
 trap stop_child INT TERM
 trap on_exit EXIT
 
+cleanup_dns
 cleanup_network
+if fake_dns_enabled; then
+    use_fake_dns=yes
+else
+    use_fake_dns=no
+fi
 "$binary" run -config "$config" &
 child=$!
 
@@ -96,7 +152,13 @@ while [ ! -e "/sys/class/net/$tun_name" ]; do
 done
 
 setup_network
-echo "xray-zig: temporary TUN routing active on $tun_name for TCP from $lan_name"
+if [ "$use_fake_dns" = yes ]; then
+    setup_fakedns_network
+    setup_dns
+    echo "xray-zig: FakeDNS SK_LOOKUP routes and lifecycle-managed dnsmasq upstream active; TUN cache-drain fallback active on $tun_name for TCP from $lan_name"
+else
+    echo "xray-zig: TUN routing active on $tun_name for TCP from $lan_name; FakeDNS integration disabled"
+fi
 
 set +e
 wait "$child"

@@ -80,8 +80,9 @@ address and port. A refcounted lease keeps its stable domain record alive for
 the complete synchronous Dispatcher call. The userspace `Session` remains the
 frozen routing authority.
 
-xray-zig does not install routes. The operator must add only the intended
-FakeDNS prefix or exact test addresses as local routes in the same namespace.
+xray-zig itself does not install routes. Test harnesses add exact addresses;
+the GL-MT6000 service wrapper owns the production FakeDNS prefix routes and
+the matching dnsmasq lifecycle described in `openwrt-tun-service.md`.
 
 ## Isolated Router Tests
 
@@ -155,10 +156,20 @@ the valid userspace Vision path because the remote peer did not set
 and 139 process CPU ticks. These Internet/CDN figures are diagnostic rather
 than a reproducible performance benchmark.
 
+The production cutover then installed the same SK_LOOKUP artifact alongside
+the existing TUN cache-drain fallback. A temporary LAN network namespace
+resolved both A and AAAA through the router and completed a verified 1 MiB
+HTTPS download through VLESS/REALITY/Vision. The service was stopped before
+commit: the test required removal of the BPF program, FakeDNS routes and DNS
+upstream plus restoration of dnsmasq rebind protection. After a service start,
+the complete dataplane and a second verified LAN HTTPS download had to pass.
+A third post-commit flow logged the domain target and Vision raw handoff.
+
 ## Current Limits
 
 - TCP only; UDP requires a separate capability and original-destination test.
-- Local FakeDNS routes remain an operator responsibility.
+- Local FakeDNS routes remain an operator responsibility outside the documented
+  GL-MT6000 service wrapper.
 - Established payload remains in userspace after SK_LOOKUP.
 - Flow metadata maps, TC observability, and kernel socket-to-socket payload
   redirection are separate future work.
