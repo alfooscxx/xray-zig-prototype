@@ -72,4 +72,17 @@ pub fn build(b: *std.Build) void {
 
     const e2e_fakedns_freedom_step = b.step("e2e-fakedns-freedom", "Run FakeDNS freedom resolution regression");
     e2e_fakedns_freedom_step.dependOn(&e2e_fakedns_freedom_cmd.step);
+
+    const ebpf_lab_peer = b.addExecutable(.{
+        .name = "ebpf-lab-peer",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/field/ebpf-lab-peer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "xray_zig", .module = mod }},
+        }),
+    });
+    const install_ebpf_lab_peer = b.addInstallArtifact(ebpf_lab_peer, .{});
+    const ebpf_lab_peer_step = b.step("ebpf-lab-peer", "Build the isolated SK_LOOKUP lab peer");
+    ebpf_lab_peer_step.dependOn(&install_ebpf_lab_peer.step);
 }

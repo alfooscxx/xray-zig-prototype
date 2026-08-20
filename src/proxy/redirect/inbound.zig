@@ -76,7 +76,10 @@ fn handleConnection(stream: net.Stream, dispatcher: session.Dispatcher, inbound_
     };
 
     if (fake_dns) |store| {
-        if (store.lookup(target, io)) |domain| {
+        if (store.lookup(target, io)) |found| {
+            var lease = found;
+            defer lease.release(io);
+            const domain = lease.domain();
             const host = net.HostName.init(domain) catch return;
             dispatcher.dispatch(stream, .{
                 .target = .{ .host = .{

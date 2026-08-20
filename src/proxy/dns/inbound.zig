@@ -118,14 +118,24 @@ fn handleMessage(
     if (fake_dns) |store| {
         const fake_dns_config = dns_config.fake_dns.?;
         if (question.qclass == dns_protocol.qclass_in and question.qtype == dns_protocol.qtype_a) {
-            const fake_ip = try store.resolveA(question.name, io);
+            const fake_ip = store.resolveA(question.name, io) catch |err| {
+                log.warn("FakeDNS A allocation for {s} failed: {s}\n", .{ question.name, @errorName(err) });
+                const response = try dns_protocol.buildErrorResponse(&response_buffer, packet, .server_failure);
+                try socket.send(io, &client_address, response);
+                return;
+            };
             const response = try dns_protocol.buildAResponse(&response_buffer, question, fake_ip, fake_dns_config.ttl);
             try socket.send(io, &client_address, response);
             return;
         }
 
         if (question.qclass == dns_protocol.qclass_in and question.qtype == dns_protocol.qtype_aaaa) {
-            const fake_ip = try store.resolveAAAA(question.name, io);
+            const fake_ip = store.resolveAAAA(question.name, io) catch |err| {
+                log.warn("FakeDNS AAAA allocation for {s} failed: {s}\n", .{ question.name, @errorName(err) });
+                const response = try dns_protocol.buildErrorResponse(&response_buffer, packet, .server_failure);
+                try socket.send(io, &client_address, response);
+                return;
+            };
             const response = try dns_protocol.buildAAAAResponse(&response_buffer, question, fake_ip, fake_dns_config.ttl);
             try socket.send(io, &client_address, response);
             return;

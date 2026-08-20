@@ -283,6 +283,18 @@ fn printSummary(writer: *Io.Writer, cfg: *const xray.config.Config) !void {
             });
             continue;
         }
+        if (std.mem.eql(u8, inbound.protocol, "sk_lookup")) {
+            const settings = inbound.sk_lookup.?;
+            try writer.print("inbound {s}: sk_lookup TCP on {s}:{d} and [{s}]:{d}, map entries {d}\n", .{
+                inbound.tag orelse "-",
+                settings.listen4,
+                settings.port4,
+                settings.listen6,
+                settings.port6,
+                settings.max_map_entries,
+            });
+            continue;
+        }
         try writer.print("inbound {s}: {s} on {s}:{d}\n", .{
             inbound.tag orelse "-",
             inbound.protocol,

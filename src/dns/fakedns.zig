@@ -4,14 +4,96 @@ const net = Io.net;
 
 const config = @import("../config/mod.zig");
 
-pub const Error = error{
-    InvalidFakeDnsPool,
-    FakeDnsPoolExhausted,
-    DomainTooLong,
+pub const Error = error{ InvalidFakeDnsPool, FakeDnsPoolExhausted, DomainTooLong };
+
+pub const Publication = extern struct {
+    domain_id: u64,
+    generation: u64,
+    route_valid_until_ns: u64,
+};
+
+/// Called under the Store mutex. Implementations must not call back into Store.
+/// Publication completes before the synthetic address is returned to DNS.
+pub const Publisher = struct {
+    context: ?*anyopaque = null,
+    publish4_fn: ?*const fn (?*anyopaque, [4]u8, Publication) anyerror!void = null,
+    publish6_fn: ?*const fn (?*anyopaque, [16]u8, Publication) anyerror!void = null,
+    remove4_fn: ?*const fn (?*anyopaque, [4]u8) void = null,
+    remove6_fn: ?*const fn (?*anyopaque, [16]u8) void = null,
+
+    pub fn publish4(self: Publisher, address: [4]u8, value: Publication) !void {
+        if (self.publish4_fn) |publish| try publish(self.context, address, value);
+    }
+    pub fn publish6(self: Publisher, address: [16]u8, value: Publication) !void {
+        if (self.publish6_fn) |publish| try publish(self.context, address, value);
+    }
+    fn remove4(self: Publisher, address: [4]u8) void {
+        if (self.remove4_fn) |remove| remove(self.context, address);
+    }
+    fn remove6(self: Publisher, address: [16]u8) void {
+        if (self.remove6_fn) |remove| remove(self.context, address);
+    }
+};
+
+pub const DomainRecord = struct {
+    id: u64,
+    name: []const u8,
+    lease4: ?*Lease4 = null,
+    lease6: ?*Lease6 = null,
+    active_refs: u32 = 0,
+};
+
+pub const Lease4 = struct {
+    record: *DomainRecord,
+    address: [4]u8,
+    generation: u64,
+    dns_expires_ns: u64,
+    reuse_after_ns: u64,
+    active_refs: u32 = 0,
+};
+
+pub const Lease6 = struct {
+    record: *DomainRecord,
+    address: [16]u8,
+    generation: u64,
+    dns_expires_ns: u64,
+    reuse_after_ns: u64,
+    active_refs: u32 = 0,
+};
+
+pub const LeaseHandle = struct {
+    store: *Store,
+    record: *DomainRecord,
+    family: net.IpAddress.Family,
+    generation: u64,
+    released: bool = false,
+
+    pub fn domain(self: *const LeaseHandle) []const u8 {
+        return self.record.name;
+    }
+    pub fn domainId(self: *const LeaseHandle) u64 {
+        return self.record.id;
+    }
+    pub fn release(self: *LeaseHandle, io: Io) void {
+        if (self.released) return;
+        self.store.mutex.lockUncancelable(io);
+        defer self.store.mutex.unlock(io);
+        const refs = switch (self.family) {
+            .ip4 => &self.record.lease4.?.active_refs,
+            .ip6 => &self.record.lease6.?.active_refs,
+        };
+        std.debug.assert(refs.* > 0 and self.record.active_refs > 0);
+        refs.* -= 1;
+        self.record.active_refs -= 1;
+        self.released = true;
+    }
 };
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
+    publisher: Publisher,
+    ttl_ns: u64,
+    reuse_grace_ns: u64,
     pool_base: u32,
     prefix_len: u8,
     usable_count: u32,
@@ -20,17 +102,26 @@ pub const Store = struct {
     pool6_prefix_len: u8,
     pool6_usable_count: u64,
     pool6_next_offset: u64,
+    next_domain_id: u64 = 1,
     mutex: Io.Mutex = .init,
-    domain_to_ip: std.StringHashMap(u32),
-    ip_to_domain: std.AutoHashMap(u32, []const u8),
-    domain_to_ip6: std.StringHashMap([16]u8),
-    ip6_to_domain: std.AutoHashMap([16]u8, []const u8),
+    domains: std.StringHashMap(*DomainRecord),
+    leases4: std.AutoHashMap(u32, *Lease4),
+    leases6: std.AutoHashMap([16]u8, *Lease6),
+    generations4: std.AutoHashMap(u32, u64),
+    generations6: std.AutoHashMap([16]u8, u64),
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.FakeDnsConfig) !Store {
+        return initWithPublisher(allocator, cfg, .{});
+    }
+
+    pub fn initWithPublisher(allocator: std.mem.Allocator, cfg: config.FakeDnsConfig, publisher: Publisher) !Store {
         const pool = try parsePool(cfg.ip_pool);
         const pool6 = try parsePool6(cfg.ip_pool6);
         return .{
             .allocator = allocator,
+            .publisher = publisher,
+            .ttl_ns = secondsToNs(cfg.ttl),
+            .reuse_grace_ns = secondsToNs(cfg.reuse_grace_seconds),
             .pool_base = pool.base,
             .prefix_len = pool.prefix_len,
             .usable_count = pool.usable_count,
@@ -39,181 +130,323 @@ pub const Store = struct {
             .pool6_prefix_len = pool6.prefix_len,
             .pool6_usable_count = pool6.usable_count,
             .pool6_next_offset = 0,
-            .domain_to_ip = std.StringHashMap(u32).init(allocator),
-            .ip_to_domain = std.AutoHashMap(u32, []const u8).init(allocator),
-            .domain_to_ip6 = std.StringHashMap([16]u8).init(allocator),
-            .ip6_to_domain = std.AutoHashMap([16]u8, []const u8).init(allocator),
+            .domains = std.StringHashMap(*DomainRecord).init(allocator),
+            .leases4 = std.AutoHashMap(u32, *Lease4).init(allocator),
+            .leases6 = std.AutoHashMap([16]u8, *Lease6).init(allocator),
+            .generations4 = std.AutoHashMap(u32, u64).init(allocator),
+            .generations6 = std.AutoHashMap([16]u8, u64).init(allocator),
         };
     }
 
     pub fn deinit(self: *Store) void {
-        var it = self.domain_to_ip.iterator();
-        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
-        self.domain_to_ip.deinit();
-        self.ip_to_domain.deinit();
-        var ip6_it = self.domain_to_ip6.iterator();
-        while (ip6_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
-        self.domain_to_ip6.deinit();
-        self.ip6_to_domain.deinit();
+        var it4 = self.leases4.valueIterator();
+        while (it4.next()) |ptr| {
+            std.debug.assert(ptr.*.active_refs == 0);
+            self.publisher.remove4(ptr.*.address);
+            self.allocator.destroy(ptr.*);
+        }
+        var it6 = self.leases6.valueIterator();
+        while (it6.next()) |ptr| {
+            std.debug.assert(ptr.*.active_refs == 0);
+            self.publisher.remove6(ptr.*.address);
+            self.allocator.destroy(ptr.*);
+        }
+        var domains = self.domains.valueIterator();
+        while (domains.next()) |ptr| {
+            std.debug.assert(ptr.*.active_refs == 0);
+            self.allocator.free(ptr.*.name);
+            self.allocator.destroy(ptr.*);
+        }
+        self.domains.deinit();
+        self.leases4.deinit();
+        self.leases6.deinit();
+        self.generations4.deinit();
+        self.generations6.deinit();
         self.* = undefined;
     }
 
     pub fn resolveA(self: *Store, domain: []const u8, io: Io) ![4]u8 {
-        var normalized_buffer: [net.HostName.max_len]u8 = undefined;
-        const normalized = try normalizeDomain(&normalized_buffer, domain);
-
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
-
-        if (self.domain_to_ip.get(normalized)) |ip| {
-            return ipToBytes(ip);
-        }
-
-        const owned = try self.allocator.dupe(u8, normalized);
-        errdefer self.allocator.free(owned);
-        const ip = try self.nextIp();
-        if (self.ip_to_domain.fetchRemove(ip)) |old| {
-            _ = self.domain_to_ip.remove(old.value);
-            self.allocator.free(old.value);
-        }
-
-        try self.domain_to_ip.put(owned, ip);
-        errdefer _ = self.domain_to_ip.remove(owned);
-        try self.ip_to_domain.put(ip, owned);
-        return ipToBytes(ip);
+        return self.resolveAAt(domain, monotonicNowNs(io), io);
     }
-
     pub fn resolveAAAA(self: *Store, domain: []const u8, io: Io) ![16]u8 {
-        var normalized_buffer: [net.HostName.max_len]u8 = undefined;
-        const normalized = try normalizeDomain(&normalized_buffer, domain);
-
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
-
-        if (self.domain_to_ip6.get(normalized)) |ip| {
-            return ip;
-        }
-
-        const owned = try self.allocator.dupe(u8, normalized);
-        errdefer self.allocator.free(owned);
-        const ip = try self.nextIp6();
-        if (self.ip6_to_domain.fetchRemove(ip)) |old| {
-            _ = self.domain_to_ip6.remove(old.value);
-            self.allocator.free(old.value);
-        }
-
-        try self.domain_to_ip6.put(owned, ip);
-        errdefer _ = self.domain_to_ip6.remove(owned);
-        try self.ip6_to_domain.put(ip, owned);
-        return ip;
+        return self.resolveAAAAAt(domain, monotonicNowNs(io), io);
     }
 
-    pub fn lookup(self: *Store, address: net.IpAddress, io: Io) ?[]const u8 {
+    pub fn resolveAAt(self: *Store, domain: []const u8, now_ns: u64, io: Io) ![4]u8 {
+        var buffer: [net.HostName.max_len]u8 = undefined;
+        const normalized = try normalizeDomain(&buffer, domain);
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        if (self.domains.get(normalized)) |record| if (record.lease4) |lease| {
+            const deadlines = self.expiration(now_ns);
+            try self.publisher.publish4(lease.address, publication(record, lease.generation, deadlines.reuse_after));
+            lease.dns_expires_ns = deadlines.dns;
+            lease.reuse_after_ns = deadlines.reuse_after;
+            return lease.address;
+        };
+        return self.allocate4(normalized, now_ns);
+    }
+
+    pub fn resolveAAAAAt(self: *Store, domain: []const u8, now_ns: u64, io: Io) ![16]u8 {
+        var buffer: [net.HostName.max_len]u8 = undefined;
+        const normalized = try normalizeDomain(&buffer, domain);
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        if (self.domains.get(normalized)) |record| if (record.lease6) |lease| {
+            const deadlines = self.expiration(now_ns);
+            try self.publisher.publish6(lease.address, publication(record, lease.generation, deadlines.reuse_after));
+            lease.dns_expires_ns = deadlines.dns;
+            lease.reuse_after_ns = deadlines.reuse_after;
+            return lease.address;
+        };
+        return self.allocate6(normalized, now_ns);
+    }
+
+    pub fn lookup(self: *Store, address: net.IpAddress, io: Io) ?LeaseHandle {
+        return self.lookupAt(address, monotonicNowNs(io), io);
+    }
+
+    pub fn lookupAt(self: *Store, address: net.IpAddress, now_ns: u64, io: Io) ?LeaseHandle {
         self.mutex.lock(io) catch return null;
         defer self.mutex.unlock(io);
         return switch (address) {
-            .ip4 => |ip4| self.ip_to_domain.get(bytesToIp(ip4.bytes)),
-            .ip6 => |ip6| self.ip6_to_domain.get(ip6.bytes),
+            .ip4 => |ip| if (self.leases4.get(bytesToIp(ip.bytes))) |lease| self.acquire4(lease, now_ns) else null,
+            .ip6 => |ip| if (self.leases6.get(ip.bytes)) |lease| self.acquire6(lease, now_ns) else null,
         };
     }
 
     pub fn contains(self: *const Store, address: net.IpAddress) bool {
         return switch (address) {
-            .ip4 => |ip4| blk: {
-                const ip = bytesToIp(ip4.bytes);
-                const mask = prefixMask(self.prefix_len);
-                break :blk (ip & mask) == self.pool_base;
-            },
-            .ip6 => |ip6| prefixMatches6(ip6.bytes, self.pool6_base, self.pool6_prefix_len),
+            .ip4 => |ip| (bytesToIp(ip.bytes) & prefixMask(self.prefix_len)) == self.pool_base,
+            .ip6 => |ip| prefixMatches6(ip.bytes, self.pool6_base, self.pool6_prefix_len),
         };
     }
 
-    fn nextIp(self: *Store) !u32 {
-        if (self.usable_count == 0) return error.FakeDnsPoolExhausted;
-        const ip = self.pool_base + self.next_offset;
-        self.next_offset += 1;
-        if (self.next_offset > self.usable_count) self.next_offset = 1;
-        return ip;
+    fn allocate4(self: *Store, normalized: []const u8, now_ns: u64) ![4]u8 {
+        const candidate = self.findCandidate4(now_ns) orelse return error.FakeDnsPoolExhausted;
+        const generation = incrementGeneration(self.generations4.get(candidate.ip) orelse 0);
+        const deadlines = self.expiration(now_ns);
+        var pending = try self.getOrCreateRecord(normalized);
+        defer pending.rollback(self);
+        if (candidate.lease == null) try self.leases4.ensureUnusedCapacity(1);
+        if (!self.generations4.contains(candidate.ip)) try self.generations4.ensureUnusedCapacity(1);
+        const created_lease = if (candidate.lease == null) try self.allocator.create(Lease4) else null;
+        errdefer if (created_lease) |lease| self.allocator.destroy(lease);
+        const address = ipToBytes(candidate.ip);
+        try self.publisher.publish4(address, publication(pending.record, generation, deadlines.reuse_after));
+
+        const old_record = if (candidate.lease) |old| old.record else null;
+        const lease = candidate.lease orelse created_lease.?;
+        if (old_record) |record| record.lease4 = null;
+        lease.* = .{
+            .record = pending.record,
+            .address = address,
+            .generation = generation,
+            .dns_expires_ns = deadlines.dns,
+            .reuse_after_ns = deadlines.reuse_after,
+        };
+        if (candidate.lease == null) self.leases4.putAssumeCapacity(candidate.ip, lease);
+        self.generations4.putAssumeCapacity(candidate.ip, generation);
+        pending.record.lease4 = lease;
+        pending.commit(self);
+        if (old_record) |record| self.destroyUnusedRecord(record);
+        self.advance4();
+        return address;
     }
 
-    fn nextIp6(self: *Store) ![16]u8 {
-        if (self.pool6_usable_count == 0) return error.FakeDnsPoolExhausted;
-        const ip = addOffset6(self.pool6_base, self.pool6_next_offset);
+    fn allocate6(self: *Store, normalized: []const u8, now_ns: u64) ![16]u8 {
+        const candidate = self.findCandidate6(now_ns) orelse return error.FakeDnsPoolExhausted;
+        const generation = incrementGeneration(self.generations6.get(candidate.ip) orelse 0);
+        const deadlines = self.expiration(now_ns);
+        var pending = try self.getOrCreateRecord(normalized);
+        defer pending.rollback(self);
+        if (candidate.lease == null) try self.leases6.ensureUnusedCapacity(1);
+        if (!self.generations6.contains(candidate.ip)) try self.generations6.ensureUnusedCapacity(1);
+        const created_lease = if (candidate.lease == null) try self.allocator.create(Lease6) else null;
+        errdefer if (created_lease) |lease| self.allocator.destroy(lease);
+        try self.publisher.publish6(candidate.ip, publication(pending.record, generation, deadlines.reuse_after));
+
+        const old_record = if (candidate.lease) |old| old.record else null;
+        const lease = candidate.lease orelse created_lease.?;
+        if (old_record) |record| record.lease6 = null;
+        lease.* = .{
+            .record = pending.record,
+            .address = candidate.ip,
+            .generation = generation,
+            .dns_expires_ns = deadlines.dns,
+            .reuse_after_ns = deadlines.reuse_after,
+        };
+        if (candidate.lease == null) self.leases6.putAssumeCapacity(candidate.ip, lease);
+        self.generations6.putAssumeCapacity(candidate.ip, generation);
+        pending.record.lease6 = lease;
+        pending.commit(self);
+        if (old_record) |record| self.destroyUnusedRecord(record);
+        self.advance6();
+        return candidate.ip;
+    }
+
+    const PendingRecord = struct {
+        record: *DomainRecord,
+        created: bool,
+        committed: bool = false,
+        fn commit(self: *PendingRecord, store: *Store) void {
+            if (self.created) store.domains.putAssumeCapacity(self.record.name, self.record);
+            self.committed = true;
+        }
+        fn rollback(self: *PendingRecord, store: *Store) void {
+            if (!self.created or self.committed) return;
+            store.allocator.free(self.record.name);
+            store.allocator.destroy(self.record);
+        }
+    };
+
+    fn getOrCreateRecord(self: *Store, normalized: []const u8) !PendingRecord {
+        if (self.domains.get(normalized)) |record| return .{ .record = record, .created = false };
+        try self.domains.ensureUnusedCapacity(1);
+        const owned = try self.allocator.dupe(u8, normalized);
+        errdefer self.allocator.free(owned);
+        const record = try self.allocator.create(DomainRecord);
+        record.* = .{ .id = self.next_domain_id, .name = owned };
+        self.next_domain_id = incrementGeneration(self.next_domain_id);
+        return .{ .record = record, .created = true };
+    }
+
+    fn destroyUnusedRecord(self: *Store, record: *DomainRecord) void {
+        if (record.lease4 != null or record.lease6 != null or record.active_refs != 0) return;
+        std.debug.assert(self.domains.remove(record.name));
+        self.allocator.free(record.name);
+        self.allocator.destroy(record);
+    }
+
+    fn acquire4(self: *Store, lease: *Lease4, now_ns: u64) ?LeaseHandle {
+        if (now_ns >= lease.reuse_after_ns) return null;
+        lease.active_refs += 1;
+        lease.record.active_refs += 1;
+        return .{ .store = self, .record = lease.record, .family = .ip4, .generation = lease.generation };
+    }
+    fn acquire6(self: *Store, lease: *Lease6, now_ns: u64) ?LeaseHandle {
+        if (now_ns >= lease.reuse_after_ns) return null;
+        lease.active_refs += 1;
+        lease.record.active_refs += 1;
+        return .{ .store = self, .record = lease.record, .family = .ip6, .generation = lease.generation };
+    }
+
+    const Candidate4 = struct { ip: u32, lease: ?*Lease4 };
+    const Candidate6 = struct { ip: [16]u8, lease: ?*Lease6 };
+
+    fn findCandidate4(self: *Store, now_ns: u64) ?Candidate4 {
+        const limit: u64 = @min(@as(u64, self.usable_count), @as(u64, self.leases4.count()) + 1);
+        var offset = self.next_offset;
+        var scanned: u64 = 0;
+        while (scanned < limit) : (scanned += 1) {
+            const ip = self.pool_base + offset;
+            const lease = self.leases4.get(ip);
+            if (lease == null or (lease.?.active_refs == 0 and now_ns >= lease.?.reuse_after_ns)) return .{ .ip = ip, .lease = lease };
+            offset += 1;
+            if (offset > self.usable_count) offset = 1;
+        }
+        return null;
+    }
+    fn findCandidate6(self: *Store, now_ns: u64) ?Candidate6 {
+        const limit: u64 = @min(self.pool6_usable_count, @as(u64, self.leases6.count()) + 1);
+        var offset = self.pool6_next_offset;
+        var scanned: u64 = 0;
+        while (scanned < limit) : (scanned += 1) {
+            const ip = addOffset6(self.pool6_base, offset);
+            const lease = self.leases6.get(ip);
+            if (lease == null or (lease.?.active_refs == 0 and now_ns >= lease.?.reuse_after_ns)) return .{ .ip = ip, .lease = lease };
+            offset += 1;
+            if (offset >= self.pool6_usable_count) offset = 0;
+        }
+        return null;
+    }
+
+    fn advance4(self: *Store) void {
+        self.next_offset += 1;
+        if (self.next_offset > self.usable_count) self.next_offset = 1;
+    }
+    fn advance6(self: *Store) void {
         self.pool6_next_offset += 1;
         if (self.pool6_next_offset >= self.pool6_usable_count) self.pool6_next_offset = 0;
-        return ip;
+    }
+    fn expiration(self: *const Store, now_ns: u64) struct { dns: u64, reuse_after: u64 } {
+        const dns = saturatingAdd(now_ns, self.ttl_ns);
+        return .{ .dns = dns, .reuse_after = saturatingAdd(dns, self.reuse_grace_ns) };
     }
 };
 
-fn parsePool(text: []const u8) !struct { base: u32, prefix_len: u8, usable_count: u32 } {
-    const slash = std.mem.indexOfScalar(u8, text, '/') orelse return error.InvalidFakeDnsPool;
-    const address_text = text[0..slash];
-    const prefix_len = std.fmt.parseInt(u8, text[slash + 1 ..], 10) catch return error.InvalidFakeDnsPool;
-    if (prefix_len > 30) return error.InvalidFakeDnsPool;
-
-    const parsed = net.IpAddress.parse(address_text, 0) catch return error.InvalidFakeDnsPool;
-    const address = switch (parsed) {
-        .ip4 => |ip4| bytesToIp(ip4.bytes),
-        .ip6 => return error.InvalidFakeDnsPool,
-    };
-    const mask = prefixMask(prefix_len);
-    const total: u64 = @as(u64, 1) << @intCast(32 - prefix_len);
-    if (total <= 2) return error.InvalidFakeDnsPool;
-    return .{
-        .base = address & mask,
-        .prefix_len = prefix_len,
-        .usable_count = @intCast(total - 2),
-    };
+pub fn validateConfig(cfg: config.FakeDnsConfig) !void {
+    _ = try parsePool(cfg.ip_pool);
+    _ = try parsePool6(cfg.ip_pool6);
 }
 
+fn publication(record: *const DomainRecord, generation: u64, valid_until: u64) Publication {
+    return .{ .domain_id = record.id, .generation = generation, .route_valid_until_ns = valid_until };
+}
+
+/// bpf_ktime_get_ns and Io `.awake` both use CLOCK_MONOTONIC on Linux.
+pub fn monotonicNowNs(io: Io) u64 {
+    return @intCast(@max(Io.Timestamp.now(io, .awake).nanoseconds, 0));
+}
+fn secondsToNs(seconds: u32) u64 {
+    return @as(u64, seconds) * std.time.ns_per_s;
+}
+fn saturatingAdd(a: u64, b: u64) u64 {
+    return std.math.add(u64, a, b) catch std.math.maxInt(u64);
+}
+fn incrementGeneration(value: u64) u64 {
+    return std.math.add(u64, value, 1) catch std.math.maxInt(u64);
+}
+
+fn parsePool(text: []const u8) !struct { base: u32, prefix_len: u8, usable_count: u32 } {
+    const slash = std.mem.indexOfScalar(u8, text, '/') orelse return error.InvalidFakeDnsPool;
+    const prefix_len = std.fmt.parseInt(u8, text[slash + 1 ..], 10) catch return error.InvalidFakeDnsPool;
+    if (prefix_len > 30) return error.InvalidFakeDnsPool;
+    const parsed = net.IpAddress.parse(text[0..slash], 0) catch return error.InvalidFakeDnsPool;
+    const address = switch (parsed) {
+        .ip4 => |ip| bytesToIp(ip.bytes),
+        .ip6 => return error.InvalidFakeDnsPool,
+    };
+    const total: u64 = @as(u64, 1) << @intCast(32 - prefix_len);
+    return .{ .base = address & prefixMask(prefix_len), .prefix_len = prefix_len, .usable_count = @intCast(total - 2) };
+}
 fn prefixMask(prefix_len: u8) u32 {
     if (prefix_len == 0) return 0;
     return std.math.shl(u32, std.math.maxInt(u32), 32 - prefix_len);
 }
-
 fn parsePool6(text: []const u8) !struct { base: [16]u8, prefix_len: u8, usable_count: u64 } {
     const slash = std.mem.indexOfScalar(u8, text, '/') orelse return error.InvalidFakeDnsPool;
-    const address_text = text[0..slash];
     const prefix_len = std.fmt.parseInt(u8, text[slash + 1 ..], 10) catch return error.InvalidFakeDnsPool;
     if (prefix_len > 128) return error.InvalidFakeDnsPool;
-
-    const parsed = net.IpAddress.parse(address_text, 0) catch return error.InvalidFakeDnsPool;
+    const parsed = net.IpAddress.parse(text[0..slash], 0) catch return error.InvalidFakeDnsPool;
     var base = switch (parsed) {
         .ip4 => return error.InvalidFakeDnsPool,
-        .ip6 => |ip6| ip6.bytes,
+        .ip6 => |ip| ip.bytes,
     };
     maskNetwork6(&base, prefix_len);
-
     const host_bits: u8 = 128 - prefix_len;
-    const usable_count = if (host_bits >= 64)
-        std.math.maxInt(u64)
-    else
-        @as(u64, 1) << @intCast(host_bits);
-    return .{ .base = base, .prefix_len = prefix_len, .usable_count = usable_count };
+    return .{ .base = base, .prefix_len = prefix_len, .usable_count = if (host_bits >= 64) std.math.maxInt(u64) else @as(u64, 1) << @intCast(host_bits) };
 }
-
 fn maskNetwork6(address: *[16]u8, prefix_len: u8) void {
-    const full_bytes = prefix_len / 8;
-    const remaining_bits = prefix_len % 8;
-    var index: usize = full_bytes;
-    if (remaining_bits != 0) {
-        const shift: u3 = @intCast(8 - remaining_bits);
+    const full = prefix_len / 8;
+    const remaining = prefix_len % 8;
+    var index: usize = full;
+    if (remaining != 0) {
+        const shift: u3 = @intCast(8 - remaining);
         address[index] &= @as(u8, 0xff) << shift;
         index += 1;
     }
     @memset(address[index..], 0);
 }
-
 fn prefixMatches6(address: [16]u8, network: [16]u8, prefix_len: u8) bool {
-    const full_bytes = prefix_len / 8;
-    if (!std.mem.eql(u8, address[0..full_bytes], network[0..full_bytes])) return false;
-    const remaining_bits = prefix_len % 8;
-    if (remaining_bits == 0) return true;
-    const shift: u3 = @intCast(8 - remaining_bits);
+    const full = prefix_len / 8;
+    if (!std.mem.eql(u8, address[0..full], network[0..full])) return false;
+    const remaining = prefix_len % 8;
+    if (remaining == 0) return true;
+    const shift: u3 = @intCast(8 - remaining);
     const mask = @as(u8, 0xff) << shift;
-    return (address[full_bytes] & mask) == (network[full_bytes] & mask);
+    return (address[full] & mask) == (network[full] & mask);
 }
-
 fn addOffset6(base: [16]u8, offset: u64) [16]u8 {
     var address = base;
     var carry = offset;
@@ -226,7 +459,6 @@ fn addOffset6(base: [16]u8, offset: u64) [16]u8 {
     }
     return address;
 }
-
 fn normalizeDomain(buffer: *[net.HostName.max_len]u8, domain: []const u8) ![]const u8 {
     var trimmed = domain;
     while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '.') trimmed = trimmed[0 .. trimmed.len - 1];
@@ -234,126 +466,155 @@ fn normalizeDomain(buffer: *[net.HostName.max_len]u8, domain: []const u8) ![]con
     for (trimmed, 0..) |c, i| buffer[i] = std.ascii.toLower(c);
     return buffer[0..trimmed.len];
 }
-
 fn bytesToIp(bytes: [4]u8) u32 {
     return std.mem.readInt(u32, &bytes, .big);
 }
-
 fn ipToBytes(ip: u32) [4]u8 {
     var bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &bytes, ip, .big);
     return bytes;
 }
 
-test "allocates and reverse maps fake IPv4 addresses" {
-    var store = try Store.init(std.testing.allocator, .{
-        .ip_pool = "198.18.0.0/30",
-        .ip_pool6 = "fc00::/126",
-        .ttl = 60,
-    });
+const test_config: config.FakeDnsConfig = .{ .ip_pool = "198.18.0.0/30", .ip_pool6 = "fc00::/126", .ttl = 10, .reuse_grace_seconds = 5 };
+
+test "FakeDNS normalizes and safely holds a session lease" {
+    var store = try Store.init(std.testing.allocator, test_config);
     defer store.deinit();
-
-    const first = try store.resolveA("Example.COM.", std.Io.failing);
-    try std.testing.expectEqualSlices(u8, &.{ 198, 18, 0, 1 }, &first);
-
-    const again = try store.resolveA("example.com", std.Io.failing);
-    try std.testing.expectEqualSlices(u8, &first, &again);
-
-    const domain = store.lookup(.{ .ip4 = .{ .bytes = first, .port = 443 } }, std.Io.failing).?;
-    try std.testing.expectEqualStrings("example.com", domain);
+    const address = try store.resolveAAt("Example.COM.", 0, std.Io.failing);
+    try std.testing.expectEqual(address, try store.resolveAAt("example.com", 1, std.Io.failing));
+    const address6 = try store.resolveAAAAAt("example.com", 1, std.Io.failing);
+    var handle = store.lookupAt(.{ .ip4 = .{ .bytes = address, .port = 443 } }, 2, std.Io.failing).?;
+    defer handle.release(std.Io.failing);
+    try std.testing.expectEqualStrings("example.com", handle.domain());
+    try std.testing.expectEqual(@as(u64, 1), handle.domainId());
+    const target6: net.IpAddress = .{ .ip6 = .{ .bytes = address6, .port = 443, .interface = .none } };
+    var handle6 = store.lookupAt(target6, 2, std.Io.failing).?;
+    defer handle6.release(std.Io.failing);
+    try std.testing.expectEqual(handle.domainId(), handle6.domainId());
 }
 
-test "cached fake addresses do not allocate" {
-    var store = try Store.init(std.testing.allocator, .{
-        .ip_pool = "198.18.0.0/30",
-        .ip_pool6 = "fc00::/126",
-        .ttl = 60,
-    });
+test "FakeDNS refreshes TTL and route validity" {
+    var capture: Publication = undefined;
+    const P = struct {
+        fn publish(context: ?*anyopaque, address: [4]u8, value: Publication) !void {
+            _ = address;
+            const output: *Publication = @ptrCast(@alignCast(context.?));
+            output.* = value;
+        }
+    };
+    var store = try Store.initWithPublisher(std.testing.allocator, test_config, .{ .context = &capture, .publish4_fn = P.publish });
     defer store.deinit();
-
-    const ipv4 = try store.resolveA("example.com", std.Io.failing);
-    const ipv6 = try store.resolveAAAA("example.com", std.Io.failing);
-
-    const allocator = store.allocator;
-    store.allocator = std.testing.failing_allocator;
-    defer store.allocator = allocator;
-
-    try std.testing.expectEqual(ipv4, try store.resolveA("Example.COM.", std.Io.failing));
-    try std.testing.expectEqual(ipv6, try store.resolveAAAA("Example.COM.", std.Io.failing));
+    const second = std.time.ns_per_s;
+    _ = try store.resolveAAt("example.com", second, std.Io.failing);
+    try std.testing.expectEqual(@as(u64, 16) * second, capture.route_valid_until_ns);
+    _ = try store.resolveAAt("EXAMPLE.COM.", 7 * second, std.Io.failing);
+    try std.testing.expectEqual(@as(u64, 22) * second, capture.route_valid_until_ns);
 }
 
-test "fake address insertion is leak-free on allocation failure" {
+test "FakeDNS exhausts before grace and reuses with new generation" {
+    var store = try Store.init(std.testing.allocator, test_config);
+    defer store.deinit();
+    const a = try store.resolveAAt("a.example", 0, std.Io.failing);
+    _ = try store.resolveAAt("b.example", 0, std.Io.failing);
+    try std.testing.expectError(error.FakeDnsPoolExhausted, store.resolveAAt("c.example", 14 * std.time.ns_per_s, std.Io.failing));
+    const c = try store.resolveAAt("c.example", 15 * std.time.ns_per_s, std.Io.failing);
+    try std.testing.expectEqual(a, c);
+    var handle = store.lookupAt(.{ .ip4 = .{ .bytes = c, .port = 80 } }, 15 * std.time.ns_per_s, std.Io.failing).?;
+    defer handle.release(std.Io.failing);
+    try std.testing.expectEqualStrings("c.example", handle.domain());
+    try std.testing.expectEqual(@as(u64, 2), handle.generation);
+}
+
+test "FakeDNS active flow prevents reuse and keeps domain alive" {
+    var store = try Store.init(std.testing.allocator, test_config);
+    defer store.deinit();
+    const a = try store.resolveAAt("a.example", 0, std.Io.failing);
+    const b = try store.resolveAAt("b.example", 0, std.Io.failing);
+    var handle = store.lookupAt(.{ .ip4 = .{ .bytes = a, .port = 80 } }, 1, std.Io.failing).?;
+    const c = try store.resolveAAt("c.example", 15 * std.time.ns_per_s, std.Io.failing);
+    try std.testing.expectEqual(b, c);
+    try std.testing.expectEqualStrings("a.example", handle.domain());
+    try std.testing.expectError(error.FakeDnsPoolExhausted, store.resolveAAt("d.example", 15 * std.time.ns_per_s, std.Io.failing));
+    handle.release(std.Io.failing);
+    try std.testing.expectEqual(a, try store.resolveAAt("d.example", 15 * std.time.ns_per_s, std.Io.failing));
+}
+
+test "FakeDNS IPv6 generation increments" {
+    var cfg = test_config;
+    cfg.ip_pool6 = "2001:db8::/127";
+    var store = try Store.init(std.testing.allocator, cfg);
+    defer store.deinit();
+    const a = try store.resolveAAAAAt("a.example", 0, std.Io.failing);
+    _ = try store.resolveAAAAAt("b.example", 0, std.Io.failing);
+    const c = try store.resolveAAAAAt("c.example", 15 * std.time.ns_per_s, std.Io.failing);
+    try std.testing.expectEqual(a, c);
+    const target: net.IpAddress = .{ .ip6 = .{ .bytes = c, .port = 443, .interface = .none } };
+    var handle = store.lookupAt(target, 15 * std.time.ns_per_s, std.Io.failing).?;
+    defer handle.release(std.Io.failing);
+    try std.testing.expectEqual(@as(u64, 2), handle.generation);
+    try std.testing.expect(store.contains(target));
+}
+
+test "FakeDNS publication failure rolls back allocation" {
+    const P = struct {
+        fn fail(context: ?*anyopaque, address: [4]u8, value: Publication) !void {
+            _ = context;
+            _ = address;
+            _ = value;
+            return error.PublishFailed;
+        }
+    };
+    var store = try Store.initWithPublisher(std.testing.allocator, test_config, .{ .publish4_fn = P.fail });
+    defer store.deinit();
+    try std.testing.expectError(error.PublishFailed, store.resolveAAt("a.example", 0, std.Io.failing));
+    try std.testing.expectEqual(@as(usize, 0), store.domains.count());
+    try std.testing.expectEqual(@as(usize, 0), store.leases4.count());
+}
+
+test "FakeDNS publication failure rolls back TTL refresh" {
+    const State = struct { fail: bool = false };
+    const P = struct {
+        fn publish(context: ?*anyopaque, address: [4]u8, value: Publication) !void {
+            _ = address;
+            _ = value;
+            const state: *State = @ptrCast(@alignCast(context.?));
+            if (state.fail) return error.PublishFailed;
+        }
+    };
+    var state: State = .{};
+    var store = try Store.initWithPublisher(std.testing.allocator, test_config, .{
+        .context = &state,
+        .publish4_fn = P.publish,
+    });
+    defer store.deinit();
+    const address = try store.resolveAAt("a.example", 0, std.Io.failing);
+    const before = store.leases4.get(bytesToIp(address)).?.reuse_after_ns;
+    state.fail = true;
+    try std.testing.expectError(error.PublishFailed, store.resolveAAt("a.example", 30 * std.time.ns_per_s, std.Io.failing));
+    try std.testing.expectEqual(before, store.leases4.get(bytesToIp(address)).?.reuse_after_ns);
+}
+
+test "FakeDNS churn keeps domain storage bounded by live leases" {
+    var store = try Store.init(std.testing.allocator, test_config);
+    defer store.deinit();
+    var name_buffer: [32]u8 = undefined;
+    var now: u64 = 0;
+    for (0..100) |index| {
+        const name = try std.fmt.bufPrint(&name_buffer, "domain-{d}.example", .{index});
+        _ = try store.resolveAAt(name, now, std.Io.failing);
+        now += 15 * std.time.ns_per_s;
+    }
+    try std.testing.expectEqual(@as(usize, 2), store.leases4.count());
+    try std.testing.expectEqual(@as(usize, 2), store.domains.count());
+}
+
+test "FakeDNS allocation is leak-free on failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(allocator: std.mem.Allocator) !void {
-            var store = try Store.init(allocator, .{
-                .ip_pool = "198.18.0.0/30",
-                .ip_pool6 = "fc00::/126",
-                .ttl = 60,
-            });
+            var store = try Store.init(allocator, test_config);
             defer store.deinit();
-
-            _ = try store.resolveA("example.com", std.Io.failing);
-            _ = try store.resolveAAAA("example.com", std.Io.failing);
+            _ = try store.resolveAAt("example.com", 0, std.Io.failing);
+            _ = try store.resolveAAAAAt("example.com", 0, std.Io.failing);
         }
     }.run, .{});
-}
-
-test "wraps fake pool and evicts reverse mapping" {
-    var store = try Store.init(std.testing.allocator, .{
-        .ip_pool = "198.18.0.0/30",
-        .ip_pool6 = "fc00::/126",
-        .ttl = 60,
-    });
-    defer store.deinit();
-
-    const a = try store.resolveA("a.example", std.Io.failing);
-    _ = try store.resolveA("b.example", std.Io.failing);
-    const c = try store.resolveA("c.example", std.Io.failing);
-
-    try std.testing.expectEqualSlices(u8, &a, &c);
-    try std.testing.expect(store.lookup(.{ .ip4 = .{ .bytes = a, .port = 80 } }, std.Io.failing) != null);
-}
-
-test "allocates and reverse maps fake IPv6 addresses" {
-    var store = try Store.init(std.testing.allocator, .{
-        .ip_pool = "198.18.0.0/30",
-        .ip_pool6 = "fc00::/126",
-        .ttl = 60,
-    });
-    defer store.deinit();
-
-    const first = try store.resolveAAAA("Example.COM.", std.Io.failing);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xfc} ++ [_]u8{0} ** 15), &first);
-
-    const again = try store.resolveAAAA("example.com", std.Io.failing);
-    try std.testing.expectEqualSlices(u8, &first, &again);
-
-    const address: net.IpAddress = .{ .ip6 = .{
-        .bytes = first,
-        .port = 443,
-        .interface = .none,
-    } };
-    try std.testing.expectEqualStrings("example.com", store.lookup(address, std.Io.failing).?);
-    try std.testing.expect(store.contains(address));
-}
-
-test "wraps fake IPv6 pool and evicts reverse mapping" {
-    var store = try Store.init(std.testing.allocator, .{
-        .ip_pool = "198.18.0.0/30",
-        .ip_pool6 = "2001:db8::/127",
-        .ttl = 60,
-    });
-    defer store.deinit();
-
-    const a = try store.resolveAAAA("a.example", std.Io.failing);
-    _ = try store.resolveAAAA("b.example", std.Io.failing);
-    const c = try store.resolveAAAA("c.example", std.Io.failing);
-
-    try std.testing.expectEqualSlices(u8, &a, &c);
-    const address: net.IpAddress = .{ .ip6 = .{
-        .bytes = a,
-        .port = 80,
-        .interface = .none,
-    } };
-    try std.testing.expectEqualStrings("c.example", store.lookup(address, std.Io.failing).?);
 }
