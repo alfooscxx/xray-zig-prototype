@@ -33,7 +33,11 @@ pub const Runtime = struct {
         var sk_lookup_inbound: ?sk_lookup.Inbound = null;
         for (self.cfg.inbounds) |inbound| {
             if (!std.mem.eql(u8, inbound.protocol, "sk_lookup")) continue;
-            sk_lookup_inbound = try sk_lookup.Inbound.init(inbound, io);
+            const fake_dns_cfg = if (self.cfg.dns) |dns_cfg|
+                dns_cfg.fake_dns orelse return error.MissingFakeDnsConfig
+            else
+                return error.MissingFakeDnsConfig;
+            sk_lookup_inbound = try sk_lookup.Inbound.init(inbound, fake_dns_cfg, io);
             break;
         }
         defer if (sk_lookup_inbound) |*inbound| inbound.deinit(io);
@@ -45,12 +49,19 @@ pub const Runtime = struct {
 
         var fake_dns_store: ?fakedns.Store = if (self.cfg.dns) |dns_cfg|
             if (dns_cfg.fake_dns) |fake_dns_cfg|
-                try fakedns.Store.initWithPublisher(self.allocator, fake_dns_cfg, fake_dns_publisher)
+                try fakedns.Store.initRestored(
+                    self.allocator,
+                    fake_dns_cfg,
+                    fake_dns_publisher,
+                    fakedns.monotonicNowNs(io),
+                )
             else
                 null
         else
             null;
         defer if (fake_dns_store) |*store| store.deinit();
+
+        if (sk_lookup_inbound) |*inbound| try inbound.attach(io);
 
         var log_mutex: Io.Mutex = .init;
         var reactor = try raw_reactor.Reactor.init(

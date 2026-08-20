@@ -58,10 +58,21 @@ pub const SkLookupInboundSettings = struct {
     listen6: []const u8,
     port6: u16,
     max_map_entries: u32,
+    fake_dns_persistence: ?FakeDnsPersistenceSettings,
 
     pub fn deinit(self: *SkLookupInboundSettings, allocator: std.mem.Allocator) void {
         allocator.free(self.listen4);
         allocator.free(self.listen6);
+        if (self.fake_dns_persistence) |*persistence| persistence.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const FakeDnsPersistenceSettings = struct {
+    pin_directory: []const u8,
+
+    pub fn deinit(self: *FakeDnsPersistenceSettings, allocator: std.mem.Allocator) void {
+        allocator.free(self.pin_directory);
         self.* = undefined;
     }
 };
@@ -329,6 +340,10 @@ pub const ParseConfigError = error{
     InvalidSkLookupListen4,
     InvalidSkLookupListen6,
     InvalidSkLookupMapEntries,
+    FakeDnsPersistenceMustBeObject,
+    MissingFakeDnsPinDirectory,
+    UnsupportedFakeDnsPersistenceSetting,
+    InvalidFakeDnsPinDirectory,
     MissingOutboundProtocol,
     MissingVlessAddress,
     MissingVlessPort,
@@ -453,7 +468,8 @@ fn parseSkLookupInboundSettings(allocator: std.mem.Allocator, maybe_value: ?std.
             !std.mem.eql(u8, key, "port4") and
             !std.mem.eql(u8, key, "listen6") and
             !std.mem.eql(u8, key, "port6") and
-            !std.mem.eql(u8, key, "maxMapEntries"))
+            !std.mem.eql(u8, key, "maxMapEntries") and
+            !std.mem.eql(u8, key, "fakeDnsPersistence"))
         {
             return error.UnsupportedSkLookupSetting;
         }
@@ -472,13 +488,60 @@ fn parseSkLookupInboundSettings(allocator: std.mem.Allocator, maybe_value: ?std.
     const max_map_entries = try optionalUnsigned(u32, object, "maxMapEntries", 65536, error.InvalidSkLookupMapEntries);
     if (max_map_entries == 0 or max_map_entries > 1_048_576) return error.InvalidSkLookupMapEntries;
 
+    const fake_dns_persistence = try parseFakeDnsPersistenceSettings(allocator, object.get("fakeDnsPersistence"));
+    errdefer if (fake_dns_persistence) |owned_value| {
+        var owned = owned_value;
+        owned.deinit(allocator);
+    };
+
     return .{
         .listen4 = listen4,
         .port4 = try requiredPort(object, "port4", error.MissingSkLookupPort4),
         .listen6 = listen6,
         .port6 = try requiredPort(object, "port6", error.MissingSkLookupPort6),
         .max_map_entries = max_map_entries,
+        .fake_dns_persistence = fake_dns_persistence,
     };
+}
+
+fn parseFakeDnsPersistenceSettings(
+    allocator: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) !?FakeDnsPersistenceSettings {
+    const value = maybe_value orelse return null;
+    if (value != .object) return error.FakeDnsPersistenceMustBeObject;
+    const object = &value.object;
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "pinDirectory"))
+            return error.UnsupportedFakeDnsPersistenceSetting;
+    }
+
+    const pin_directory = try requiredString(
+        allocator,
+        object,
+        "pinDirectory",
+        error.MissingFakeDnsPinDirectory,
+    );
+    errdefer allocator.free(pin_directory);
+    if (!validAbsoluteDirectory(pin_directory)) return error.InvalidFakeDnsPinDirectory;
+    return .{ .pin_directory = pin_directory };
+}
+
+fn validAbsoluteDirectory(path: []const u8) bool {
+    if (path.len < 2 or path.len >= std.posix.PATH_MAX or path[0] != '/' or path[path.len - 1] == '/')
+        return false;
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or
+            std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, "..") or
+            std.mem.indexOfScalar(u8, component, 0) != null)
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn parseTunInboundSettings(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) !?TunInboundSettings {
@@ -1162,7 +1225,8 @@ test "parses strict sk_lookup inbound settings" {
     const source =
         \\{"inbounds":[{"tag":"bpf-in","protocol":"sk_lookup","settings":{
         \\  "listen4":"0.0.0.0","port4":19080,
-        \\  "listen6":"::","port6":19081,"maxMapEntries":1024
+        \\  "listen6":"::","port6":19081,"maxMapEntries":1024,
+        \\  "fakeDnsPersistence":{"pinDirectory":"/sys/fs/bpf/xray-zig"}
         \\}}]}
     ;
     var cfg = try parse(std.testing.allocator, source);
@@ -1173,6 +1237,7 @@ test "parses strict sk_lookup inbound settings" {
     try std.testing.expectEqualStrings("::", settings.listen6);
     try std.testing.expectEqual(@as(u16, 19081), settings.port6);
     try std.testing.expectEqual(@as(u32, 1024), settings.max_map_entries);
+    try std.testing.expectEqualStrings("/sys/fs/bpf/xray-zig", settings.fake_dns_persistence.?.pin_directory);
 }
 
 test "rejects ambiguous or unsupported sk_lookup settings" {
@@ -1187,6 +1252,14 @@ test "rejects ambiguous or unsupported sk_lookup settings" {
     try std.testing.expectError(
         error.InvalidSkLookupMapEntries,
         parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"maxMapEntries\":0}}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidFakeDnsPinDirectory,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"fakeDnsPersistence\":{\"pinDirectory\":\"../bpf\"}}}]}"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedFakeDnsPersistenceSetting,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"fakeDnsPersistence\":{\"pinDirectory\":\"/sys/fs/bpf/xray-zig\",\"cleanup\":true}}}]}"),
     );
 }
 

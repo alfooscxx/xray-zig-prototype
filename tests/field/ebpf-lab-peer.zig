@@ -23,6 +23,14 @@ pub fn main(init: std.process.Init) !void {
             io,
         );
     }
+    if (args.len == 5 and std.mem.eql(u8, args[1], "direct-client")) {
+        return runDirectClient(
+            args[2],
+            try std.fmt.parseUnsigned(u16, args[3], 10),
+            args[4],
+            io,
+        );
+    }
     if (args.len == 7 and std.mem.eql(u8, args[1], "http-client")) {
         const family: net.IpAddress.Family = if (std.mem.eql(u8, args[5], "4")) .ip4 else if (std.mem.eql(u8, args[5], "6")) .ip6 else return error.InvalidFamily;
         return runHttpClient(
@@ -182,6 +190,25 @@ fn runClient(
 ) !void {
     const target = try resolveFake(dns_server, server_port, domain, family, target_port, io);
 
+    try echoRoundTrip(target, payload, io);
+
+    var stdout_buffer: [256]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    try stdout_writer.interface.print("PASS {s} {f}\n", .{ domain, target });
+    try stdout_writer.interface.flush();
+}
+
+fn runDirectClient(address: []const u8, port: u16, payload: []const u8, io: Io) !void {
+    const target = try net.IpAddress.parse(address, port);
+    try echoRoundTrip(target, payload, io);
+
+    var stdout_buffer: [256]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    try stdout_writer.interface.print("PASS cached {f}\n", .{target});
+    try stdout_writer.interface.flush();
+}
+
+fn echoRoundTrip(target: net.IpAddress, payload: []const u8, io: Io) !void {
     const stream = try xray.net.session.connectTargetTimeout(
         .{ .address = target },
         io,
@@ -199,11 +226,6 @@ fn runClient(
     try echoed.resize(std.heap.page_allocator, payload.len);
     try reader.interface.readSliceAll(echoed.items);
     if (!std.mem.eql(u8, payload, echoed.items)) return error.EchoMismatch;
-
-    var stdout_buffer: [256]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    try stdout_writer.interface.print("PASS {s} {f}\n", .{ domain, target });
-    try stdout_writer.interface.flush();
 }
 
 fn runHttpClient(

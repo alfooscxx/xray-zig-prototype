@@ -29,14 +29,21 @@ required:
     "port4": 19080,
     "listen6": "::",
     "port6": 19081,
-    "maxMapEntries": 65536
+    "maxMapEntries": 65536,
+    "fakeDnsPersistence": {
+      "pinDirectory": "/sys/fs/bpf/xray-zig"
+    }
   }
 }
 ```
 
-No other `sk_lookup` fields are accepted. Listener addresses must have the
-indicated family. Ports are nonzero, and `maxMapEntries` is bounded from 1 to
-1,048,576. A `sk_lookup` inbound requires `dns.fakeDns`.
+`fakeDnsPersistence` is optional and disabled by default. Its only field is an
+absolute, normalized `pinDirectory`. The directory must already exist on a
+mounted bpffs; xray-zig does not create a mount or choose a machine-specific
+path. No other `sk_lookup` or `fakeDnsPersistence` fields are accepted.
+Listener addresses must have the indicated family. Ports are nonzero, and
+`maxMapEntries` is bounded from 1 to 1,048,576. A `sk_lookup` inbound requires
+`dns.fakeDns`.
 
 FakeDNS accepts `reuseGraceSeconds`, which defaults to 30:
 
@@ -69,20 +76,100 @@ misses, expired entries, missing listeners, and assignment failures are
 fail-open (`SK_PASS`).
 
 The runtime uses `bpf()` syscalls directly. It has no dependency on bpftool or
-libbpf, does not pin objects, and does not use CO-RE or BTF. The process owns
-all map, program, and link FDs. Closing the link FD, including on process exit,
-detaches the namespace hook and removes the non-persistent objects.
+libbpf and does not use CO-RE or BTF. The listener SOCKMAP, program, and link
+always remain process-owned and ephemeral. Closing the link FD, including on
+process exit, detaches the namespace hook.
 
-Startup creates both listeners and attaches the link before connecting the
-FakeDNS publisher and before DNS can answer. Publication completes before the
-DNS response. `getsockname` on the accepted socket recovers the original fake
-address and port. A refcounted lease keeps its stable domain record alive for
-the complete synchronous Dispatcher call. The userspace `Session` remains the
-frozen routing authority.
+Startup creates both listeners and the BPF objects, restores the complete
+FakeDNS store when persistence is configured, and only then attaches the BPF
+link. DNS and SK_LOOKUP workers are spawned after restoration and attach.
+Publication completes before the userspace lease is committed and before a DNS
+response is sent. `getsockname` on the accepted socket recovers the original
+fake address and port. A refcounted lease keeps its stable domain record alive
+for the complete synchronous Dispatcher call. The userspace `Session` remains
+the frozen routing authority.
 
 xray-zig itself does not install routes. Test harnesses add exact addresses;
 the GL-MT6000 service wrapper owns the production FakeDNS prefix routes and
 the matching dnsmasq lifecycle described in `openwrt-tun-service.md`.
+
+## Restart-Safe FakeDNS
+
+With `fakeDnsPersistence`, xray-zig pins exactly three objects below the
+configured directory:
+
+```text
+fake4       IPv4 HASH map used by SK_LOOKUP
+fake6       IPv6 HASH map used by SK_LOOKUP
+lease_meta  control-plane HASH map with BPF_F_NO_PREALLOC
+```
+
+The listener SOCKMAP and SK_LOOKUP program/link remain ephemeral. The packet
+program never references `lease_meta`, so persistence adds no per-packet
+lookup. A metadata write precedes each address-map update; the address map is
+the commit marker. Metadata keys include family, address, domain ID,
+generation, and exact monotonic route deadline. Startup can therefore retain
+the last committed version and prune an interrupted pending version.
+
+Each metadata value contains the normalized domain and DNS deadline. A reserved
+header records the schema and a fingerprint covering both pool strings, TTL,
+reuse grace, `maxMapEntries`, and schema version. Reopen validates map type,
+key/value sizes, maximum entries, flags, names, header, and fingerprint. An
+incompatible or incomplete set fails closed instead of being replaced.
+
+Unexpected `BPF_OBJ_GET` and every failed `BPF_OBJ_PIN` log the exact operation
+stage, configured bpffs path, and numeric and symbolic errno. In particular,
+`EEXIST` can identify a non-BPF file or directory occupying one of the fixed
+pin names even when no reusable pinned map was opened.
+
+A deterministic lock file named
+`/run/xray-zig-fakedns-<sha256(pinDirectory)>.lock` is held with an exclusive
+nonblocking lock for the runtime lifetime. xray-zig verifies `/run` is tmpfs,
+opens the file with `CLOEXEC` and `NOFOLLOW`, creates it as mode 0600 when
+absent, and accepts only a root-owned regular file with one link. The file is
+deliberately not unlinked on close, preventing two processes from locking
+different inodes under the same name. `/run` clears it on reboot without a
+flash write.
+
+Normal shutdown closes FDs but deliberately leaves the three bpffs pins and
+live leases. On the next process start, expired pairs and unreferenced
+transaction records are deleted, unexpired A/AAAA leases and generations are
+restored, and allocation resumes without colliding with restored addresses.
+bpffs is RAM-backed: this preserves state across process restarts in one boot,
+not across a kernel reboot, and causes no flash writes.
+
+The metadata map capacity is twice `maxMapEntries` plus two transactional and
+header slots, but `BPF_F_NO_PREALLOC` avoids preallocating all declared values.
+Allow roughly 0.35--0.5 KiB per live family lease, or about 0.35--0.5 MiB per
+1000 single-stack names and 0.7--1.0 MiB when all names have both A and AAAA.
+
+Administrative cleanup must be done after stopping the process:
+
+```sh
+xray-zig check -config /path/to/config.json
+xray-zig fakedns-unpin -config /path/to/config.json
+```
+
+`fakedns-unpin` acquires the same `/run` lock, validates every present exact
+object, and removes only `fake4`, `fake6`, and `lease_meta`. Missing members are
+allowed so it can recover an interrupted first creation; a foreign or
+incompatible object is never unlinked. Removing `fakeDnsPersistence` from the
+configuration does not implicitly delete old pins.
+
+A restart acceptance test can record an A/AAAA answer, stop and restart the
+same configuration, verify the answer remains identical before its monotonic
+deadline, and inspect the fixed pins:
+
+```sh
+bpftool map show pinned /sys/fs/bpf/xray-zig/fake4
+bpftool map show pinned /sys/fs/bpf/xray-zig/fake6
+bpftool map show pinned /sys/fs/bpf/xray-zig/lease_meta
+```
+
+During the stop interval the address maps remain pinned, but the namespace
+link and listener map are gone, so cached addresses are not assigned to a dead
+listener. After restart a new program/link and listener SOCKMAP use the
+reopened address maps.
 
 ## Isolated Router Tests
 
@@ -164,6 +251,17 @@ commit: the test required removal of the BPF program, FakeDNS routes and DNS
 upstream plus restoration of dnsmasq rebind protection. After a service start,
 the complete dataplane and a second verified LAN HTTPS download had to pass.
 A third post-commit flow logged the domain target and Vision raw handoff.
+
+Restart persistence was then validated on the same router. An isolated
+two-netns test proved IPv4/IPv6 cached-address connections without a DNS
+refresh, stable address-map IDs, active-unpin locking, and ephemeral
+program/link cleanup. The production cutover preserved map IDs 271, 272, and
+273 across a controlled restart. Eight cached-address HTTPS clients then used
+the pre-restart IPv4 FakeDNS result without a DNS lookup and downloaded 8 MiB
+each through VLESS/REALITY/Vision with certificate verification. The 64 MiB
+batch completed in 3 seconds; a separate post-cutover WAN HTTPS request also
+passed. These figures validate correctness and are not a controlled throughput
+comparison.
 
 ## Current Limits
 

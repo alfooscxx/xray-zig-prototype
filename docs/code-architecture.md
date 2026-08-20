@@ -125,8 +125,12 @@ If no rule matches, `routing.defaultOutboundTag` is used.
 
 The experimental Linux `sk_lookup` inbound is documented in
 `ebpf-sk-lookup.md`. FakeDNS uses stable domain records and refcounted leases;
-the BPF publisher runs before the DNS response, while an accepted session holds
-its lease across the complete synchronous dispatch.
+when its optional bpffs persistence is configured, startup reconstructs those
+records from validated pinned address and metadata maps before attaching the
+new namespace link. The metadata map is control-plane-only and has no
+dataplane lookup cost. Listener maps are never restored across a process
+boundary. The BPF publisher runs before the DNS response, while an accepted
+session holds its lease across the complete synchronous dispatch.
 
 DNS server selection should not be implemented in protocol code. Protocol code should ask the DNS config/upstream layer for the selected resolver based on the queried domain.
 

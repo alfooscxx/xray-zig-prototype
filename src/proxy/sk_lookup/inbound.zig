@@ -17,7 +17,7 @@ pub const Inbound = struct {
     listener6: net.Server,
     dataplane: bpf.Dataplane,
 
-    pub fn init(inbound: config.Inbound, io: Io) !Inbound {
+    pub fn init(inbound: config.Inbound, fake_dns_cfg: config.FakeDnsConfig, io: Io) !Inbound {
         if (builtin.os.tag != .linux) return error.SkLookupRequiresLinux;
         const settings = inbound.sk_lookup orelse return error.MissingSkLookupSettings;
 
@@ -33,6 +33,8 @@ pub const Inbound = struct {
             settings.max_map_entries,
             listener4.socket.handle,
             listener6.socket.handle,
+            fake_dns_cfg,
+            settings.fake_dns_persistence,
             io,
         );
         errdefer {
@@ -57,6 +59,10 @@ pub const Inbound = struct {
 
     pub fn publisher(self: *Inbound) fakedns.Publisher {
         return self.dataplane.publisher();
+    }
+
+    pub fn attach(self: *Inbound, io: Io) !void {
+        try self.dataplane.attach(io);
     }
 
     pub fn run(
