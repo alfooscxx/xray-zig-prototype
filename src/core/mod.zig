@@ -76,9 +76,12 @@ pub const Runtime = struct {
             reactor.stop();
             group.cancel(io);
         }
+        var raw_failure_buffer: [1]RawReactorFailure = undefined;
+        var raw_failures: Io.Queue(RawReactorFailure) = .init(&raw_failure_buffer);
+        defer raw_failures.close(io);
         self.reactor = &reactor;
         defer self.reactor = null;
-        try group.concurrent(io, runRawReactor, .{&reactor});
+        try group.concurrent(io, runRawReactor, .{ &reactor, &raw_failures, io });
 
         for (self.cfg.inbounds) |inbound| {
             if (std.mem.eql(u8, inbound.protocol, "socks")) {
@@ -107,7 +110,11 @@ pub const Runtime = struct {
             return error.UnsupportedInboundProtocol;
         }
 
-        try group.await(io);
+        const raw_failure = raw_failures.getOne(io) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.Closed => unreachable,
+        };
+        return raw_failure.err;
     }
 
     fn dispatcher(self: *Runtime) session.Dispatcher {
@@ -147,14 +154,21 @@ pub const Runtime = struct {
     }
 };
 
-fn runRawReactor(reactor: *raw_reactor.Reactor) Io.Cancelable!void {
+const RawReactorFailure = struct {
+    err: anyerror,
+};
+
+fn runRawReactor(reactor: *raw_reactor.Reactor, failures: *Io.Queue(RawReactorFailure), io: Io) Io.Cancelable!void {
     diagnostics.setRawReactorCount(0);
+    var failure: anyerror = error.RawReactorStopped;
     reactor.run() catch |err| switch (err) {
         error.Canceled => return error.Canceled,
-        else => {
-            log.err("raw io_uring reactor stopped: {s}\n", .{@errorName(err)});
-            return err;
-        },
+        else => failure = err,
+    };
+    log.err("raw io_uring reactor stopped: {s}\n", .{@errorName(failure)});
+    failures.putOne(io, .{ .err = failure }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.Closed => return,
     };
 }
 
