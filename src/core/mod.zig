@@ -151,7 +151,10 @@ fn runRawReactor(reactor: *raw_reactor.Reactor) Io.Cancelable!void {
     diagnostics.setRawReactorCount(0);
     reactor.run() catch |err| switch (err) {
         error.Canceled => return error.Canceled,
-        else => log.err("raw io_uring reactor stopped: {s}\n", .{@errorName(err)}),
+        else => {
+            log.err("raw io_uring reactor stopped: {s}\n", .{@errorName(err)});
+            return err;
+        },
     };
 }
 
