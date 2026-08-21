@@ -51,6 +51,8 @@ pub const State = struct {
     send_una: u32,
     send_next: u32,
     send_window: u32,
+    send_window_sequence: u32,
+    send_window_acknowledgment: u32,
     mss: u16,
     cwnd: u32,
     ssthresh: u32,
@@ -72,6 +74,8 @@ pub const State = struct {
             .send_una = server_isn,
             .send_next = server_isn,
             .send_window = window,
+            .send_window_sequence = client_sequence,
+            .send_window_acknowledgment = 0,
             .mss = effective_mss,
             .cwnd = @as(u32, effective_mss) * 2,
             .ssthresh = @as(u32, effective_mss) * 32,
@@ -122,9 +126,17 @@ pub const State = struct {
         }
 
         if (flags.ack) {
-            const duplicate_eligible = payload_len == 0 and !flags.syn and !flags.fin and self.send_window == window;
-            self.send_window = window;
-            result.fast_retransmit = self.acceptAck(acknowledgment, now_ms, duplicate_eligible);
+            const acknowledgment_valid = !sequenceAfter(acknowledgment, self.send_next) and
+                !sequenceAfter(self.send_una, acknowledgment);
+            if (acknowledgment_valid) {
+                const duplicate_eligible = payload_len == 0 and !flags.syn and !flags.fin and self.send_window == window;
+                result.fast_retransmit = self.acceptAck(acknowledgment, now_ms, duplicate_eligible);
+                if (self.windowUpdateIsFresh(sequence, acknowledgment)) {
+                    self.send_window = window;
+                    self.send_window_sequence = sequence;
+                    self.send_window_acknowledgment = acknowledgment;
+                }
+            }
         }
 
         if (self.phase == .syn_received and self.send_una == self.send_next) {
@@ -220,7 +232,6 @@ pub const State = struct {
     }
 
     fn acceptAck(self: *State, acknowledgment: u32, now_ms: u64, duplicate_eligible: bool) ?TxSegment {
-        if (sequenceAfter(acknowledgment, self.send_next)) return null;
         if (!sequenceAfter(acknowledgment, self.send_una)) {
             if (duplicate_eligible and acknowledgment == self.send_una and self.tx_count != 0) {
                 self.duplicate_acks +|= 1;
@@ -250,6 +261,13 @@ pub const State = struct {
         }
         if (self.local_fin_sent and self.tx_count == 0) self.local_fin_acked = true;
         return null;
+    }
+
+    fn windowUpdateIsFresh(self: *const State, sequence: u32, acknowledgment: u32) bool {
+        return sequenceAfter(sequence, self.send_window_sequence) or
+            (sequence == self.send_window_sequence and
+                (acknowledgment == self.send_window_acknowledgment or
+                    sequenceAfter(acknowledgment, self.send_window_acknowledgment)));
     }
 
     fn discardAcknowledged(self: *State, acknowledgment: u32) void {
@@ -417,9 +435,36 @@ test "invalid ACK cannot release queued bytes" {
     _ = state.queueData("payload", 2);
     const before_una = state.send_una;
     const before_count = state.tx_count;
+    const before_window = state.send_window;
     _ = state.onSegment(2, state.send_next +% 100, .{ .ack = true }, 65535, 0, 3);
     try std.testing.expectEqual(before_una, state.send_una);
     try std.testing.expectEqual(before_count, state.tx_count);
+    try std.testing.expectEqual(before_window, state.send_window);
+}
+
+test "stale ACK cannot close a newer send window" {
+    var state = State.init(10, 100, 4096, 1000, 0);
+    _ = state.queueSynAck(0);
+    _ = state.onSegment(11, 101, .{ .ack = true }, 4096, 0, 1);
+    _ = state.onSegment(11, 101, .{ .ack = true }, 4096, 9, 2);
+    _ = state.queueData("first", 2);
+    _ = state.onSegment(20, 106, .{ .ack = true }, 8192, 0, 3);
+    try std.testing.expectEqual(@as(u32, 8192), state.send_window);
+
+    _ = state.onSegment(19, 106, .{ .ack = true }, 0, 0, 4);
+    try std.testing.expectEqual(@as(u32, 8192), state.send_window);
+    try std.testing.expectEqualStrings("next", state.queueData("next", 5).?.bytes());
+}
+
+test "fresh duplicate ACK can update the send window" {
+    var state = State.init(10, 100, 4096, 1000, 0);
+    _ = state.queueSynAck(0);
+    _ = state.onSegment(11, 101, .{ .ack = true }, 4096, 0, 1);
+
+    _ = state.onSegment(11, 101, .{ .ack = true }, 0, 0, 2);
+    try std.testing.expectEqual(@as(u32, 0), state.send_window);
+    _ = state.onSegment(11, 101, .{ .ack = true }, 8192, 0, 3);
+    try std.testing.expectEqual(@as(u32, 8192), state.send_window);
 }
 
 test "retransmission retry budget eventually terminates a flow" {

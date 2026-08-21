@@ -13,6 +13,9 @@ hold one maximum-MTU TCP payload, so memory is bounded independently of peer
 behavior. The engine limits new data by the smaller of the advertised receive
 window and a basic congestion window. A cumulative ACK releases slots and
 wakes blocked bridge writers. Partial ACKs trim the first queued segment.
+Advertised-window updates use TCP sequence and acknowledgment freshness, so a
+reordered or invalid ACK cannot overwrite a newer window and stall downlink
+traffic.
 
 The oldest unacknowledged SYN-ACK, data segment, or FIN is retransmitted after
 the RTO. The initial RTO is 300 ms, doubles to an 8-second ceiling, and gives
