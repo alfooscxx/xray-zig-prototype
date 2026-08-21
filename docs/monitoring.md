@@ -39,9 +39,10 @@ External workstation, NAS, or VPS
 
 ## Current Baseline (2026-08-21)
 
-This document is a target contract, not a claim that the control socket,
-Prometheus collector, ubus adapter, or LuCI application already exists. The
-current implementation provides the following observability building blocks:
+This document is the target contract. The native metrics registry, control
+socket, CLI frontend, OpenWrt collector command, read-only rpcd/ubus adapter,
+LuCI dashboard, and external Grafana assets are implemented. The current
+implementation provides the following observability building blocks:
 
 - FakeDNS, `sk_lookup`, VLESS/REALITY/Vision, raw-reactor, and SOCKHASH
   lifecycle events are available as low-rate process logs; there are no
@@ -53,6 +54,9 @@ current implementation provides the following observability building blocks:
   bytes, packets, and redirect errors for the process lifetime, independent of
   individual flow cleanup. These maps are not pinned and are recreated on
   every process start.
+- SK_LOOKUP maintains hit, miss, expiry, socket-assignment, pass, and drop
+  counters in the bounded per-CPU `xz_sk_count` ARRAY. The control snapshot
+  aggregates it through the FD owned by xray-zig; the map is not pinned.
 - The SOCKHASH userspace monitor owns duplicate socket FDs, observes FIN/RST,
   enforces idle timeout, and maintains exact flow capacity. It is lifecycle
   machinery rather than a general monitoring API.
@@ -68,11 +72,23 @@ current implementation provides the following observability building blocks:
   the complete test suite and AArch64 build. It still requires an isolated
   router field run before it becomes part of the production monitoring
   baseline.
+- The merged io_uring/SK_LOOKUP/SOCKHASH monitoring build was installed on the
+  AArch64 field router on 2026-08-21. The live control API reported readiness,
+  all four configured listeners, the io_uring raw reactor, compatible FakeDNS
+  pins, and all required BPF/SOCKHASH hooks. A certificate-verified 1 MiB HTTPS
+  SOCKS probe completed with HTTP 200 in 0.91 seconds. The collector returned a
+  15,713-byte bounded snapshot with zero SOCKHASH redirect errors.
+- The Internet A/B harness could not establish an independent numeric
+  monitoring overhead baseline while the production TUN policy was active:
+  its temporary LAN client was intentionally captured by the live TUN rules.
+  Production must not be stopped to run that benchmark. CPU, latency, and
+  throughput alert thresholds therefore remain intentionally unset until a
+  non-disruptive controlled-peer topology is available.
 
-There is no stable metrics registry or scrape endpoint yet. SK_LOOKUP has no
-dedicated hit/miss/expiry counter map, no TC observability program is attached,
-and no BPF ring buffer is present. Until the control API lands, logs and
-`bpftool` are test evidence, not a stable integration contract.
+The stable registry and bounded scrape operation are exposed through
+`/run/xray-zig/control.sock`. No TC observability program is attached and no
+BPF ring buffer is present. Logs and `bpftool` remain independent field-test
+oracles rather than integration interfaces.
 
 ## Ownership Boundaries
 
@@ -302,6 +318,15 @@ bpf-status
 diagnostic-snapshot
 ```
 
+The first implemented subset is `status`, `metrics`, `bpf-status`, and
+`recent-events`, with the CLI aliases `top`, `bpf`, and `events`. Requests and
+responses are capped at 256 bytes and 64 KiB respectively. Set
+`XRAY_ZIG_CONTROL_SOCKET` to override the socket path for isolated tests. Set
+`XRAY_ZIG_MONITORING=0` for the field A/B control arm; the API remains present
+and readiness/capacity gauges continue to work while userspace event and
+protocol traffic accounting is suppressed. The bounded BPF maps remain active
+in both arms so the dataplane program and offload lifecycle are identical.
+
 The protocol may be a small length-bounded request/response format or JSON
 lines. It must reject unknown fields, cap request and response sizes, avoid
 long-lived subscriptions initially, and never execute arbitrary commands.
@@ -444,35 +469,46 @@ before measurements are available.
 
 ## Implementation Order
 
-1. Add an allocation-free internal metrics registry with counters, gauges, and
-   fixed histograms. Instrument the existing typed routing, DNS, Vision,
-   freedom, raw-reactor, and SOCKHASH transitions at their ownership points;
-   do not parse the current log text back into the process.
-2. Add an immutable bounded snapshot that combines the registry with direct
-   reads of the already-owned FakeDNS/SK_LOOKUP/SOCKHASH maps. Cross-check
-   SOCKHASH flow-close totals against `xz_sh_total` and expose map capacities,
-   not raw keys or domain metadata.
-3. Add the root-controlled Unix socket plus `xray-zig ctl status`, `metrics`,
-   `bpf`, and bounded `events`. Readiness must cover required BPF links,
-   SOCKHASH monitor state, FakeDNS pin compatibility, and capacity invariants.
-4. Convert the SK_LOOKUP and SOCKHASH field harnesses to assert the control API
-   while retaining `bpftool`, log, and client-byte checks as independent test
-   oracles. Add a monitoring-disabled/enabled A/B arm for CPU, throughput, RSS,
-   latency, scrape size, and scrape time.
-5. Add missing SK_LOOKUP counters only after the stable metrics enum exists.
-   Prefer bounded per-CPU counters; add rare-event buffering only for errors.
-   Do not attach TC solely for observability before a TC interface/configuration
-   contract exists.
-6. Package an OpenWrt system exporter and an xray-zig Prometheus collector. The
-   collector queries the Unix socket and does not require BPF filesystem access.
-7. Add the rpcd/ubus adapter and a read-only LuCI overview, then DNS, FakeDNS,
-   REALITY/Vision, traffic, and diagnostic views. Keep administrative service,
-   firewall, and firmware operations outside the monitoring API.
-8. Add external Grafana dashboards and alerts only after field baselines exist.
-   Vision eligibility and freedom admission must have separate denominators.
-   A future UDP path must reuse the fixed `network=udp` dimension and add
-   datagram, idle-expiry, and error accounting only after its kernel capability
-   and bidirectional field tests pass.
+1. **Implemented.** Add an allocation-free internal metrics registry with
+   counters, gauges, and fixed histograms. Instrument the existing typed
+   routing, DNS, Vision, freedom, raw-reactor, and SOCKHASH transitions at
+   their ownership points; do not parse the current log text back into the
+   process.
+2. **Implemented for owned FakeDNS state and direct SOCKHASH aggregate
+   reads.** Add an immutable bounded snapshot that combines the registry with
+   direct reads of the already-owned FakeDNS/SK_LOOKUP/SOCKHASH maps.
+   Cross-check SOCKHASH flow-close totals against `xz_sh_total` and expose map
+   capacities, not raw keys or domain metadata.
+3. **Implemented for the initial read-only operations.** Add the
+   root-controlled Unix socket plus `xray-zig ctl status`, `metrics`, `bpf`,
+   and bounded `events`. Readiness must cover required BPF links, SOCKHASH
+   monitor state, FakeDNS pin compatibility, and capacity invariants.
+4. **Implemented in the isolated WAN/SOCKHASH harness.** Convert the SK_LOOKUP
+   and SOCKHASH field harnesses to assert the control API while retaining
+   `bpftool`, log, and client-byte checks as independent test oracles. Add a
+   monitoring-disabled/enabled A/B arm for CPU, throughput, RSS, latency,
+   scrape size, and scrape time.
+5. **Implemented without TC or a ring buffer.** Add missing SK_LOOKUP counters
+   only after the stable metrics enum exists. Prefer bounded per-CPU counters;
+   add rare-event buffering only for errors. Do not attach TC solely for
+   observability before a TC interface/configuration contract exists.
+6. **Collector command implemented; system metrics remain owned by the
+   existing OpenWrt exporter.** Package an OpenWrt system exporter and an
+   xray-zig Prometheus collector. The collector queries the Unix socket and
+   does not require BPF filesystem access.
+7. **Implemented for the bounded read-only API.** The rpcd/ubus adapter and
+   LuCI dashboard cover overview, traffic, DNS/FakeDNS, REALITY/Vision, eBPF,
+   capacity, and recent events. The backend exposes no shell or administrative
+   operation. Route/DNS probes and diagnostic bundles remain gated on explicit
+   native control operations with strict input schemas.
+8. **Implemented for visualization and correctness invariants.** The external
+   Grafana dashboard keeps Vision eligibility and offload admission separate.
+   Alerts cover readiness, missing metrics, required BPF hooks, capacity
+   rejection, and redirect errors. Empirical performance/rate thresholds remain
+   unset until a non-disruptive repeatable A/B baseline exists. A future UDP
+   path must reuse the fixed `network=udp` dimension and add datagram,
+   idle-expiry, and error accounting only after its kernel capability and
+   bidirectional field tests pass.
 
 ## References
 

@@ -6,6 +6,7 @@ const net = Io.net;
 const linux = std.os.linux;
 const posix = std.posix;
 const diagnostics = @import("../diagnostics.zig");
+const monitoring = @import("../monitoring.zig");
 
 const buffer_size = 16 * 1024;
 const connection_idle_timeout_ns = 300 * std.time.ns_per_s;
@@ -197,12 +198,14 @@ pub const Reactor = struct {
             self.ring_live = false;
             self.closeActiveList(active_head);
             self.closePendingList(self.pending_head.swap(null, .acquire));
+            monitoring.registry.setRawActive(0);
         }
 
         while (!self.stopped.load(.acquire)) {
             try Io.checkCancel(self.io);
             self.takePending(&active_head);
             self.serviceAll(&active_head);
+            monitoring.registry.setRawActive(self.active_count);
             diagnostics.setRawReactorCount(self.active_count);
             try self.armOperations(active_head);
             _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
@@ -287,6 +290,7 @@ pub const Reactor = struct {
                 connection.client_recv_pending = false;
                 if (result > 0) {
                     connection.client_to_upstream.end = @intCast(result);
+                    monitoring.registry.addRawBytes(.uplink, @intCast(result));
                     connection.last_activity = Io.Timestamp.now(self.io, .awake);
                 } else if (result == 0) connection.client_eof = true else if (!canceled) connection.failed = true;
             },
@@ -294,6 +298,7 @@ pub const Reactor = struct {
                 connection.upstream_recv_pending = false;
                 if (result > 0) {
                     connection.upstream_to_client.end = @intCast(result);
+                    monitoring.registry.addRawBytes(.downlink, @intCast(result));
                     connection.last_activity = Io.Timestamp.now(self.io, .awake);
                 } else if (result == 0) connection.upstream_eof = true else if (!canceled) connection.failed = true;
             },
@@ -331,6 +336,7 @@ pub const Reactor = struct {
         while (pending) |connection| {
             const next = connection.next;
             if (self.active_count >= self.max_connections) {
+                monitoring.registry.connectionRejected(@intCast(Io.Timestamp.now(self.io, .awake).nanoseconds));
                 self.closePending(connection);
             } else {
                 connection.next = active_head.*;

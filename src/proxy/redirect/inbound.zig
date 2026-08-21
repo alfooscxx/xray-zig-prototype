@@ -6,6 +6,7 @@ const net = Io.net;
 const config = @import("../../config/mod.zig");
 const fakedns = @import("../../dns/fakedns.zig");
 const log = @import("../../log.zig");
+const monitoring = @import("../../monitoring.zig");
 const session = @import("../../net/session.zig");
 const sniff = @import("../../net/sniff.zig");
 
@@ -33,6 +34,8 @@ pub fn run(inbound: config.Inbound, dispatcher: session.Dispatcher, fake_dns: ?*
     };
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
+    monitoring.registry.listenerStarted();
+    defer monitoring.registry.listenerStopped();
     var group: Io.Group = .init;
     defer group.cancel(io);
 

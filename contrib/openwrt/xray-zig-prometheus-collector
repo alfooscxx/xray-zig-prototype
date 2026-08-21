@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+binary=${XRAY_ZIG_BINARY:-/usr/bin/xray-zig}
+socket=${XRAY_ZIG_CONTROL_SOCKET:-/run/xray-zig/control.sock}
+
+[ -x "$binary" ] || {
+    echo "xray-zig collector: binary is not executable: $binary" >&2
+    exit 1
+}
+[ -S "$socket" ] || {
+    echo "xray-zig collector: control socket is unavailable: $socket" >&2
+    exit 1
+}
+
+exec "$binary" ctl metrics --socket "$socket"

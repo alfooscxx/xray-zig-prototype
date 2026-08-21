@@ -5,6 +5,7 @@ const net = Io.net;
 const config = @import("../../config/mod.zig");
 const diagnostics = @import("../../diagnostics.zig");
 const log = @import("../../log.zig");
+const monitoring = @import("../../monitoring.zig");
 const session = @import("../../net/session.zig");
 const sockhash = @import("../sk_lookup/sockhash.zig");
 pub const vision = @import("vision.zig");
@@ -34,11 +35,16 @@ pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: sessio
     };
     logTarget(connection_id, sess.target);
 
+    const handshake_started = nowNs(io);
+    monitoring.registry.realityStart();
     var upstream: session.OutboundConnection = undefined;
     connect(&upstream, outbound, settings, handshake_slots, io) catch |err| {
+        monitoring.registry.realityEnd(.server_response, false, nowNs(io) -| handshake_started);
+        monitoring.registry.addEvent(.reality_failure, .none, nowNs(io));
         log.warn("vless {d} REALITY initialization failed: {s}\n", .{ connection_id, @errorName(err) });
         return err;
     };
+    monitoring.registry.realityEnd(.established, true, nowNs(io) -| handshake_started);
     defer upstream.close(io);
     log.trace("vless {d} reality-ready\n", .{connection_id});
 
@@ -58,9 +64,11 @@ pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: sessio
         try upstream.flush();
         diagnostics.setThreadName("xz-vless-wait");
         waitResponseHeader(client, &upstream, &traffic_state, io) catch |err| {
+            monitoring.registry.realityOutcome(.vless_response_header, false);
             log.warn("vless {d} response wait failed: {s}\n", .{ connection_id, @errorName(err) });
             return err;
         };
+        monitoring.registry.realityOutcome(.vless_response_header, true);
         log.trace("vless {d} response-ready\n", .{connection_id});
         logEstablished(connection_id, sess.target, traffic_state.is_tls);
         diagnostics.setThreadName("xz-vision-scan");
@@ -74,6 +82,11 @@ pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: sessio
     try readResponseHeader(&upstream, io);
 
     try session.bridgeOutbound(client, &upstream, io);
+}
+
+fn nowNs(io: Io) u64 {
+    const value = Io.Timestamp.now(io, .awake).nanoseconds;
+    return if (value > 0) @intCast(value) else 0;
 }
 
 fn logEstablished(connection_id: u32, target: session.Target, client_tls: bool) void {

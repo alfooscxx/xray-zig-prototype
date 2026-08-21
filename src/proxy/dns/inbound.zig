@@ -7,6 +7,7 @@ const dns_client = @import("../../dns/client.zig");
 const fakedns = @import("../../dns/fakedns.zig");
 const dns_protocol = @import("../../dns/protocol.zig");
 const log = @import("../../log.zig");
+const monitoring = @import("../../monitoring.zig");
 const session = @import("../../net/session.zig");
 
 pub const Error = error{
@@ -45,6 +46,8 @@ pub fn run(
     var address = try bindAddress(inbound.listen, inbound.port);
     var socket = try address.bind(io, .{ .mode = .dgram, .protocol = .udp });
     defer socket.close(io);
+    monitoring.registry.listenerStarted();
+    defer monitoring.registry.listenerStopped();
 
     {
         try log_mutex.lock(io);
@@ -106,6 +109,17 @@ fn handleMessage(
     dispatcher: session.Dispatcher,
     io: Io,
 ) !void {
+    const started_ns = fakedns.monotonicNowNs(io);
+    monitoring.registry.dnsStart();
+    var metric_qtype: monitoring.Qtype = .other;
+    var metric_resolver: ?[]const u8 = null;
+    var metric_result: monitoring.DnsResult = .format_error;
+    defer monitoring.registry.dnsEnd(
+        metric_qtype,
+        metric_resolver,
+        metric_result,
+        fakedns.monotonicNowNs(io) -| started_ns,
+    );
     var response_buffer: [4096]u8 = undefined;
     var name_buffer: [255]u8 = undefined;
 
@@ -114,11 +128,17 @@ fn handleMessage(
         try socket.send(io, &client_address, response);
         return;
     };
+    metric_qtype = switch (question.qtype) {
+        dns_protocol.qtype_a => .a,
+        dns_protocol.qtype_aaaa => .aaaa,
+        else => .other,
+    };
 
     if (fake_dns) |store| {
         const fake_dns_config = dns_config.fake_dns.?;
         if (question.qclass == dns_protocol.qclass_in and question.qtype == dns_protocol.qtype_a) {
             const fake_ip = store.resolveA(question.name, io) catch |err| {
+                metric_result = .servfail;
                 log.warn("FakeDNS A allocation for {s} failed: {s}\n", .{ question.name, @errorName(err) });
                 const response = try dns_protocol.buildErrorResponse(&response_buffer, packet, .server_failure);
                 try socket.send(io, &client_address, response);
@@ -126,11 +146,13 @@ fn handleMessage(
             };
             const response = try dns_protocol.buildAResponse(&response_buffer, question, fake_ip, fake_dns_config.ttl);
             try socket.send(io, &client_address, response);
+            metric_result = .success;
             return;
         }
 
         if (question.qclass == dns_protocol.qclass_in and question.qtype == dns_protocol.qtype_aaaa) {
             const fake_ip = store.resolveAAAA(question.name, io) catch |err| {
+                metric_result = .servfail;
                 log.warn("FakeDNS AAAA allocation for {s} failed: {s}\n", .{ question.name, @errorName(err) });
                 const response = try dns_protocol.buildErrorResponse(&response_buffer, packet, .server_failure);
                 try socket.send(io, &client_address, response);
@@ -138,18 +160,22 @@ fn handleMessage(
             };
             const response = try dns_protocol.buildAAAAResponse(&response_buffer, question, fake_ip, fake_dns_config.ttl);
             try socket.send(io, &client_address, response);
+            metric_result = .success;
             return;
         }
     }
 
     const server = dns_config.selectServer(question.name);
+    metric_resolver = server.resolver;
     const forwarded = dns_client.exchange(packet, question.name, server, dispatcher, &response_buffer, io) catch |err| {
+        metric_result = if (err == error.Timeout) .timeout else .servfail;
         log.warn("dns query {s} via {s}/{s} failed: {s}\n", .{ question.name, server.resolver, server.outbound_tag, @errorName(err) });
         const response = try dns_protocol.buildErrorResponse(&response_buffer, packet, .server_failure);
         try socket.send(io, &client_address, response);
         return;
     };
     try socket.send(io, &client_address, forwarded);
+    metric_result = .success;
 }
 
 fn bindAddress(listen: []const u8, port: u16) !net.IpAddress {

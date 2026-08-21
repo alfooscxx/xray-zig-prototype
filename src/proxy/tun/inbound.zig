@@ -7,6 +7,7 @@ const posix = std.posix;
 const config = @import("../../config/mod.zig");
 const diagnostics = @import("../../diagnostics.zig");
 const log = @import("../../log.zig");
+const monitoring = @import("../../monitoring.zig");
 const session = @import("../../net/session.zig");
 const sniff = @import("../../net/sniff.zig");
 pub const packet = @import("packet.zig");
@@ -734,6 +735,8 @@ pub fn run(
     var tun_file = try Io.Dir.openFileAbsolute(io, "/dev/net/tun", .{ .mode = .read_write });
     defer tun_file.close(io);
     try attach(tun_file, settings.name);
+    monitoring.registry.listenerStarted();
+    defer monitoring.registry.listenerStopped();
 
     var device: Device = .{ .file = tun_file, .mtu = settings.mtu };
     var manager = try FlowManager.init(allocator, dispatcher, &device, settings.max_connections);

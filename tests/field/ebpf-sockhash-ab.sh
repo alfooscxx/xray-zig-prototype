@@ -30,10 +30,17 @@ grep -q '"sockhashOffload"' "$SOCKHASH_CONFIG" || {
     exit 1
 }
 
-echo "== raw-reactor control =="
-"$WAN_HARNESS" "$XRAY_BIN" "$CONTROL_CONFIG"
+run_arm() {
+    label=$1
+    monitoring=$2
+    config=$3
+    echo "== $label monitoring=$monitoring =="
+    XRAY_ZIG_MONITORING=$monitoring "$WAN_HARNESS" "$XRAY_BIN" "$config"
+}
 
-echo "== SOCKHASH candidate =="
-"$WAN_HARNESS" "$XRAY_BIN" "$SOCKHASH_CONFIG"
+run_arm "raw-reactor control" 0 "$CONTROL_CONFIG"
+run_arm "raw-reactor instrumented" 1 "$CONTROL_CONFIG"
+run_arm "SOCKHASH control" 0 "$SOCKHASH_CONFIG"
+run_arm "SOCKHASH instrumented" 1 "$SOCKHASH_CONFIG"
 
-echo "PASS: isolated raw-reactor/SOCKHASH A/B completed with independent namespace cleanup"
+echo "PASS: isolated raw-reactor/SOCKHASH and monitoring-disabled/enabled A/B completed with independent namespace cleanup"

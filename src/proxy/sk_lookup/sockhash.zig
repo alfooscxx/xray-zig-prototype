@@ -4,6 +4,7 @@ const Io = std.Io;
 const net = Io.net;
 
 const log = @import("../../log.zig");
+const monitoring = @import("../../monitoring.zig");
 const raw_reactor = @import("../../net/reactor.zig");
 
 const linux = std.os.linux;
@@ -187,6 +188,13 @@ pub const Dataplane = struct {
         return value;
     }
 
+    fn aggregateStats(self: *Dataplane) !AggregateStats {
+        const key: u32 = 0;
+        var value: AggregateStats = undefined;
+        try lookup(self.aggregate_fd, &key, &value);
+        return value;
+    }
+
     fn cleanup(self: *Dataplane, flow_id: u64, client_cookie: u64, upstream_cookie: u64, source_mask: u2) void {
         if (source_mask & 1 != 0) delete(self.sources_fd, &client_cookie);
         if (source_mask & 2 != 0) delete(self.sources_fd, &upstream_cookie);
@@ -308,6 +316,9 @@ pub const Manager = struct {
         const wake_rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
         if (linux.errno(wake_rc) != .SUCCESS) return error.SockhashMonitorCreateFailed;
 
+        monitoring.registry.sockhash_capacity.store(max_flows, .release);
+        monitoring.registry.bpf_sockhash_parser_up.store(true, .release);
+        monitoring.registry.bpf_sockhash_verdict_up.store(true, .release);
         return .{
             .allocator = allocator,
             .io = io,
@@ -321,6 +332,9 @@ pub const Manager = struct {
     }
 
     pub fn deinit(self: *Manager) void {
+        monitoring.registry.sockhash_monitor_up.store(false, .release);
+        monitoring.registry.bpf_sockhash_parser_up.store(false, .release);
+        monitoring.registry.bpf_sockhash_verdict_up.store(false, .release);
         self.stop();
         self.closePendingList(self.pending_head.swap(null, .acquire));
         closeFd(self.wake_fd);
@@ -345,6 +359,18 @@ pub const Manager = struct {
     }
 
     pub fn admitOwned(
+        self: *Manager,
+        client: net.Stream,
+        upstream: net.Stream,
+        reactor: *raw_reactor.Reactor,
+        owner: Owner,
+    ) Admission {
+        const result = self.admitOwnedInner(client, upstream, reactor, owner);
+        recordAdmission(owner, result, monotonicNowNs(self.io));
+        return result;
+    }
+
+    fn admitOwnedInner(
         self: *Manager,
         client: net.Stream,
         upstream: net.Stream,
@@ -488,6 +514,8 @@ pub const Manager = struct {
     }
 
     pub fn run(self: *Manager) Io.Cancelable!void {
+        monitoring.registry.sockhash_monitor_up.store(true, .release);
+        defer monitoring.registry.sockhash_monitor_up.store(false, .release);
         var active_head: ?*Flow = null;
         defer {
             self.closeActiveList(active_head);
@@ -541,7 +569,19 @@ pub const Manager = struct {
                     link = &flow.next;
                 }
             }
+            if (self.dataplane.aggregateStats()) |stats| {
+                monitoring.registry.sockhash_kernel_bytes.store(stats.bytes, .release);
+                monitoring.registry.sockhash_packets.store(stats.packets, .release);
+                monitoring.registry.sockhash_redirect_errors.store(stats.redirect_errors, .release);
+            } else |_| {}
         }
+    }
+
+    pub fn refreshMonitoring(self: *Manager) void {
+        const stats = self.dataplane.aggregateStats() catch return;
+        monitoring.registry.sockhash_kernel_bytes.store(stats.bytes, .release);
+        monitoring.registry.sockhash_packets.store(stats.packets, .release);
+        monitoring.registry.sockhash_redirect_errors.store(stats.redirect_errors, .release);
     }
 
     fn serviceFlow(self: *Manager, flow: *Flow, client_events: i16, upstream_events: i16) void {
@@ -631,6 +671,13 @@ pub const Manager = struct {
                 flow.lifecycle.reset,
             },
         );
+        monitoring.registry.offloadClosed(
+            monitoringOwner(flow.owner),
+            client_stats.bytes,
+            upstream_stats.bytes,
+            client_stats.redirect_errors +| upstream_stats.redirect_errors,
+            monotonicNowNs(self.io),
+        );
         self.dataplane.cleanup(
             flow.flow_id,
             flow.client_cookie,
@@ -680,6 +727,30 @@ pub const Manager = struct {
         }
     }
 };
+
+fn recordAdmission(owner: Owner, admission: Admission, now_ns: u64) void {
+    const metric_owner = monitoringOwner(owner);
+    switch (admission) {
+        .offloaded => monitoring.registry.offload(metric_owner, .offloaded, .none, now_ns),
+        .fallback => |reason| monitoring.registry.offload(metric_owner, .raw_fallback, monitoringReason(reason), now_ns),
+        .hybrid_raw => |reason| monitoring.registry.offload(metric_owner, .hybrid_raw, monitoringReason(reason), now_ns),
+        .terminal => |reason| monitoring.registry.offload(metric_owner, .failed_closed, monitoringReason(reason), now_ns),
+    }
+}
+
+fn monitoringOwner(owner: Owner) monitoring.Owner {
+    return switch (owner) {
+        .freedom => .freedom,
+        .vless_vision => .vless_vision,
+        .generic => .generic,
+    };
+}
+
+fn monitoringReason(reason: FallbackReason) monitoring.FallbackReason {
+    return switch (reason) {
+        inline else => |value| @enumFromInt(@as(usize, @intFromEnum(value)) + 1),
+    };
+}
 
 fn releaseHybrid(context: *anyopaque) void {
     const cleanup: *HybridCleanup = @ptrCast(@alignCast(context));

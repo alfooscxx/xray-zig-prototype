@@ -4,6 +4,7 @@ const Io = std.Io;
 const net = Io.net;
 
 const config = @import("../config/mod.zig");
+const control = @import("../control.zig");
 const diagnostics = @import("../diagnostics.zig");
 const log = @import("../log.zig");
 const fakedns = @import("../dns/fakedns.zig");
@@ -21,6 +22,7 @@ const sockhash = @import("../proxy/sk_lookup/sockhash.zig");
 const tun = @import("../proxy/tun/inbound.zig");
 const reality = @import("../transport/reality/client.zig");
 const vless = @import("../proxy/vless/outbound.zig");
+const monitoring = @import("../monitoring.zig");
 
 pub const Runtime = struct {
     cfg: *const config.Config,
@@ -28,10 +30,19 @@ pub const Runtime = struct {
     reactor_allocator: std.mem.Allocator = std.heap.page_allocator,
     raw_connection_limit: usize = 256,
     reality_handshake_slots: Io.Semaphore = .{ .permits = 32 },
+    monitoring_enabled: bool = true,
+    control_socket_path: []const u8 = control.default_socket_path,
     reactor: ?*raw_reactor.Reactor = null,
     sockhash_manager: ?*sockhash.Manager = null,
+    sk_lookup_state: ?*sk_lookup.Inbound = null,
 
     pub fn run(self: *Runtime, io: Io, log_writer: *Io.Writer) !void {
+        monitoring.registry.reset(
+            self.cfg,
+            self.monitoring_enabled,
+            control.nowNs(io),
+            self.raw_connection_limit,
+        );
         const dispatch_interface = self.dispatcher();
 
         var sk_lookup_inbound: ?sk_lookup.Inbound = null;
@@ -45,6 +56,8 @@ pub const Runtime = struct {
             break;
         }
         defer if (sk_lookup_inbound) |*inbound| inbound.deinit(io);
+        self.sk_lookup_state = if (sk_lookup_inbound) |*inbound| inbound else null;
+        defer self.sk_lookup_state = null;
 
         const fake_dns_publisher: fakedns.Publisher = if (sk_lookup_inbound) |*inbound|
             inbound.publisher()
@@ -66,6 +79,20 @@ pub const Runtime = struct {
         defer if (fake_dns_store) |*store| store.deinit();
 
         if (sk_lookup_inbound) |*inbound| try inbound.attach(io);
+        if (sk_lookup_inbound != null) {
+            monitoring.registry.bpf_sk_lookup_up.store(true, .release);
+            for (self.cfg.inbounds) |inbound| {
+                if (!std.mem.eql(u8, inbound.protocol, "sk_lookup")) continue;
+                const settings = inbound.sk_lookup.?;
+                monitoring.registry.bpf_fake_capacity.store(settings.max_map_entries, .release);
+                if (settings.fake_dns_persistence != null) {
+                    monitoring.registry.fakedns_persistence_configured.store(true, .release);
+                    monitoring.registry.fakedns_pin_compatible.store(true, .release);
+                }
+                break;
+            }
+        }
+        defer monitoring.registry.bpf_sk_lookup_up.store(false, .release);
 
         var log_mutex: Io.Mutex = .init;
         var reactor = try raw_reactor.Reactor.init(
@@ -89,6 +116,13 @@ pub const Runtime = struct {
         try group.concurrent(io, runRawReactor, .{ &reactor, &raw_failures, io });
         if (self.sockhash_manager) |manager|
             try group.concurrent(io, runSockhashManager, .{manager});
+        try group.concurrent(io, runControlServer, .{ control.Server{
+            .path = self.control_socket_path,
+            .dataplane = dataplaneName(self.cfg),
+            .version = @import("../version.zig").string,
+            .refresh_context = self,
+            .refresh_fn = refreshMonitoring,
+        }, io });
 
         for (self.cfg.inbounds) |inbound| {
             if (std.mem.eql(u8, inbound.protocol, "socks")) {
@@ -117,6 +151,9 @@ pub const Runtime = struct {
             return error.UnsupportedInboundProtocol;
         }
 
+        monitoring.registry.setReady(true, control.nowNs(io));
+        defer monitoring.registry.setReady(false, control.nowNs(io));
+
         const raw_failure = raw_failures.getOne(io) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.Closed => unreachable,
@@ -132,10 +169,23 @@ pub const Runtime = struct {
     }
 
     pub fn dispatch(self: *Runtime, client: net.Stream, sess: session.Session, preface: session.Preface, io: Io) !void {
-        const outbound = if (sess.outbound_tag) |tag|
-            self.cfg.findOutbound(tag) orelse return error.MissingOutboundTag
-        else
-            try routing.selectOutbound(self.cfg, sess);
+        monitoring.registry.connectionStart();
+        var selected_tag: ?[]const u8 = null;
+        var success = false;
+        var active_stage: monitoring.ConnectionStage = .dispatch;
+        defer monitoring.registry.connectionEnd(sess.inbound_tag, selected_tag, success, active_stage);
+        const outbound = if (sess.outbound_tag) |tag| blk: {
+            const selected = self.cfg.findOutbound(tag) orelse return error.MissingOutboundTag;
+            monitoring.registry.routingDecision(selected.tag orelse selected.protocol, false);
+            break :blk selected;
+        } else blk: {
+            const selection = try routing.selectOutboundWithMetadata(self.cfg, sess);
+            monitoring.registry.routingDecision(selection.outbound.tag orelse selection.outbound.protocol, selection.rule_index != null);
+            break :blk selection.outbound;
+        };
+        selected_tag = outbound.tag orelse outbound.protocol;
+        monitoring.registry.connectionMoveToOutbound();
+        active_stage = .outbound;
         const reactor = self.reactor orelse return error.RuntimeNotRunning;
         if (std.mem.eql(u8, outbound.protocol, "freedom")) {
             const fake_dns_config: ?config.DnsConfig = if (self.cfg.dns) |dns_cfg|
@@ -152,14 +202,17 @@ pub const Runtime = struct {
                 if (sess.allow_sockhash_offload) self.sockhash_manager else null,
                 io,
             );
+            success = true;
             return;
         }
         if (std.mem.eql(u8, outbound.protocol, "blackhole")) {
             try blackhole.handle(client, sess, preface, io);
+            success = true;
             return;
         }
         if (std.mem.eql(u8, outbound.protocol, "dns")) {
             try dns_outbound.handle(client, sess, preface, self.cfg.dns, io);
+            success = true;
             return;
         }
         if (std.mem.eql(u8, outbound.protocol, "vless")) {
@@ -173,6 +226,7 @@ pub const Runtime = struct {
                 if (sess.allow_sockhash_offload) self.sockhash_manager else null,
                 io,
             );
+            success = true;
             return;
         }
         return error.UnsupportedOutboundProtocol;
@@ -185,6 +239,8 @@ const RawReactorFailure = struct {
 
 fn runRawReactor(reactor: *raw_reactor.Reactor, failures: *Io.Queue(RawReactorFailure), io: Io) Io.Cancelable!void {
     diagnostics.setRawReactorCount(0);
+    monitoring.registry.raw_reactor_up.store(true, .release);
+    defer monitoring.registry.raw_reactor_up.store(false, .release);
     var failure: anyerror = error.RawReactorStopped;
     reactor.run() catch |err| switch (err) {
         error.Canceled => return error.Canceled,
@@ -195,6 +251,31 @@ fn runRawReactor(reactor: *raw_reactor.Reactor, failures: *Io.Queue(RawReactorFa
         error.Canceled => return error.Canceled,
         error.Closed => return,
     };
+}
+
+fn refreshMonitoring(context: *anyopaque) void {
+    const runtime: *Runtime = @ptrCast(@alignCast(context));
+    if (runtime.sk_lookup_state) |inbound| inbound.refreshMonitoring();
+    if (runtime.sockhash_manager) |manager| manager.refreshMonitoring();
+}
+
+fn runControlServer(server: control.Server, io: Io) Io.Cancelable!void {
+    server.run(io) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => {
+            log.warn("control API stopped: {s}\n", .{@errorName(err)});
+            return;
+        },
+    };
+}
+
+fn dataplaneName(cfg: *const config.Config) []const u8 {
+    for (cfg.inbounds) |inbound| {
+        if (std.mem.eql(u8, inbound.protocol, "sk_lookup")) return "sk_lookup";
+        if (std.mem.eql(u8, inbound.protocol, "tun")) return "tun";
+        if (std.mem.eql(u8, inbound.protocol, "redirect")) return "redirect";
+    }
+    return "userspace";
 }
 
 fn runSockhashManager(manager: *sockhash.Manager) Io.Cancelable!void {

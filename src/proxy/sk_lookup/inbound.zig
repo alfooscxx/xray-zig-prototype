@@ -6,6 +6,7 @@ const net = Io.net;
 const config = @import("../../config/mod.zig");
 const fakedns = @import("../../dns/fakedns.zig");
 const log = @import("../../log.zig");
+const monitoring = @import("../../monitoring.zig");
 const session = @import("../../net/session.zig");
 const bpf = @import("bpf.zig");
 const sockhash = @import("sockhash.zig");
@@ -83,6 +84,21 @@ pub const Inbound = struct {
         return if (self.sockhash_manager) |*manager| manager else null;
     }
 
+    pub fn refreshMonitoring(self: *const Inbound) void {
+        const snapshot = self.dataplane.counterSnapshot() catch return;
+        monitoring.registry.updateSkLookupCounters(
+            snapshot.get(.lookup_hit),
+            snapshot.get(.lookup_miss),
+            snapshot.get(.lookup_expiry),
+            snapshot.get(.assign4_success),
+            snapshot.get(.assign4_error),
+            snapshot.get(.assign6_success),
+            snapshot.get(.assign6_error),
+            snapshot.get(.pass),
+            snapshot.get(.drop),
+        );
+    }
+
     pub fn run(
         self: *Inbound,
         dispatcher: session.Dispatcher,
@@ -91,6 +107,8 @@ pub const Inbound = struct {
         log_writer: *Io.Writer,
         log_mutex: *Io.Mutex,
     ) !void {
+        monitoring.registry.listenerStarted();
+        defer monitoring.registry.listenerStopped();
         {
             try log_mutex.lock(io);
             defer log_mutex.unlock(io);

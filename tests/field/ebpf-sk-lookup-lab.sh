@@ -23,6 +23,7 @@ BPF_PROG_ID=
 BPF_MAP4_ID=
 BPF_MAP6_ID=
 BPF_LISTENERS_ID=
+BPF_COUNTERS_ID=
 
 assert_map4_entry() {
     bpftool map lookup id "$BPF_MAP4_ID" key hex c6 12 fe 01
@@ -107,7 +108,7 @@ if bpftool prog show name xz_sk_lookup 2>/dev/null | grep -q 'xz_sk_lookup'; the
     echo "refusing to run: BPF program name xz_sk_lookup already exists" >&2
     exit 1
 fi
-for map_name in xz_fake4 xz_fake6 xz_listeners; do
+for map_name in xz_fake4 xz_fake6 xz_listeners xz_sk_count; do
     if bpftool map show name "$map_name" 2>/dev/null | grep -q "$map_name"; then
         echo "refusing to run: BPF map name $map_name already exists" >&2
         exit 1
@@ -202,7 +203,8 @@ BPF_PROG_ID=$(bpftool prog show name xz_sk_lookup | sed -n 's/^\([0-9][0-9]*\):.
 BPF_MAP4_ID=$(bpftool map show name xz_fake4 | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
 BPF_MAP6_ID=$(bpftool map show name xz_fake6 | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
 BPF_LISTENERS_ID=$(bpftool map show name xz_listeners | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-[ -n "$BPF_PROG_ID" ] && [ -n "$BPF_MAP4_ID" ] && [ -n "$BPF_MAP6_ID" ] && [ -n "$BPF_LISTENERS_ID" ]
+BPF_COUNTERS_ID=$(bpftool map show name xz_sk_count | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
+[ -n "$BPF_PROG_ID" ] && [ -n "$BPF_MAP4_ID" ] && [ -n "$BPF_MAP6_ID" ] && [ -n "$BPF_LISTENERS_ID" ] && [ -n "$BPF_COUNTERS_ID" ]
 BPF_LINK_ID=$(bpftool link show | awk -v prog_id="$BPF_PROG_ID" '
     $0 ~ ("prog[[:space:]]+" prog_id "([[:space:]]|$)") {
         gsub(":", "", $1)
@@ -213,6 +215,7 @@ BPF_LINK_ID=$(bpftool link show | awk -v prog_id="$BPF_PROG_ID" '
 [ -n "$BPF_LINK_ID" ]
 bpftool prog show id "$BPF_PROG_ID" | grep -q 'sk_lookup'
 bpftool link show id "$BPF_LINK_ID" | grep -Eq "prog[[:space:]]+$BPF_PROG_ID([[:space:]]|$)"
+bpftool map show id "$BPF_COUNTERS_ID" | grep -q 'percpu_array'
 if ip -n "$ROUTER_NS" route show dev "$TUN_IF" | grep -q .; then
     echo "test TUN unexpectedly owns an IPv4 route" >&2
     exit 1
@@ -257,6 +260,7 @@ XRAY_PID=
 ! bpftool map show id "$BPF_MAP4_ID" >/dev/null 2>&1
 ! bpftool map show id "$BPF_MAP6_ID" >/dev/null 2>&1
 ! bpftool map show id "$BPF_LISTENERS_ID" >/dev/null 2>&1
+! bpftool map show id "$BPF_COUNTERS_ID" >/dev/null 2>&1
 ! ip netns exec "$ROUTER_NS" bpftool prog show id "$BPF_PROG_ID" >/dev/null 2>&1
 
 echo "PASS: isolated FakeDNS -> SK_LOOKUP IPv4/IPv6, miss/expiry, TUN coexistence, and FD cleanup"

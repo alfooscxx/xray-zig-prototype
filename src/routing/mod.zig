@@ -8,14 +8,29 @@ pub const SelectError = error{
     MissingOutboundTag,
 };
 
+pub const Selection = struct {
+    outbound: *const config.Outbound,
+    rule_index: ?usize,
+};
+
 pub fn selectOutbound(cfg: *const config.Config, sess: session.Session) SelectError!*const config.Outbound {
-    for (cfg.routing.rules) |rule| {
+    return (try selectOutboundWithMetadata(cfg, sess)).outbound;
+}
+
+pub fn selectOutboundWithMetadata(cfg: *const config.Config, sess: session.Session) SelectError!Selection {
+    for (cfg.routing.rules, 0..) |rule, rule_index| {
         if (!ruleMatchesSession(rule, sess)) continue;
-        return cfg.findOutbound(rule.outbound_tag) orelse error.MissingOutboundTag;
+        return .{
+            .outbound = cfg.findOutbound(rule.outbound_tag) orelse return error.MissingOutboundTag,
+            .rule_index = rule_index,
+        };
     }
 
     const tag = cfg.defaultOutboundTag() orelse return error.MissingDefaultOutbound;
-    return cfg.findOutbound(tag) orelse error.MissingOutboundTag;
+    return .{
+        .outbound = cfg.findOutbound(tag) orelse return error.MissingOutboundTag,
+        .rule_index = null,
+    };
 }
 
 fn ruleMatchesSession(rule: config.RouteRule, sess: session.Session) bool {

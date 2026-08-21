@@ -1,0 +1,13 @@
+{
+  "luci-app-xray-zig": {
+    "description": "Read xray-zig monitoring snapshots",
+    "read": {
+      "ubus": {
+        "luci.xray-zig": [
+          "snapshot",
+          "events"
+        ]
+      }
+    }
+  }
+}

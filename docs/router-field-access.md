@@ -44,6 +44,14 @@ records. They do not authorize deploying to the bridge.
 5. Stop only processes started by the test and remove every temporary route,
    address, interface, process, and file when it completes or fails.
 
+Never stop the live xray-zig service to make a field harness pass or to deploy a
+replacement. Tests must coexist with the running service or be deferred. Stage
+each deployment file beside its destination on the same filesystem, set its
+final ownership and mode, then replace the destination with one atomic rename.
+Do not roll back the monitored primary replica after it has been installed.
+Service, firewall, policy-routing, and boot-state changes are not deployment
+shortcuts and still require their own explicit operator request.
+
 For TUN probes, also protect the proxy server route so the outbound REALITY
 connection cannot be captured by the TUN route. UDP must remain disabled when
 the requested field test is TCP-only.

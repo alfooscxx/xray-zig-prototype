@@ -24,10 +24,20 @@ zig_pid=""
 echo_pid=""
 
 cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ "${status}" -ne 0 ]]; then
+    for log_file in "${tmp_dir}"/xray-zig-*.log; do
+      [[ -f "${log_file}" ]] || continue
+      echo "== ${log_file##*/} ==" >&2
+      sed -n '1,240p' "${log_file}" >&2
+    done
+  fi
   if [[ -n "${zig_pid}" ]]; then kill "${zig_pid}" 2>/dev/null || true; fi
   if [[ -n "${xray_pid}" ]]; then kill "${xray_pid}" 2>/dev/null || true; fi
   if [[ -n "${echo_pid}" ]]; then kill "${echo_pid}" 2>/dev/null || true; fi
   rm -rf "${tmp_dir}"
+  exit "${status}"
 }
 trap cleanup EXIT
 

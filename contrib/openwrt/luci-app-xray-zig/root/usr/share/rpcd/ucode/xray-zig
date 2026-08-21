@@ -1,0 +1,72 @@
+'use strict';
+
+import { popen } from 'fs';
+
+const MAX_RESPONSE = 64 * 1024;
+
+function control_request(operation) {
+	let commands = {
+		status: '/usr/bin/xray-zig ctl status',
+		'bpf-status': '/usr/bin/xray-zig ctl bpf',
+		metrics: '/usr/bin/xray-zig ctl metrics',
+		'recent-events 16': '/usr/bin/xray-zig ctl events --limit 16'
+	};
+	let command = commands[operation];
+	if (!command)
+		return { error: 'unknown_operation' };
+
+	let pipe = popen(command);
+	if (!pipe)
+		return { error: 'control_unavailable' };
+
+	let response = pipe.read(MAX_RESPONSE + 1) ?? '';
+	pipe.close();
+	if (length(response) > MAX_RESPONSE)
+		return { error: 'response_too_large' };
+
+	return { text: response };
+}
+
+function json_request(operation) {
+	let response = control_request(operation);
+	if (response.error)
+		return response;
+
+	try {
+		return json(trim(response.text));
+	}
+	catch (e) {
+		return { error: 'invalid_control_response' };
+	}
+}
+
+return {
+	'luci.xray-zig': {
+		snapshot: {
+			call: function() {
+				let status = json_request('status');
+				let bpf = json_request('bpf-status');
+				let events = json_request('recent-events 16');
+				let metrics = control_request('metrics');
+
+				return {
+					status,
+					bpf,
+					events: events.events ?? [],
+					metrics: metrics.text ?? '',
+					error: status.error ?? bpf.error ?? events.error ?? metrics.error
+				};
+			}
+		},
+		events: {
+			args: { limit: 16 },
+			call: function(request) {
+				let limit = int(request.args.limit ?? 16);
+				if (limit != 16)
+					return { error: 'invalid_limit' };
+
+				return json_request('recent-events 16');
+			}
+		}
+	}
+};

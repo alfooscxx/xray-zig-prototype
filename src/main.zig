@@ -55,6 +55,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "ctl")) {
+        try runControlClient(args[2..], init.environ_map, io, stdout, stderr);
+        return;
+    }
+
     const config_path = findConfigPath(args[2..]) orelse {
         try stderr.print("missing -config <path>\n\n", .{});
         try usage(stderr);
@@ -108,6 +113,8 @@ pub fn main(init: std.process.Init) !void {
             // them should unmap their storage instead of retaining it in the
             // ReleaseFast SMP allocator's caches.
             .reactor_allocator = std.heap.page_allocator,
+            .monitoring_enabled = monitoringEnabled(init.environ_map),
+            .control_socket_path = init.environ_map.get("XRAY_ZIG_CONTROL_SOCKET") orelse xray.control.default_socket_path,
         };
         try runtime.run(io, stdout);
         return;
@@ -284,9 +291,58 @@ fn usage(writer: *Io.Writer) !void {
         \\  xray-zig check -config <path>
         \\  xray-zig run -config <path>
         \\  xray-zig fakedns-unpin -config <path>
+        \\  xray-zig ctl status|top|metrics|bpf|events [--limit N] [--socket <path>]
         \\  xray-zig version
         \\
     );
+}
+
+fn monitoringEnabled(environ: *const std.process.Environ.Map) bool {
+    const value = environ.get("XRAY_ZIG_MONITORING") orelse return true;
+    return !std.mem.eql(u8, value, "0") and
+        !std.ascii.eqlIgnoreCase(value, "false") and
+        !std.ascii.eqlIgnoreCase(value, "off");
+}
+
+fn runControlClient(
+    args: []const []const u8,
+    environ: *const std.process.Environ.Map,
+    io: Io,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) !void {
+    if (args.len == 0) {
+        try usage(stderr);
+        std.process.exit(2);
+    }
+    const operation = args[0];
+    var socket_path = environ.get("XRAY_ZIG_CONTROL_SOCKET") orelse xray.control.default_socket_path;
+    var limit: ?usize = null;
+    var index: usize = 1;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--socket")) {
+            if (index + 1 >= args.len) return error.MissingControlSocketPath;
+            socket_path = args[index + 1];
+            index += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, args[index], "--limit")) {
+            if (index + 1 >= args.len) return error.MissingEventLimit;
+            limit = try std.fmt.parseUnsigned(usize, args[index + 1], 10);
+            index += 2;
+            continue;
+        }
+        return error.UnknownControlOption;
+    }
+
+    var request_buffer: [xray.control.max_request_bytes]u8 = undefined;
+    const request = if (std.mem.eql(u8, operation, "events"))
+        try std.fmt.bufPrint(&request_buffer, "events {d}", .{limit orelse 50})
+    else blk: {
+        if (limit != null) return error.EventLimitRequiresEvents;
+        break :blk try std.fmt.bufPrint(&request_buffer, "{s}", .{operation});
+    };
+    try xray.control.runClient(io, socket_path, request, stdout);
 }
 
 fn findConfigPath(args: []const []const u8) ?[]const u8 {

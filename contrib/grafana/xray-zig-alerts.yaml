@@ -1,0 +1,48 @@
+groups:
+  - name: xray-zig-correctness
+    interval: 30s
+    rules:
+      - alert: XrayZigNotReady
+        expr: xray_zig_ready != 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: xray-zig is not ready
+          description: The local runtime readiness invariant has failed for two minutes.
+
+      - alert: XrayZigMetricsMissing
+        expr: absent(xray_zig_ready)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: xray-zig metrics are missing
+          description: The collector or control socket has not produced a readiness sample.
+
+      - alert: XrayZigRequiredBpfHookDown
+        expr: min by (instance) (xray_zig_bpf_program_up{hook=~"sk_lookup|sockhash_parser|sockhash_verdict"}) < 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: A required xray-zig BPF hook is down
+          description: At least one required SK_LOOKUP or SOCKHASH program is unavailable.
+
+      - alert: XrayZigSockhashRedirectError
+        expr: increase(xray_zig_bpf_sockhash_redirect_errors_total{network="tcp"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: SOCKHASH redirect errors increased
+          description: Kernel stream redirection reported at least one new error in five minutes.
+
+      - alert: XrayZigCapacityRejection
+        expr: increase(xray_zig_connection_rejections_total{reason="capacity"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: xray-zig rejected a connection at capacity
+          description: At least one connection was rejected by a bounded runtime capacity limit.
