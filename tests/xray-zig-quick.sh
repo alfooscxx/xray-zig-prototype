@@ -31,6 +31,14 @@ command=$1
 config=$3
 case $command in
 check)
+    if [ "${config##*/}" = socks.json ]; then
+        cat <<'SUMMARY'
+config ok: 1 inbound(s), 1 outbound(s)
+inbound socks-in: socks on 127.0.0.1:1080
+outbound direct: freedom
+SUMMARY
+        exit 0
+    fi
     cat <<'SUMMARY'
 config ok: 3 inbound(s), 1 outbound(s)
 inbound redirect-ipv4: redirect on 0.0.0.0:12345
@@ -41,7 +49,9 @@ SUMMARY
     ;;
 run)
     trap 'exit 0' TERM INT
-    if [ "${config##*/}" != fail.json ]; then
+    if [ "${config##*/}" = socks.json ]; then
+        echo 'socks inbound socks-in listening on 127.0.0.1:1080'
+    elif [ "${config##*/}" != fail.json ]; then
         echo 'redirect inbound redirect-ipv4 listening on 0.0.0.0:12345'
         echo 'redirect inbound redirect-ipv6 listening on :::12346'
         echo 'dns inbound dns-in listening on 0.0.0.0:15353'
@@ -66,6 +76,7 @@ chmod +x "$bin_dir/xray-zig" "$bin_dir/iptables" "$bin_dir/ip6tables"
 
 : >"$test_dir/xray.json"
 : >"$test_dir/fail.json"
+: >"$test_dir/socks.json"
 cat >"$test_dir/router.conf" <<EOF
 Config = xray.json
 Binary = $bin_dir/xray-zig
@@ -122,6 +133,19 @@ if run_quick status router >/dev/null 2>&1; then
 fi
 grep -q 'iptables -t nat -D PREROUTING -i br-lan -j XZQ_' "$firewall_log"
 grep -q 'ip6tables -t nat -X XZQ_' "$firewall_log"
+
+: >"$firewall_log"
+cat >"$test_dir/socks.conf" <<EOF
+Config = socks.json
+Binary = $bin_dir/xray-zig
+LogFile = $test_dir/socks.log
+EOF
+check_output=$(run_quick check "$test_dir/socks.conf")
+printf '%s\n' "$check_output" | grep -q 'lan=off ipv4_redirect=off ipv6_redirect=off'
+run_quick up "$test_dir/socks.conf" >/dev/null
+run_quick status socks | grep -q 'socks is up (.*lan off)'
+test ! -s "$firewall_log"
+run_quick down socks >/dev/null
 
 sed 's/Config = xray.json/Config = fail.json/' "$test_dir/router.conf" >"$test_dir/fail.conf"
 if run_quick up "$test_dir/fail.conf" >/dev/null 2>&1; then

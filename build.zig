@@ -85,4 +85,17 @@ pub fn build(b: *std.Build) void {
     const install_ebpf_lab_peer = b.addInstallArtifact(ebpf_lab_peer, .{});
     const ebpf_lab_peer_step = b.step("ebpf-lab-peer", "Build the isolated SK_LOOKUP lab peer");
     ebpf_lab_peer_step.dependOn(&install_ebpf_lab_peer.step);
+
+    const ebpf_sockhash_selftest = b.addExecutable(.{
+        .name = "ebpf-sockhash-selftest",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/field/ebpf-sockhash-selftest.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "xray_zig", .module = mod }},
+        }),
+    });
+    const install_ebpf_sockhash_selftest = b.addInstallArtifact(ebpf_sockhash_selftest, .{});
+    const ebpf_sockhash_selftest_step = b.step("ebpf-sockhash-selftest", "Build the privileged TCP SOCKHASH capability selftest");
+    ebpf_sockhash_selftest_step.dependOn(&install_ebpf_sockhash_selftest.step);
 }

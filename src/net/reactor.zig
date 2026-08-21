@@ -40,8 +40,23 @@ const Connection = struct {
     upstream_send_shutdown: bool = false,
     client_send_shutdown: bool = false,
     failed: bool = false,
+    cleanup: ?Cleanup = null,
     last_activity: Io.Timestamp,
     next: ?*Connection = null,
+};
+
+pub const Cleanup = struct {
+    context: *anyopaque,
+    callback: *const fn (*anyopaque) void,
+    health_callback: ?*const fn (*anyopaque) bool = null,
+
+    fn run(self: Cleanup) void {
+        self.callback(self.context);
+    }
+
+    fn healthy(self: Cleanup) bool {
+        return if (self.health_callback) |callback| callback(self.context) else true;
+    }
 };
 
 pub const Reactor = struct {
@@ -98,6 +113,15 @@ pub const Reactor = struct {
     }
 
     pub fn adoptDuplicate(self: *Reactor, client: net.Stream, upstream: net.Stream) !void {
+        try self.adoptDuplicateWithCleanup(client, upstream, null);
+    }
+
+    pub fn adoptDuplicateWithCleanup(
+        self: *Reactor,
+        client: net.Stream,
+        upstream: net.Stream,
+        cleanup: ?Cleanup,
+    ) !void {
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
         if (self.stopped.load(.acquire)) return error.ReactorStopped;
 
@@ -114,6 +138,7 @@ pub const Reactor = struct {
             .client = client_copy,
             .upstream = upstream_copy,
             .last_activity = Io.Timestamp.now(self.io, .awake),
+            .cleanup = cleanup,
         };
 
         self.pushPending(connection);
@@ -183,6 +208,12 @@ pub const Reactor = struct {
                 const connection = self.poll_connections[index];
                 const client_events = self.poll_fds[index * 2 + 1].revents;
                 const upstream_events = self.poll_fds[index * 2 + 2].revents;
+                if (connection.cleanup) |cleanup| {
+                    if (!cleanup.healthy()) {
+                        connection.failed = true;
+                        continue;
+                    }
+                }
                 if (service(connection, client_events, upstream_events)) {
                     connection.last_activity = now;
                 }
@@ -235,6 +266,7 @@ pub const Reactor = struct {
     }
 
     fn closeConnection(self: *Reactor, connection: *Connection) void {
+        if (connection.cleanup) |cleanup| cleanup.run();
         connection.client.close(self.io);
         connection.upstream.close(self.io);
         self.allocator.destroy(connection);
@@ -242,6 +274,7 @@ pub const Reactor = struct {
     }
 
     fn closePending(self: *Reactor, connection: *Connection) void {
+        if (connection.cleanup) |cleanup| cleanup.run();
         connection.client.close(self.io);
         connection.upstream.close(self.io);
         self.allocator.destroy(connection);
@@ -417,4 +450,43 @@ test "raw connection idle timeout uses monotonic activity" {
         &connection,
         .fromNanoseconds(10 + connection_idle_timeout_ns),
     ));
+}
+
+test "raw reactor cleanup callback has single-owner semantics" {
+    const Counter = struct {
+        fn increment(context: *anyopaque) void {
+            const count: *usize = @ptrCast(@alignCast(context));
+            count.* += 1;
+        }
+    };
+    var count: usize = 0;
+    var connection: Connection = .{
+        .client = undefined,
+        .upstream = undefined,
+        .last_activity = .zero,
+        .cleanup = .{ .context = &count, .callback = Counter.increment },
+    };
+    const cleanup = connection.cleanup.take().?;
+    cleanup.run();
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expect(connection.cleanup == null);
+}
+
+test "raw reactor cleanup health callback can terminate hybrid ownership" {
+    const Health = struct {
+        fn reject(context: *anyopaque) bool {
+            const called: *bool = @ptrCast(@alignCast(context));
+            called.* = true;
+            return false;
+        }
+        fn cleanup(_: *anyopaque) void {}
+    };
+    var called = false;
+    const cleanup: Cleanup = .{
+        .context = &called,
+        .callback = Health.cleanup,
+        .health_callback = Health.reject,
+    };
+    try std.testing.expect(!cleanup.healthy());
+    try std.testing.expect(called);
 }

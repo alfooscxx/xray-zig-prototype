@@ -24,6 +24,7 @@ pub const proxy = struct {
     pub const sk_lookup = struct {
         pub const bpf = @import("proxy/sk_lookup/bpf.zig");
         pub const inbound = @import("proxy/sk_lookup/inbound.zig");
+        pub const sockhash = @import("proxy/sk_lookup/sockhash.zig");
     };
     pub const tun = @import("proxy/tun/inbound.zig");
     pub const vless = @import("proxy/vless/outbound.zig");
@@ -54,6 +55,7 @@ test {
     _ = proxy.socks;
     _ = proxy.sk_lookup.bpf;
     _ = proxy.sk_lookup.inbound;
+    _ = proxy.sk_lookup.sockhash;
     _ = proxy.tun;
     _ = proxy.tun.packet;
     _ = proxy.vless;

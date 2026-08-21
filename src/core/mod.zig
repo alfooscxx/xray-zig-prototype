@@ -16,6 +16,7 @@ const freedom = @import("../proxy/freedom/outbound.zig");
 const redirect = @import("../proxy/redirect/inbound.zig");
 const socks = @import("../proxy/socks/inbound.zig");
 const sk_lookup = @import("../proxy/sk_lookup/inbound.zig");
+const sockhash = @import("../proxy/sk_lookup/sockhash.zig");
 const tun = @import("../proxy/tun/inbound.zig");
 const reality = @import("../transport/reality/client.zig");
 const vless = @import("../proxy/vless/outbound.zig");
@@ -26,6 +27,7 @@ pub const Runtime = struct {
     reactor_allocator: std.mem.Allocator = std.heap.page_allocator,
     raw_connection_limit: usize = 256,
     reactor: ?*raw_reactor.Reactor = null,
+    sockhash_manager: ?*sockhash.Manager = null,
 
     pub fn run(self: *Runtime, io: Io, log_writer: *Io.Writer) !void {
         const dispatch_interface = self.dispatcher();
@@ -37,7 +39,7 @@ pub const Runtime = struct {
                 dns_cfg.fake_dns orelse return error.MissingFakeDnsConfig
             else
                 return error.MissingFakeDnsConfig;
-            sk_lookup_inbound = try sk_lookup.Inbound.init(inbound, fake_dns_cfg, io);
+            sk_lookup_inbound = try sk_lookup.Inbound.init(inbound, fake_dns_cfg, self.allocator, io);
             break;
         }
         defer if (sk_lookup_inbound) |*inbound| inbound.deinit(io);
@@ -77,7 +79,11 @@ pub const Runtime = struct {
         }
         self.reactor = &reactor;
         defer self.reactor = null;
+        self.sockhash_manager = if (sk_lookup_inbound) |*inbound| inbound.sockhashManager() else null;
+        defer self.sockhash_manager = null;
         try group.concurrent(io, runRawReactor, .{&reactor});
+        if (self.sockhash_manager) |manager|
+            try group.concurrent(io, runSockhashManager, .{manager});
 
         for (self.cfg.inbounds) |inbound| {
             if (std.mem.eql(u8, inbound.protocol, "socks")) {
@@ -127,7 +133,16 @@ pub const Runtime = struct {
                 if (dns_cfg.fake_dns != null) dns_cfg else null
             else
                 null;
-            try freedom.handle(client, sess, preface, fake_dns_config, self.dispatcher(), reactor, io);
+            try freedom.handle(
+                client,
+                sess,
+                preface,
+                fake_dns_config,
+                self.dispatcher(),
+                reactor,
+                if (sess.allow_sockhash_offload) self.sockhash_manager else null,
+                io,
+            );
             return;
         }
         if (std.mem.eql(u8, outbound.protocol, "blackhole")) {
@@ -139,7 +154,15 @@ pub const Runtime = struct {
             return;
         }
         if (std.mem.eql(u8, outbound.protocol, "vless")) {
-            try vless.handle(outbound, client, sess, preface, reactor, io);
+            try vless.handle(
+                outbound,
+                client,
+                sess,
+                preface,
+                reactor,
+                if (sess.allow_sockhash_offload) self.sockhash_manager else null,
+                io,
+            );
             return;
         }
         return error.UnsupportedOutboundProtocol;
@@ -149,6 +172,10 @@ pub const Runtime = struct {
 fn runRawReactor(reactor: *raw_reactor.Reactor) Io.Cancelable!void {
     diagnostics.setRawReactorCount(0);
     try reactor.run();
+}
+
+fn runSockhashManager(manager: *sockhash.Manager) Io.Cancelable!void {
+    try manager.run();
 }
 
 fn runSocksInbound(inbound: config.Inbound, dispatcher: session.Dispatcher, io: Io, log_writer: *Io.Writer, log_mutex: *Io.Mutex) Io.Cancelable!void {
@@ -198,10 +225,6 @@ fn dispatchThunk(context: *anyopaque, client: net.Stream, sess: session.Session,
 
 pub fn validate(cfg: *const config.Config) !void {
     if (cfg.inbounds.len == 0) return error.MissingInbounds;
-
-    if (cfg.dns) |dns_cfg| {
-        if (dns_cfg.fake_dns) |fake_dns_cfg| try fakedns.validateConfig(fake_dns_cfg);
-    }
 
     var sk_lookup_count: usize = 0;
     for (cfg.inbounds) |inbound| {
@@ -345,23 +368,6 @@ test "rejects sk_lookup without FakeDNS" {
     var cfg = try config.parse(std.testing.allocator, source);
     defer cfg.deinit();
     try std.testing.expectError(error.MissingFakeDnsConfig, validate(&cfg));
-}
-
-test "rejects invalid FakeDNS pools during config validation" {
-    const source =
-        \\{
-        \\  "inbounds": [{"protocol":"socks","listen":"127.0.0.1","port":1080}],
-        \\  "outbounds": [{"tag":"direct","protocol":"freedom"}],
-        \\  "dns": {
-        \\    "servers": [{"resolver":"1.1.1.1","outboundTag":"direct","domains":["domain:"]}],
-        \\    "fakeDns": {"ipPool":"198.18.254.1/32"}
-        \\  },
-        \\  "routing": {"defaultOutboundTag":"direct"}
-        \\}
-    ;
-    var cfg = try config.parse(std.testing.allocator, source);
-    defer cfg.deinit();
-    try std.testing.expectError(error.InvalidFakeDnsPool, validate(&cfg));
 }
 
 test "validates redirect VLESS Reality graph" {

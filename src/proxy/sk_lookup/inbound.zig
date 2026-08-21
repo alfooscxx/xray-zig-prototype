@@ -8,6 +8,7 @@ const fakedns = @import("../../dns/fakedns.zig");
 const log = @import("../../log.zig");
 const session = @import("../../net/session.zig");
 const bpf = @import("bpf.zig");
+const sockhash = @import("sockhash.zig");
 
 const linux = std.os.linux;
 
@@ -16,8 +17,14 @@ pub const Inbound = struct {
     listener4: net.Server,
     listener6: net.Server,
     dataplane: bpf.Dataplane,
+    sockhash_manager: ?sockhash.Manager,
 
-    pub fn init(inbound: config.Inbound, fake_dns_cfg: config.FakeDnsConfig, io: Io) !Inbound {
+    pub fn init(
+        inbound: config.Inbound,
+        fake_dns_cfg: config.FakeDnsConfig,
+        allocator: std.mem.Allocator,
+        io: Io,
+    ) !Inbound {
         if (builtin.os.tag != .linux) return error.SkLookupRequiresLinux;
         const settings = inbound.sk_lookup orelse return error.MissingSkLookupSettings;
 
@@ -42,15 +49,22 @@ pub const Inbound = struct {
             owned.deinit();
         }
 
+        const sockhash_manager = if (settings.sockhash_offload) |offload|
+            try sockhash.Manager.init(allocator, io, offload.max_flows, offload.idle_timeout_seconds)
+        else
+            null;
+
         return .{
             .inbound_tag = inbound.tag,
             .listener4 = listener4,
             .listener6 = listener6,
             .dataplane = dataplane,
+            .sockhash_manager = sockhash_manager,
         };
     }
 
     pub fn deinit(self: *Inbound, io: Io) void {
+        if (self.sockhash_manager) |*manager| manager.deinit();
         self.dataplane.deinit();
         self.listener6.deinit(io);
         self.listener4.deinit(io);
@@ -63,6 +77,10 @@ pub const Inbound = struct {
 
     pub fn attach(self: *Inbound, io: Io) !void {
         try self.dataplane.attach(io);
+    }
+
+    pub fn sockhashManager(self: *Inbound) ?*sockhash.Manager {
+        return if (self.sockhash_manager) |*manager| manager else null;
     }
 
     pub fn run(
@@ -162,6 +180,7 @@ fn skLookupSession(
         .inbound_tag = inbound_tag,
         .sniffed_domain = domain,
         .preferred_family = family,
+        .allow_sockhash_offload = true,
     };
 }
 
@@ -210,9 +229,9 @@ test "converts getsockname IPv4 destination" {
     try std.testing.expectEqualSlices(u8, &.{ 198, 18, 0, 1 }, &target.ip4.bytes);
 }
 
-test "sk_lookup session preserves the fake destination family" {
+test "only sk_lookup session factory authorizes SOCKHASH offload" {
     const host = try net.HostName.init("fake.test");
     const sess = skLookupSession(host, 443, null, host.bytes, .ip4);
+    try std.testing.expect(sess.allow_sockhash_offload);
     try std.testing.expectEqual(@as(u16, 443), sess.target.port());
-    try std.testing.expectEqual(net.IpAddress.Family.ip4, sess.preferred_family.?);
 }

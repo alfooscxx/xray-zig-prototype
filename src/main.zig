@@ -311,6 +311,12 @@ fn printSummary(writer: *Io.Writer, cfg: *const xray.config.Config) !void {
             });
             if (settings.fake_dns_persistence) |persistence|
                 try writer.print("  persistent FakeDNS BPF maps: {s}\n", .{persistence.pin_directory});
+            if (settings.sockhash_offload) |offload| {
+                try writer.print("  required TCP SOCKHASH offload: max flows {d}, idle timeout {d}s\n", .{
+                    offload.max_flows,
+                    offload.idle_timeout_seconds,
+                });
+            }
             continue;
         }
         try writer.print("inbound {s}: {s} on {s}:{d}\n", .{

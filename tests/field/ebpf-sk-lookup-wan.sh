@@ -27,13 +27,23 @@ BPF_PROG_ID=
 BPF_MAP4_ID=
 BPF_MAP6_ID=
 BPF_LISTENERS_ID=
-DOWNLOAD_BYTES=${SK_LOOKUP_DOWNLOAD_BYTES:-1048576}
-LOAD_CONCURRENCY=${SK_LOOKUP_LOAD_CONCURRENCY:-1}
-LOAD_BATCH_TIMEOUT=${SK_LOOKUP_LOAD_TIMEOUT_SECONDS:-180}
+SH_PARSER_ID=
+SH_VERDICT_ID=
+SH_TARGETS_ID=
+SH_SOURCES_ID=
+SH_PEERS_ID=
+SH_STATE_ID=
+SH_STATS_ID=
+SH_TOTAL_ID=
+BASE_MAP4_IDS=
+BASE_MAP6_IDS=
+OFFLOAD=0
+DOWNLOAD_BYTES=${SOCKHASH_DOWNLOAD_BYTES:-1048576}
+LOAD_CONCURRENCY=${SOCKHASH_LOAD_CONCURRENCY:-1}
+LOAD_BATCH_TIMEOUT=${SOCKHASH_LOAD_TIMEOUT_SECONDS:-180}
 
 if grep -q '"sockhashOffload"' "$CONFIG_FILE"; then
-    echo "SK_LOOKUP-only harness refuses sockhashOffload configuration" >&2
-    exit 1
+    OFFLOAD=1
 fi
 
 terminate_pid() {
@@ -76,6 +86,64 @@ run_bounded() {
     kill "$watchdog_pid" 2>/dev/null || true
     wait "$watchdog_pid" 2>/dev/null || true
     return "$cmd_status"
+}
+
+named_map_ids() {
+    bpftool map show name "$1" 2>/dev/null |
+        sed -n 's/^\([0-9][0-9]*\):.*/\1/p' || true
+}
+
+new_named_map_id() {
+    map_name=$1
+    baseline_ids=$2
+    found=
+    for candidate_id in $(named_map_ids "$map_name"); do
+        case " $baseline_ids " in
+            *" $candidate_id "*) continue ;;
+        esac
+        [ -z "$found" ] || {
+            echo "multiple new BPF maps named $map_name" >&2
+            return 1
+        }
+        found=$candidate_id
+    done
+    [ -n "$found" ] || {
+        echo "no new BPF map named $map_name" >&2
+        return 1
+    }
+    printf '%s\n' "$found"
+}
+
+map_u64_at() {
+    map_id=$1
+    byte_offset=$2
+    bpftool map lookup id "$map_id" key hex 00 00 00 00 | awk -v byte_offset="$byte_offset" '
+        function hex(s, i, n, c) {
+            s = tolower(s); n = 0
+            for (i = 1; i <= length(s); i++) {
+                c = index("0123456789abcdef", substr(s, i, 1)) - 1
+                n = n * 16 + c
+            }
+            return n
+        }
+        /^value:/ { in_value = 1; next }
+        in_value {
+            for (i = 1; i <= NF; i++) {
+                token = tolower($i)
+                if (token !~ /^[0-9a-f][0-9a-f]$/) continue
+                if (value_index == byte_offset) multiplier = 1
+                if (value_index >= byte_offset && value_index < byte_offset + 8) {
+                    total += hex(token) * multiplier
+                    multiplier *= 256
+                }
+                value_index++
+            }
+        }
+        END {
+            if (value_index < byte_offset + 8) exit 1
+            printf "%.0f\n", total
+        }
+    '
 }
 
 print_client_diagnostics() {
@@ -129,6 +197,37 @@ cleanup() {
         print_client_diagnostics
         echo "== isolated WAN xray log ==" >&2
         sed -n '1,260p' "$LAB_ROOT/xray.log" >&2 2>/dev/null
+        echo "== Vision trace frame summary ==" >&2
+        awk '
+            /^vision [0-9]+ downlink (initial )?frame command=/ {
+                id = $2
+                frames[id]++
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ /^command=/) {
+                        split($i, field, "=")
+                        command = field[2]
+                    }
+                }
+                if (command == 0) continues[id]++
+                else if (command == 1) ends[id]++
+                else if (command == 2) directs[id]++
+                else unknown[id]++
+                last[id] = command
+            }
+            /^vision [0-9]+ downlink chunk / {
+                chunks[$2]++
+                if ($0 ~ / read_direct=true$/) direct_chunks[$2]++
+            }
+            END {
+                for (id in frames) {
+                    printf "vision=%s frames=%d continue=%d end=%d direct=%d unknown=%d last=%s chunks=%d direct_chunks=%d\n", \
+                        id, frames[id], continues[id], ends[id], directs[id], unknown[id], \
+                        last[id], chunks[id], direct_chunks[id]
+                }
+            }
+        ' "$LAB_ROOT/xray.log" >&2 2>/dev/null || true
+        grep -E '^vision [0-9]+ (classified|raw-reactor-handoff|sockhash-handoff|uplink|downlink|Timeout) target=' \
+            "$LAB_ROOT/xray.log" >&2 2>/dev/null || true
         echo "== isolated WAN DHCP log ==" >&2
         sed -n '1,160p' "$LAB_ROOT/dhcp.log" >&2 2>/dev/null
     fi
@@ -161,7 +260,7 @@ trap 'exit 143' TERM
 [ -r "$CONFIG_FILE" ] || { echo "lab config is not readable: $CONFIG_FILE" >&2; exit 1; }
 case "$DOWNLOAD_BYTES:$LOAD_CONCURRENCY:$LOAD_BATCH_TIMEOUT" in
     *[!0-9:]* | 0:* | *:0:* | *:0)
-        echo "SK_LOOKUP download, concurrency, and timeout values must be positive integers" >&2
+        echo "SOCKHASH download, concurrency, and timeout values must be positive integers" >&2
         exit 1
         ;;
 esac
@@ -187,12 +286,27 @@ if bpftool prog show name xz_sk_lookup 2>/dev/null | grep -q 'xz_sk_lookup'; the
     echo "refusing to run: BPF program name xz_sk_lookup already exists" >&2
     exit 1
 fi
-for map_name in xz_fake4 xz_fake6 xz_listeners; do
-    if bpftool map show name "$map_name" 2>/dev/null | grep -q "$map_name"; then
-        echo "refusing to run: BPF map name $map_name already exists" >&2
-        exit 1
-    fi
-done
+BASE_MAP4_IDS=$(named_map_ids xz_fake4)
+BASE_MAP6_IDS=$(named_map_ids xz_fake6)
+if bpftool map show name xz_listeners 2>/dev/null | grep -q xz_listeners; then
+    echo "refusing to run: BPF map name xz_listeners already exists" >&2
+    exit 1
+fi
+if [ "$OFFLOAD" -eq 1 ]; then
+    for prog_name in xz_sh_parser xz_sh_verdict; do
+        if bpftool prog show name "$prog_name" 2>/dev/null | grep -q "$prog_name"; then
+            echo "refusing to run: BPF program name $prog_name already exists" >&2
+            exit 1
+        fi
+    done
+    for map_name in xz_sh_targets xz_sh_sources xz_sh_peers xz_sh_state xz_sh_stats xz_sh_total; do
+        if bpftool map show name "$map_name" 2>/dev/null | grep -q "$map_name"; then
+            echo "refusing to run: BPF map name $map_name already exists" >&2
+            exit 1
+        fi
+    done
+fi
+
 "$XRAY_BIN" check -config "$CONFIG_FILE" >/dev/null
 mkdir "$LAB_ROOT"
 chmod 700 "$LAB_ROOT"
@@ -287,8 +401,8 @@ while ! ip -n "$ROUTER_NS" link show "$TUN_IF" >/dev/null 2>&1; do
 done
 
 BPF_PROG_ID=$(bpftool prog show name xz_sk_lookup | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-BPF_MAP4_ID=$(bpftool map show name xz_fake4 | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-BPF_MAP6_ID=$(bpftool map show name xz_fake6 | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
+BPF_MAP4_ID=$(new_named_map_id xz_fake4 "$BASE_MAP4_IDS")
+BPF_MAP6_ID=$(new_named_map_id xz_fake6 "$BASE_MAP6_IDS")
 BPF_LISTENERS_ID=$(bpftool map show name xz_listeners | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
 [ -n "$BPF_PROG_ID" ] && [ -n "$BPF_MAP4_ID" ] && [ -n "$BPF_MAP6_ID" ] && [ -n "$BPF_LISTENERS_ID" ]
 BPF_LINK_ID=$(bpftool link show | awk -v prog_id="$BPF_PROG_ID" '
@@ -299,6 +413,24 @@ BPF_LINK_ID=$(bpftool link show | awk -v prog_id="$BPF_PROG_ID" '
     }
 ')
 [ -n "$BPF_LINK_ID" ]
+if [ "$OFFLOAD" -eq 1 ]; then
+    SH_PARSER_ID=$(bpftool prog show name xz_sh_parser | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
+    SH_VERDICT_ID=$(bpftool prog show name xz_sh_verdict | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
+    SH_TARGETS_ID=$(bpftool map show name xz_sh_targets | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
+    SH_SOURCES_ID=$(bpftool map show name xz_sh_sources | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
+    SH_PEERS_ID=$(bpftool map show name xz_sh_peers | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
+    SH_STATE_ID=$(bpftool map show name xz_sh_state | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
+    SH_STATS_ID=$(bpftool map show name xz_sh_stats | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
+    SH_TOTAL_ID=$(bpftool map show name xz_sh_total | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
+    [ -n "$SH_PARSER_ID" ] && [ -n "$SH_VERDICT_ID" ] &&
+        [ -n "$SH_TARGETS_ID" ] && [ -n "$SH_SOURCES_ID" ] &&
+        [ -n "$SH_PEERS_ID" ] && [ -n "$SH_STATE_ID" ] &&
+        [ -n "$SH_STATS_ID" ] && [ -n "$SH_TOTAL_ID" ]
+    bpftool prog show id "$SH_PARSER_ID" | grep -q ' sk_skb '
+    bpftool prog show id "$SH_VERDICT_ID" | grep -q ' sk_skb '
+    bpftool map show id "$SH_TARGETS_ID" | grep -q ' sockhash '
+    bpftool map show id "$SH_SOURCES_ID" | grep -q ' sockhash '
+fi
 if ip -n "$ROUTER_NS" route show dev "$TUN_IF" | grep -q .; then
     echo "test TUN unexpectedly owns an IPv4 route" >&2
     exit 1
@@ -368,10 +500,40 @@ throughput_bytes_per_second=$((download_bytes / elapsed_seconds))
 bpftool map lookup id "$BPF_MAP4_ID" key hex c6 12 fe 01 >/dev/null
 established_count=$(grep -Ec 'vless [0-9]+ established target=speed\.cloudflare\.com:443 client_tls=true' "$LAB_ROOT/xray.log")
 [ "$established_count" -ge "$LOAD_CONCURRENCY" ]
-handoff_count=$(grep -Ec 'vision [0-9]+ raw-handoff target=speed\.cloudflare\.com:443 tls=true tls12=true xtls=true write_direct=true read_direct=true' "$LAB_ROOT/xray.log")
-[ "$handoff_count" -ge 1 ]
+if [ "$OFFLOAD" -eq 1 ]; then
+    handoff_count=$(grep -Ec 'vision [0-9]+ sockhash-handoff target=speed\.cloudflare\.com:443 tls=true tls12=true xtls=true write_direct=true read_direct=true' "$LAB_ROOT/xray.log")
+    [ "$handoff_count" -ge "$LOAD_CONCURRENCY" ]
+    attempt=0
+    while [ "$(grep -c '^sockhash-close ' "$LAB_ROOT/xray.log" || true)" -lt "$LOAD_CONCURRENCY" ]; do
+        attempt=$((attempt + 1))
+        [ "$attempt" -lt 10 ] || { echo "SOCKHASH flow did not close within the bounded wait" >&2; exit 1; }
+        sleep 1
+    done
+    close_summary=$(awk '
+        /^sockhash-close / {
+            count++
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^upstream_bytes=/) { split($i, a, "="); bytes += a[2] }
+                if ($i ~ /^errors=/) { split($i, a, "="); errors += a[2] }
+            }
+        }
+        END { printf "%d %.0f %.0f\n", count, bytes, errors }
+    ' "$LAB_ROOT/xray.log")
+    set -- $close_summary
+    [ "$1" -ge "$LOAD_CONCURRENCY" ]
+    [ "$2" -ge "$download_bytes" ]
+    [ "$3" -eq 0 ]
+
+    aggregate_bytes=$(map_u64_at "$SH_TOTAL_ID" 0)
+    aggregate_errors=$(map_u64_at "$SH_TOTAL_ID" 16)
+    [ "$aggregate_bytes" -ge "$download_bytes" ]
+    [ "$aggregate_errors" -eq 0 ]
+else
+    handoff_count=$(grep -Ec 'vision [0-9]+ raw-reactor-handoff target=speed\.cloudflare\.com:443 tls=true tls12=true xtls=true write_direct=true read_direct=true' "$LAB_ROOT/xray.log")
+    [ "$handoff_count" -ge "$LOAD_CONCURRENCY" ]
+fi
 kill -0 "$DHCP_PID"
-echo "PASS WAN HTTPS speed.cloudflare.com flows=$LOAD_CONCURRENCY bytes=$download_bytes elapsed_s=$elapsed_seconds throughput_Bps=$throughput_bytes_per_second cpu_ticks=$cpu_ticks certificate=verified vision_raw_handoffs=$handoff_count"
+echo "PASS WAN HTTPS speed.cloudflare.com flows=$LOAD_CONCURRENCY bytes=$download_bytes elapsed_s=$elapsed_seconds throughput_Bps=$throughput_bytes_per_second cpu_ticks=$cpu_ticks certificate=verified offload=$OFFLOAD"
 
 terminate_pid "$XRAY_PID"
 XRAY_PID=
@@ -382,5 +544,18 @@ XRAY_PID=
 ! bpftool map show id "$BPF_MAP4_ID" >/dev/null 2>&1
 ! bpftool map show id "$BPF_MAP6_ID" >/dev/null 2>&1
 ! bpftool map show id "$BPF_LISTENERS_ID" >/dev/null 2>&1
+for baseline_id in $BASE_MAP4_IDS $BASE_MAP6_IDS; do
+    bpftool map show id "$baseline_id" >/dev/null
+done
+if [ "$OFFLOAD" -eq 1 ]; then
+    ! bpftool prog show id "$SH_PARSER_ID" >/dev/null 2>&1
+    ! bpftool prog show id "$SH_VERDICT_ID" >/dev/null 2>&1
+    ! bpftool map show id "$SH_TARGETS_ID" >/dev/null 2>&1
+    ! bpftool map show id "$SH_SOURCES_ID" >/dev/null 2>&1
+    ! bpftool map show id "$SH_PEERS_ID" >/dev/null 2>&1
+    ! bpftool map show id "$SH_STATE_ID" >/dev/null 2>&1
+    ! bpftool map show id "$SH_STATS_ID" >/dev/null 2>&1
+    ! bpftool map show id "$SH_TOTAL_ID" >/dev/null 2>&1
+fi
 
-echo "PASS: isolated FakeDNS -> SK_LOOKUP -> VLESS/REALITY/Vision -> WAN HTTPS handoff"
+echo "PASS: isolated FakeDNS -> SK_LOOKUP -> VLESS/REALITY/Vision -> WAN HTTPS handoff offload=$OFFLOAD"

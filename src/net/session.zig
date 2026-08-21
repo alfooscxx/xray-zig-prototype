@@ -44,7 +44,13 @@ pub const Session = struct {
     sniffed_domain: ?[]const u8 = null,
     outbound_tag: ?[]const u8 = null,
     preferred_family: ?net.IpAddress.Family = null,
+    allow_sockhash_offload: bool = false,
 };
+
+test "sessions deny SOCKHASH offload unless their inbound explicitly opts in" {
+    const sess: Session = .{ .target = try targetFromHostBytes("example.test", 443) };
+    try std.testing.expect(!sess.allow_sockhash_offload);
+}
 
 pub const Preface = struct {
     bytes: []const u8 = &.{},

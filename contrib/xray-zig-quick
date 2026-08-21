@@ -155,7 +155,6 @@ parse_profile() {
     done <"$profile"
 
     [ -n "$config" ] || die "Config is required in $profile"
-    [ -n "$lan_interfaces" ] || die "LanInterface is required in $profile"
     validate_uint "$memory_budget_mib" MemoryBudgetMiB
     validate_uint "$worker_limit" WorkerLimit
     validate_uint "$raw_connection_limit" RawConnectionLimit
@@ -198,7 +197,6 @@ parse_profile() {
             lan_interfaces="$lan_interfaces $iface"
         fi
     done
-    [ -n "$lan_interfaces" ] || die "LanInterface is empty"
 }
 
 require_root() {
@@ -320,7 +318,9 @@ EOF
         dns_port4=
         dns_port6=
     }
-    [ -n "$redirect_port4$redirect_port6" ] || die "no enabled redirect inbound was found"
+    if [ -n "$redirect_port4$redirect_port6" ] && [ -z "$lan_interfaces" ]; then
+        die "LanInterface is required when a redirect inbound is enabled"
+    fi
 }
 
 firewall_tool_exists() {
@@ -431,11 +431,10 @@ do_check() {
     parse_profile
     discover_inbounds
     printf '%s\n' "$summary"
-    say "quick profile ok: name=$name lan=$lan_interfaces ipv4_redirect=${redirect_port4:-off} ipv6_redirect=${redirect_port6:-off} ipv4_dns=${dns_port4:-off} ipv6_dns=${dns_port6:-off}"
+    say "quick profile ok: name=$name lan=${lan_interfaces:-off} ipv4_redirect=${redirect_port4:-off} ipv6_redirect=${redirect_port6:-off} ipv4_dns=${dns_port4:-off} ipv6_dns=${dns_port6:-off}"
 }
 
 do_up() {
-    require_root
     resolve_profile "$1"
     parse_profile
     acquire_lock
@@ -450,7 +449,7 @@ do_up() {
     stale_lan=$(read_state lan 2>/dev/null || true)
     stale_v4=$(read_state v4 2>/dev/null || true)
     stale_v6=$(read_state v6 2>/dev/null || true)
-    if [ -n "$stale_lan" ]; then
+    if [ -f "$(state_path lan)" ]; then
         lan_interfaces=$stale_lan
         firewall_down "$stale_v4" "$stale_v6" || die "cannot clean stale firewall state for $name"
         parse_profile
@@ -458,6 +457,9 @@ do_up() {
     clear_state
 
     discover_inbounds
+    if [ -n "$redirect_port4$redirect_port6" ]; then
+        require_root
+    fi
     [ -z "$redirect_port4" ] || firewall_tool_exists "$iptables_bin"
     [ -z "$redirect_port6" ] || firewall_tool_exists "$ip6tables_bin"
 
@@ -487,7 +489,6 @@ do_up() {
 }
 
 do_down() {
-    require_root
     resolve_name "$1"
     acquire_lock
     trap on_exit EXIT
@@ -495,10 +496,13 @@ do_down() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
+    [ -f "$(state_path lan)" ] || die "$name is not up"
     lan_interfaces=$(read_state lan 2>/dev/null || true)
-    [ -n "$lan_interfaces" ] || die "$name is not up"
     active_v4=$(read_state v4 2>/dev/null || true)
     active_v6=$(read_state v6 2>/dev/null || true)
+    if [ "$active_v4" = yes ] || [ "$active_v6" = yes ]; then
+        require_root
+    fi
     firewall_down "$active_v4" "$active_v6" || die "cannot remove firewall rules for $name; xray-zig was left running"
     stop_process
     clear_state
@@ -510,7 +514,7 @@ do_status() {
     if process_is_ours; then
         pid=$(read_state pid)
         lan_interfaces=$(read_state lan 2>/dev/null || true)
-        say "$name is up (pid $pid, lan $lan_interfaces)"
+        say "$name is up (pid $pid, lan ${lan_interfaces:-off})"
         return 0
     fi
     say "$name is down"

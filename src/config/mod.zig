@@ -59,6 +59,7 @@ pub const SkLookupInboundSettings = struct {
     port6: u16,
     max_map_entries: u32,
     fake_dns_persistence: ?FakeDnsPersistenceSettings,
+    sockhash_offload: ?SockhashOffloadSettings,
 
     pub fn deinit(self: *SkLookupInboundSettings, allocator: std.mem.Allocator) void {
         allocator.free(self.listen4);
@@ -75,6 +76,11 @@ pub const FakeDnsPersistenceSettings = struct {
         allocator.free(self.pin_directory);
         self.* = undefined;
     }
+};
+
+pub const SockhashOffloadSettings = struct {
+    max_flows: u32,
+    idle_timeout_seconds: u32,
 };
 
 pub const TunInboundSettings = struct {
@@ -469,7 +475,8 @@ fn parseSkLookupInboundSettings(allocator: std.mem.Allocator, maybe_value: ?std.
             !std.mem.eql(u8, key, "listen6") and
             !std.mem.eql(u8, key, "port6") and
             !std.mem.eql(u8, key, "maxMapEntries") and
-            !std.mem.eql(u8, key, "fakeDnsPersistence"))
+            !std.mem.eql(u8, key, "fakeDnsPersistence") and
+            !std.mem.eql(u8, key, "sockhashOffload"))
         {
             return error.UnsupportedSkLookupSetting;
         }
@@ -493,6 +500,7 @@ fn parseSkLookupInboundSettings(allocator: std.mem.Allocator, maybe_value: ?std.
         var owned = owned_value;
         owned.deinit(allocator);
     };
+    const sockhash_offload = try parseSockhashOffloadSettings(object.get("sockhashOffload"));
 
     return .{
         .listen4 = listen4,
@@ -501,6 +509,7 @@ fn parseSkLookupInboundSettings(allocator: std.mem.Allocator, maybe_value: ?std.
         .port6 = try requiredPort(object, "port6", error.MissingSkLookupPort6),
         .max_map_entries = max_map_entries,
         .fake_dns_persistence = fake_dns_persistence,
+        .sockhash_offload = sockhash_offload,
     };
 }
 
@@ -542,6 +551,31 @@ fn validAbsoluteDirectory(path: []const u8) bool {
         }
     }
     return true;
+}
+
+fn parseSockhashOffloadSettings(maybe_value: ?std.json.Value) !?SockhashOffloadSettings {
+    const value = maybe_value orelse return null;
+    if (value != .object) return error.SockhashOffloadMustBeObject;
+    const object = &value.object;
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.eql(u8, key, "mode") and
+            !std.mem.eql(u8, key, "maxFlows") and
+            !std.mem.eql(u8, key, "idleTimeoutSeconds"))
+        {
+            return error.UnsupportedSockhashOffloadSetting;
+        }
+    }
+
+    const mode_value = object.get("mode") orelse return error.MissingSockhashOffloadMode;
+    if (mode_value != .string or !std.mem.eql(u8, mode_value.string, "required"))
+        return error.UnsupportedSockhashOffloadMode;
+    const max_flows = try optionalUnsigned(u32, object, "maxFlows", 1024, error.InvalidSockhashFlowLimit);
+    if (max_flows == 0 or max_flows > 131_072) return error.InvalidSockhashFlowLimit;
+    const idle_timeout_seconds = try optionalUnsigned(u32, object, "idleTimeoutSeconds", 300, error.InvalidSockhashIdleTimeout);
+    if (idle_timeout_seconds == 0 or idle_timeout_seconds > 86_400) return error.InvalidSockhashIdleTimeout;
+    return .{ .max_flows = max_flows, .idle_timeout_seconds = idle_timeout_seconds };
 }
 
 fn parseTunInboundSettings(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) !?TunInboundSettings {
@@ -1226,7 +1260,8 @@ test "parses strict sk_lookup inbound settings" {
         \\{"inbounds":[{"tag":"bpf-in","protocol":"sk_lookup","settings":{
         \\  "listen4":"0.0.0.0","port4":19080,
         \\  "listen6":"::","port6":19081,"maxMapEntries":1024,
-        \\  "fakeDnsPersistence":{"pinDirectory":"/sys/fs/bpf/xray-zig"}
+        \\  "fakeDnsPersistence":{"pinDirectory":"/sys/fs/bpf/xray-zig"},
+        \\  "sockhashOffload":{"mode":"required","maxFlows":64,"idleTimeoutSeconds":45}
         \\}}]}
     ;
     var cfg = try parse(std.testing.allocator, source);
@@ -1238,6 +1273,8 @@ test "parses strict sk_lookup inbound settings" {
     try std.testing.expectEqual(@as(u16, 19081), settings.port6);
     try std.testing.expectEqual(@as(u32, 1024), settings.max_map_entries);
     try std.testing.expectEqualStrings("/sys/fs/bpf/xray-zig", settings.fake_dns_persistence.?.pin_directory);
+    try std.testing.expectEqual(@as(u32, 64), settings.sockhash_offload.?.max_flows);
+    try std.testing.expectEqual(@as(u32, 45), settings.sockhash_offload.?.idle_timeout_seconds);
 }
 
 test "rejects ambiguous or unsupported sk_lookup settings" {
@@ -1252,6 +1289,18 @@ test "rejects ambiguous or unsupported sk_lookup settings" {
     try std.testing.expectError(
         error.InvalidSkLookupMapEntries,
         parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"maxMapEntries\":0}}]}"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSockhashOffloadSetting,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"sockhashOffload\":{\"mode\":\"required\",\"udp\":true}}}]}"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSockhashOffloadMode,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"sockhashOffload\":{\"mode\":\"best-effort\"}}}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidSockhashFlowLimit,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"sockhashOffload\":{\"mode\":\"required\",\"maxFlows\":0}}}]}"),
     );
     try std.testing.expectError(
         error.InvalidFakeDnsPinDirectory,

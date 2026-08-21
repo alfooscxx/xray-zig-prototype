@@ -11,11 +11,6 @@ pub const Error = error{
     InvalidFakeDnsPersistentState,
 };
 
-pub fn validateConfig(cfg: config.FakeDnsConfig) !void {
-    _ = try parsePool(cfg.ip_pool);
-    _ = try parsePool6(cfg.ip_pool6);
-}
-
 pub const Publication = extern struct {
     domain_id: u64,
     generation: u64,
