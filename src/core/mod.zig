@@ -5,6 +5,7 @@ const net = Io.net;
 
 const config = @import("../config/mod.zig");
 const diagnostics = @import("../diagnostics.zig");
+const log = @import("../log.zig");
 const fakedns = @import("../dns/fakedns.zig");
 const routing = @import("../routing/mod.zig");
 const raw_reactor = @import("../net/reactor.zig");
@@ -26,6 +27,7 @@ pub const Runtime = struct {
     allocator: std.mem.Allocator,
     reactor_allocator: std.mem.Allocator = std.heap.page_allocator,
     raw_connection_limit: usize = 256,
+    reality_handshake_slots: Io.Semaphore = .{ .permits = 32 },
     reactor: ?*raw_reactor.Reactor = null,
     sockhash_manager: ?*sockhash.Manager = null,
 
@@ -77,11 +79,14 @@ pub const Runtime = struct {
             reactor.stop();
             group.cancel(io);
         }
+        var raw_failure_buffer: [1]RawReactorFailure = undefined;
+        var raw_failures: Io.Queue(RawReactorFailure) = .init(&raw_failure_buffer);
+        defer raw_failures.close(io);
         self.reactor = &reactor;
         defer self.reactor = null;
         self.sockhash_manager = if (sk_lookup_inbound) |*inbound| inbound.sockhashManager() else null;
         defer self.sockhash_manager = null;
-        try group.concurrent(io, runRawReactor, .{&reactor});
+        try group.concurrent(io, runRawReactor, .{ &reactor, &raw_failures, io });
         if (self.sockhash_manager) |manager|
             try group.concurrent(io, runSockhashManager, .{manager});
 
@@ -112,7 +117,11 @@ pub const Runtime = struct {
             return error.UnsupportedInboundProtocol;
         }
 
-        try group.await(io);
+        const raw_failure = raw_failures.getOne(io) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.Closed => unreachable,
+        };
+        return raw_failure.err;
     }
 
     fn dispatcher(self: *Runtime) session.Dispatcher {
@@ -160,6 +169,7 @@ pub const Runtime = struct {
                 sess,
                 preface,
                 reactor,
+                &self.reality_handshake_slots,
                 if (sess.allow_sockhash_offload) self.sockhash_manager else null,
                 io,
             );
@@ -169,9 +179,22 @@ pub const Runtime = struct {
     }
 };
 
-fn runRawReactor(reactor: *raw_reactor.Reactor) Io.Cancelable!void {
+const RawReactorFailure = struct {
+    err: anyerror,
+};
+
+fn runRawReactor(reactor: *raw_reactor.Reactor, failures: *Io.Queue(RawReactorFailure), io: Io) Io.Cancelable!void {
     diagnostics.setRawReactorCount(0);
-    try reactor.run();
+    var failure: anyerror = error.RawReactorStopped;
+    reactor.run() catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => failure = err,
+    };
+    log.err("raw io_uring reactor stopped: {s}\n", .{@errorName(failure)});
+    failures.putOne(io, .{ .err = failure }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.Closed => return,
+    };
 }
 
 fn runSockhashManager(manager: *sockhash.Manager) Io.Cancelable!void {
@@ -206,7 +229,7 @@ fn runTunInbound(inbound: config.Inbound, dispatcher: session.Dispatcher, alloca
     diagnostics.setThreadName("xz-tun-listen");
     tun.run(inbound, dispatcher, allocator, io, log_writer, log_mutex) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
-        else => return,
+        else => log.err("tun inbound stopped: {s}\n", .{@errorName(err)}),
     };
 }
 

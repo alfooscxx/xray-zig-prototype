@@ -31,10 +31,12 @@ the default pool is unlimited and reserves 16 MiB per worker. Smaller 256 KiB
 and 512 KiB stacks previously corrupted deep TLS/crypto workers, so reducing
 the stack is not used as an RSS optimization.
 
-The worker and raw-reactor limits cover different connection states. Lowering
+The heavy-worker and raw-reactor limits cover different connection states. Lowering
 the worker limit does not increase reactor capacity: it reduces the number of
 connections that can initialize or remain in a non-direct bridge. The
-32-permit REALITY semaphore already bounds the CPU-heavy handshake phase.
+runtime-owned REALITY semaphore bounds the CPU-heavy handshake phase. Its
+`XRAY_ZIG_REALITY_HANDSHAKE_LIMIT` setting defaults to 32 and can be raised
+independently of established-connection capacity.
 `XRAY_ZIG_MEMORY_BUDGET_MIB` defaults to 512 MiB. The runtime models an
 initialization worker as 560 KiB and a raw connection as 112 KiB, reflecting
 the measured approximately 5:1 resident-memory ratio. Without explicit caps it
@@ -46,7 +48,11 @@ admission ceilings, not startup allocations.
 `XRAY_ZIG_WORKER_LIMIT` and `XRAY_ZIG_RAW_CONNECTION_LIMIT` override automatic
 sizing. When an explicit worker limit omits the raw limit, raw capacity is five
 times the worker request. Explicit requests that exceed the budget are reduced
-proportionally. The selected budget and effective counts are logged at startup.
+proportionally. One low-level io_uring shard is bounded to 4,095 raw bridges;
+larger explicit raw requests fail instead of silently changing admission. The
+selected counts are logged as `heavy_workers` and
+`io_uring_raw_connections`; the selected handshake limit is logged as
+`reality_handshakes`.
 This model is an admission-sizing estimate, not an allocator-enforced RSS
 limit; the watchdog remains responsible for terminating a process that exceeds
 the same budget. The process raises its soft descriptor limit to the permitted
@@ -64,14 +70,23 @@ warnings and reached 5.778 MiB/s, but two successive mixed matrices each lost
 one Fastly TLS handshake. The 80/240 split is therefore the production default
 pending longer observation.
 
-Each accepted TCP connection gets one handler worker. Bidirectional plain, REALITY, and Vision bridges poll the client and upstream sockets from that handler, then drain any userspace reader/TLS buffers before polling again. This keeps a live connection to one worker. If the pool limit is reached, a TCP inbound holds one accepted stream, retries scheduling every 10 ms, and leaves later connections in the kernel listen backlog. It must not run the handler synchronously on the accept worker because a long-lived connection would stall that listener indefinitely.
+Each accepted TCP connection gets one handler worker for routing and outbound
+initialization. Framed TLS/Vision work remains on that worker, while eligible
+plain and post-Vision direct-copy bridges hand both sockets to the shared raw
+reactor and release it. If the pool limit is reached, a TCP inbound holds one
+accepted stream, retries scheduling every 10 ms, and leaves later connections
+in the kernel listen backlog. It must not run the handler synchronously on the
+accept worker because initialization or a non-offloaded connection would stall
+that listener indefinitely.
 
-The TUN endpoint uses three concurrent tasks per active proxied flow: the flow
-owner also runs the uplink pump, one task runs the downlink pump, and one runs
-the selected outbound dispatcher. All TUN flows share one 50 ms retransmission
-and expiry task. This replaced the earlier five-task design; the AArch64 field
-run in `tun-tcp-field-test-2026-08-20.md` measured the resulting capacity and
-RSS reduction.
+The TUN endpoint uses a temporary flow-owner task until it has a routing
+preface, then one dispatcher task while the selected outbound performs
+handshake and framed Vision work. A protocol-owned low-level io_uring handles
+both bridge directions, partial writes, half-closes, TCP retransmission, and
+idle expiry for every flow. Once Vision hands the dispatch side to the shared
+raw reactor, an established TUN flow retains no per-flow worker. The earlier
+three-task and five-task designs remain recorded in
+`tun-tcp-field-test-2026-08-20.md` as historical baselines.
 
 The response-header phase has a 60-second inactivity timeout, and established
 worker and raw-reactor bridges have a 300-second inactivity timeout. These
@@ -84,12 +99,15 @@ remaining below its RSS limit.
 
 Connections that have completed the Vision direct-copy transition, plus plain
 freedom connections that are not eligible for kernel offload, move to the
-shared raw reactor. Producers publish them through a lock-free atomic stack and
-signal an `eventfd`; there is no producer spin lock. The reactor blocks in
-`poll` until socket activity, a new connection, or its one-second
-cooperative-cancellation check. Reactor shutdown drains and closes both active
-and not-yet-adopted connections before its allocator and wake descriptor are
-released.
+shared raw reactor. Producers publish them
+through a lock-free atomic stack and signal an `eventfd`; there is no producer
+spin lock. The reactor submits one receive and one send per direction through a
+low-level Linux io_uring and uses one one-second timeout for idle expiry and
+cooperative cancellation. `Io.Threaded` remains the bounded heavy executor;
+high-level `std.Io.Uring` is not used because Zig 0.16 reserves a fixed 60 MiB
+virtual stack per fiber and its stream listen/accept/read/write vtable is still
+unimplemented. Reactor shutdown closes the ring, canceling all kernel buffer
+references, before active or pending connection storage is freed.
 
 An optional Linux-only backend can move eligible connections originating from
 the `sk_lookup` inbound into a pair of SOCKHASH maps. Vision waits for its
@@ -102,8 +120,8 @@ SOCKS, redirect, TUN, recursively dispatched DNS, and every other inbound leave
 targets are installed before programmed sources, and an identity SK_SKB parser
 drives pre-existing receive queues through the verdict path. Its manager owns
 duplicate FDs, FIN/RST/idle handling, exact non-LRU state, and teardown.
-Admission pressure falls back to the raw reactor only when ordering safety
-permits it; see `ebpf-sk-lookup.md`.
+Admission pressure falls back to the io_uring raw reactor only when ordering
+safety permits it; see `ebpf-sk-lookup.md`.
 
 Inbound startup and error messages share one buffered writer, protected by an `Io.Mutex`. Any new concurrent log site must use the same mutex.
 

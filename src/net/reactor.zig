@@ -8,8 +8,10 @@ const posix = std.posix;
 const diagnostics = @import("../diagnostics.zig");
 
 const buffer_size = 16 * 1024;
-const cancellation_poll_ms = 1000;
 const connection_idle_timeout_ns = 300 * std.time.ns_per_s;
+const timer_poll_ms = 1000;
+pub const max_connections_per_ring = 4095;
+const maximum_ring_entries: usize = 32768;
 
 const Buffer = struct {
     bytes: [buffer_size]u8 = undefined,
@@ -41,6 +43,11 @@ const Connection = struct {
     client_send_shutdown: bool = false,
     failed: bool = false,
     cleanup: ?Cleanup = null,
+    client_recv_pending: bool = false,
+    upstream_recv_pending: bool = false,
+    client_send_pending: bool = false,
+    upstream_send_pending: bool = false,
+    cancellation_requested: bool = false,
     last_activity: Io.Timestamp,
     next: ?*Connection = null,
 };
@@ -64,24 +71,46 @@ pub const Reactor = struct {
     io: Io,
     wake_fd: posix.fd_t,
     max_connections: usize,
-    poll_fds: []posix.pollfd,
-    poll_connections: []*Connection,
+    ring: linux.IoUring,
+    ring_live: bool = true,
+    completions: []linux.io_uring_cqe,
     pending_head: std.atomic.Value(?*Connection) = .init(null),
+    admission_mutex: std.atomic.Mutex = .unlocked,
     stopped: std.atomic.Value(bool) = .init(false),
     active_count: usize = 0,
+    wake_value: u64 = 0,
+    wake_pending: bool = false,
+    timer_spec: linux.kernel_timespec = .{
+        .sec = 0,
+        .nsec = timer_poll_ms * std.time.ns_per_ms,
+    },
+    timer_pending: bool = false,
+
+    const wake_user_data: u64 = 1;
+    const timer_user_data: u64 = 2;
+    const cancel_user_data: u64 = 3;
+    const client_recv_tag: usize = 0;
+    const upstream_recv_tag: usize = 1;
+    const client_send_tag: usize = 2;
+    const upstream_send_tag: usize = 3;
+    const tag_mask: usize = 3;
 
     pub fn init(allocator: std.mem.Allocator, io: Io, max_connections: usize) !Reactor {
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
-        if (max_connections == 0 or
+        if (max_connections == 0 or max_connections > max_connections_per_ring or
             max_connections > (std.math.maxInt(usize) - 1) / 2)
         {
             return error.InvalidReactorCapacity;
         }
 
-        const poll_fds = try allocator.alloc(posix.pollfd, max_connections * 2 + 1);
-        errdefer allocator.free(poll_fds);
-        const poll_connections = try allocator.alloc(*Connection, max_connections);
-        errdefer allocator.free(poll_connections);
+        // Reserve one operation in each direction plus cancellation SQEs for
+        // deterministic shutdown without overcommitting the submission ring.
+        const required_entries = max_connections * 8 + 8;
+        const completions = try allocator.alloc(linux.io_uring_cqe, required_entries);
+        errdefer allocator.free(completions);
+        const entries = try ringEntries(required_entries);
+        var ring = try linux.IoUring.init(entries, 0);
+        errdefer ring.deinit();
 
         const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
         return switch (linux.errno(rc)) {
@@ -90,8 +119,8 @@ pub const Reactor = struct {
                 .io = io,
                 .wake_fd = @intCast(rc),
                 .max_connections = max_connections,
-                .poll_fds = poll_fds,
-                .poll_connections = poll_connections,
+                .ring = ring,
+                .completions = completions,
             },
             .MFILE, .NFILE, .NOMEM => error.SystemResources,
             else => error.Unexpected,
@@ -100,15 +129,18 @@ pub const Reactor = struct {
 
     pub fn deinit(self: *Reactor) void {
         self.stop();
+        if (self.ring_live) self.ring.deinit();
         self.closePendingList(self.pending_head.swap(null, .acquire));
         _ = linux.close(self.wake_fd);
-        self.allocator.free(self.poll_connections);
-        self.allocator.free(self.poll_fds);
+        self.allocator.free(self.completions);
         self.* = undefined;
     }
 
     pub fn stop(self: *Reactor) void {
-        if (self.stopped.swap(true, .release)) return;
+        lockAdmission(&self.admission_mutex);
+        const was_stopped = self.stopped.swap(true, .release);
+        self.admission_mutex.unlock();
+        if (was_stopped) return;
         self.wake();
     }
 
@@ -123,17 +155,13 @@ pub const Reactor = struct {
         cleanup: ?Cleanup,
     ) !void {
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
-        if (self.stopped.load(.acquire)) return error.ReactorStopped;
-
         const client_copy = try duplicateStream(client);
         errdefer client_copy.close(self.io);
         const upstream_copy = try duplicateStream(upstream);
         errdefer upstream_copy.close(self.io);
 
-        try setNonBlocking(client_copy.socket.handle);
-        try setNonBlocking(upstream_copy.socket.handle);
-
         const connection = try self.allocator.create(Connection);
+        errdefer self.allocator.destroy(connection);
         connection.* = .{
             .client = client_copy,
             .upstream = upstream_copy,
@@ -141,6 +169,9 @@ pub const Reactor = struct {
             .cleanup = cleanup,
         };
 
+        lockAdmission(&self.admission_mutex);
+        defer self.admission_mutex.unlock();
+        if (self.stopped.load(.acquire)) return error.ReactorStopped;
         self.pushPending(connection);
         self.wake();
     }
@@ -158,78 +189,141 @@ pub const Reactor = struct {
         }
     }
 
-    pub fn run(self: *Reactor) Io.Cancelable!void {
+    pub fn run(self: *Reactor) !void {
         var active_head: ?*Connection = null;
         defer {
+            self.stop();
+            self.ring.deinit();
+            self.ring_live = false;
             self.closeActiveList(active_head);
             self.closePendingList(self.pending_head.swap(null, .acquire));
         }
 
-        while (true) {
-            self.takePending(&active_head);
-            diagnostics.setRawReactorCount(self.active_count);
-            if (self.stopped.load(.acquire)) return;
-
-            self.poll_fds[0] = .{
-                .fd = self.wake_fd,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            };
-
-            var count: usize = 0;
-            var current = active_head;
-            while (current) |connection| : (current = connection.next) {
-                if (count == self.max_connections) break;
-                self.poll_connections[count] = connection;
-                self.poll_fds[count * 2 + 1] = .{
-                    .fd = connection.client.socket.handle,
-                    .events = readEvents(connection.client_eof, &connection.client_to_upstream) |
-                        writeEvents(&connection.upstream_to_client),
-                    .revents = 0,
-                };
-                self.poll_fds[count * 2 + 2] = .{
-                    .fd = connection.upstream.socket.handle,
-                    .events = readEvents(connection.upstream_eof, &connection.upstream_to_client) |
-                        writeEvents(&connection.client_to_upstream),
-                    .revents = 0,
-                };
-                count += 1;
-            }
-
-            _ = posix.poll(self.poll_fds[0 .. count * 2 + 1], cancellation_poll_ms) catch continue;
+        while (!self.stopped.load(.acquire)) {
             try Io.checkCancel(self.io);
-            if (self.poll_fds[0].revents & posix.POLL.IN != 0) self.drainWake();
-            if (self.poll_fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return;
-            if (self.stopped.load(.acquire)) return;
-
-            const now = Io.Timestamp.now(self.io, .awake);
-            var index: usize = 0;
-            while (index < count) : (index += 1) {
-                const connection = self.poll_connections[index];
-                const client_events = self.poll_fds[index * 2 + 1].revents;
-                const upstream_events = self.poll_fds[index * 2 + 2].revents;
-                if (connection.cleanup) |cleanup| {
-                    if (!cleanup.healthy()) {
-                        connection.failed = true;
-                        continue;
-                    }
-                }
-                if (service(connection, client_events, upstream_events)) {
-                    connection.last_activity = now;
-                }
-            }
-
-            var link = &active_head;
-            while (link.*) |connection| {
-                if (finished(connection) or idleExpired(connection, now)) {
-                    link.* = connection.next;
-                    self.closeConnection(connection);
-                } else {
-                    link = &connection.next;
-                }
-            }
+            self.takePending(&active_head);
+            self.serviceAll(&active_head);
             diagnostics.setRawReactorCount(self.active_count);
+            try self.armOperations(active_head);
+            _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
+                error.SignalInterrupt => continue,
+                else => return err,
+            };
+            const count = try self.ring.copy_cqes(self.completions, 0);
+            for (self.completions[0..count]) |completion| self.complete(completion);
         }
+    }
+
+    fn serviceAll(self: *Reactor, active_head: *?*Connection) void {
+        const now = Io.Timestamp.now(self.io, .awake);
+        var link = active_head;
+        while (link.*) |connection| {
+            if (connection.cleanup) |cleanup| {
+                if (!cleanup.healthy()) connection.failed = true;
+            }
+            service(connection);
+            if (idleExpired(connection, now)) connection.failed = true;
+            if (connection.failed) self.cancelConnection(connection);
+            if (finished(connection) and !hasPending(connection)) {
+                link.* = connection.next;
+                self.closeConnection(connection);
+            } else {
+                link = &connection.next;
+            }
+        }
+        diagnostics.setRawReactorCount(self.active_count);
+    }
+
+    fn armOperations(self: *Reactor, active_head: ?*Connection) !void {
+        if (!self.wake_pending) {
+            _ = try self.ring.read(wake_user_data, self.wake_fd, .{ .buffer = std.mem.asBytes(&self.wake_value) }, 0);
+            self.wake_pending = true;
+        }
+        if (!self.timer_pending) {
+            _ = try self.ring.timeout(timer_user_data, &self.timer_spec, 0, 0);
+            self.timer_pending = true;
+        }
+        var current = active_head;
+        while (current) |connection| : (current = connection.next) {
+            if (connection.failed) continue;
+            if (!connection.client_recv_pending and !connection.client_eof and connection.client_to_upstream.empty()) {
+                _ = try self.ring.recv(connectionUserData(connection, client_recv_tag), connection.client.socket.handle, .{ .buffer = &connection.client_to_upstream.bytes }, 0);
+                connection.client_recv_pending = true;
+            }
+            if (!connection.upstream_recv_pending and !connection.upstream_eof and connection.upstream_to_client.empty()) {
+                _ = try self.ring.recv(connectionUserData(connection, upstream_recv_tag), connection.upstream.socket.handle, .{ .buffer = &connection.upstream_to_client.bytes }, 0);
+                connection.upstream_recv_pending = true;
+            }
+            if (!connection.upstream_send_pending and !connection.client_to_upstream.empty()) {
+                _ = try self.ring.send(connectionUserData(connection, upstream_send_tag), connection.upstream.socket.handle, connection.client_to_upstream.readable(), linux.MSG.NOSIGNAL);
+                connection.upstream_send_pending = true;
+            }
+            if (!connection.client_send_pending and !connection.upstream_to_client.empty()) {
+                _ = try self.ring.send(connectionUserData(connection, client_send_tag), connection.client.socket.handle, connection.upstream_to_client.readable(), linux.MSG.NOSIGNAL);
+                connection.client_send_pending = true;
+            }
+        }
+        _ = try self.ring.submit();
+    }
+
+    fn complete(self: *Reactor, completion: linux.io_uring_cqe) void {
+        if (completion.user_data == wake_user_data) {
+            self.wake_pending = false;
+            return;
+        }
+        if (completion.user_data == timer_user_data) {
+            self.timer_pending = false;
+            return;
+        }
+        if (completion.user_data == cancel_user_data) return;
+
+        const pointer: usize = @intCast(completion.user_data & ~@as(u64, tag_mask));
+        const connection: *Connection = @ptrFromInt(pointer);
+        const tag: usize = @intCast(completion.user_data & tag_mask);
+        const result = completion.res;
+        const canceled = result < 0 and completionErrno(result) == .CANCELED;
+        switch (tag) {
+            client_recv_tag => {
+                connection.client_recv_pending = false;
+                if (result > 0) {
+                    connection.client_to_upstream.end = @intCast(result);
+                    connection.last_activity = Io.Timestamp.now(self.io, .awake);
+                } else if (result == 0) connection.client_eof = true else if (!canceled) connection.failed = true;
+            },
+            upstream_recv_tag => {
+                connection.upstream_recv_pending = false;
+                if (result > 0) {
+                    connection.upstream_to_client.end = @intCast(result);
+                    connection.last_activity = Io.Timestamp.now(self.io, .awake);
+                } else if (result == 0) connection.upstream_eof = true else if (!canceled) connection.failed = true;
+            },
+            client_send_tag => {
+                connection.client_send_pending = false;
+                if (result > 0) {
+                    connection.upstream_to_client.start += @intCast(result);
+                    if (connection.upstream_to_client.empty()) connection.upstream_to_client.reset();
+                    connection.last_activity = Io.Timestamp.now(self.io, .awake);
+                } else if (!canceled) connection.failed = true;
+            },
+            upstream_send_tag => {
+                connection.upstream_send_pending = false;
+                if (result > 0) {
+                    connection.client_to_upstream.start += @intCast(result);
+                    if (connection.client_to_upstream.empty()) connection.client_to_upstream.reset();
+                    connection.last_activity = Io.Timestamp.now(self.io, .awake);
+                } else if (!canceled) connection.failed = true;
+            },
+            else => unreachable,
+        }
+    }
+
+    fn cancelConnection(self: *Reactor, connection: *Connection) void {
+        if (connection.cancellation_requested) return;
+        connection.cancellation_requested = true;
+        if (connection.client_recv_pending) _ = self.ring.cancel(cancel_user_data, connectionUserData(connection, client_recv_tag), 0) catch {};
+        if (connection.upstream_recv_pending) _ = self.ring.cancel(cancel_user_data, connectionUserData(connection, upstream_recv_tag), 0) catch {};
+        if (connection.client_send_pending) _ = self.ring.cancel(cancel_user_data, connectionUserData(connection, client_send_tag), 0) catch {};
+        if (connection.upstream_send_pending) _ = self.ring.cancel(cancel_user_data, connectionUserData(connection, upstream_send_tag), 0) catch {};
     }
 
     fn takePending(self: *Reactor, active_head: *?*Connection) void {
@@ -291,58 +385,17 @@ pub const Reactor = struct {
             }
         }
     }
-
-    fn drainWake(self: *Reactor) void {
-        var value: u64 = undefined;
-        while (true) {
-            const rc = linux.read(self.wake_fd, @ptrCast(&value), @sizeOf(u64));
-            switch (linux.errno(rc)) {
-                .SUCCESS, .AGAIN => return,
-                .INTR => continue,
-                else => return,
-            }
-        }
-    }
 };
 
-fn readEvents(eof: bool, buffer: *const Buffer) i16 {
-    return if (!eof and buffer.empty()) posix.POLL.IN else 0;
-}
-
-fn writeEvents(buffer: *const Buffer) i16 {
-    return if (!buffer.empty()) posix.POLL.OUT else 0;
-}
-
-fn service(connection: *Connection, client_events: i16, upstream_events: i16) bool {
-    const terminal = posix.POLL.ERR | posix.POLL.NVAL;
-    if (client_events & terminal != 0 or upstream_events & terminal != 0) {
-        connection.failed = true;
-        return false;
-    }
-
-    var activity = false;
-    if (client_events & (posix.POLL.IN | posix.POLL.HUP) != 0 and connection.client_to_upstream.empty()) {
-        activity = readSocket(connection.client.socket.handle, &connection.client_to_upstream, &connection.client_eof, &connection.failed) or activity;
-    }
-    if (upstream_events & posix.POLL.OUT != 0 and !connection.client_to_upstream.empty()) {
-        activity = writeSocket(connection.upstream.socket.handle, &connection.client_to_upstream, &connection.failed) or activity;
-    }
+fn service(connection: *Connection) void {
     if (connection.client_eof and connection.client_to_upstream.empty() and !connection.upstream_send_shutdown) {
         shutdownSend(connection.upstream.socket.handle);
         connection.upstream_send_shutdown = true;
-    }
-
-    if (upstream_events & (posix.POLL.IN | posix.POLL.HUP) != 0 and connection.upstream_to_client.empty()) {
-        activity = readSocket(connection.upstream.socket.handle, &connection.upstream_to_client, &connection.upstream_eof, &connection.failed) or activity;
-    }
-    if (client_events & posix.POLL.OUT != 0 and !connection.upstream_to_client.empty()) {
-        activity = writeSocket(connection.client.socket.handle, &connection.upstream_to_client, &connection.failed) or activity;
     }
     if (connection.upstream_eof and connection.upstream_to_client.empty() and !connection.client_send_shutdown) {
         shutdownSend(connection.client.socket.handle);
         connection.client_send_shutdown = true;
     }
-    return activity;
 }
 
 fn finished(connection: *const Connection) bool {
@@ -350,47 +403,13 @@ fn finished(connection: *const Connection) bool {
         connection.client_to_upstream.empty() and connection.upstream_to_client.empty();
 }
 
+fn hasPending(connection: *const Connection) bool {
+    return connection.client_recv_pending or connection.upstream_recv_pending or
+        connection.client_send_pending or connection.upstream_send_pending;
+}
+
 fn idleExpired(connection: *const Connection, now: Io.Timestamp) bool {
     return now.nanoseconds - connection.last_activity.nanoseconds >= connection_idle_timeout_ns;
-}
-
-fn readSocket(fd: posix.fd_t, buffer: *Buffer, eof: *bool, failed: *bool) bool {
-    const rc = linux.read(fd, &buffer.bytes, buffer.bytes.len);
-    return switch (linux.errno(rc)) {
-        .SUCCESS => {
-            const n: usize = @intCast(rc);
-            if (n == 0) {
-                eof.* = true;
-            } else {
-                buffer.start = 0;
-                buffer.end = n;
-            }
-            return n != 0;
-        },
-        .AGAIN, .INTR => false,
-        else => {
-            failed.* = true;
-            return false;
-        },
-    };
-}
-
-fn writeSocket(fd: posix.fd_t, buffer: *Buffer, failed: *bool) bool {
-    const bytes = buffer.readable();
-    const rc = linux.write(fd, bytes.ptr, bytes.len);
-    return switch (linux.errno(rc)) {
-        .SUCCESS => {
-            const n: usize = @intCast(rc);
-            buffer.start += n;
-            if (buffer.empty()) buffer.reset();
-            return n != 0;
-        },
-        .AGAIN, .INTR => false,
-        else => {
-            failed.* = true;
-            return false;
-        },
-    };
 }
 
 fn shutdownSend(fd: posix.fd_t) void {
@@ -406,12 +425,26 @@ fn duplicateStream(stream: net.Stream) !net.Stream {
     } };
 }
 
-fn setNonBlocking(fd: posix.fd_t) !void {
-    const get_rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
-    if (posix.errno(get_rc) != .SUCCESS) return error.Unexpected;
-    const nonblock = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
-    const set_rc = posix.system.fcntl(fd, posix.F.SETFL, get_rc | nonblock);
-    if (posix.errno(set_rc) != .SUCCESS) return error.Unexpected;
+fn connectionUserData(connection: *Connection, tag: usize) u64 {
+    const pointer = @intFromPtr(connection);
+    std.debug.assert(pointer & Reactor.tag_mask == 0);
+    return @intCast(pointer | tag);
+}
+
+fn completionErrno(result: i32) linux.E {
+    std.debug.assert(result < 0);
+    return @enumFromInt(@as(u16, @intCast(-result)));
+}
+
+fn lockAdmission(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn ringEntries(required: usize) !u16 {
+    if (required > maximum_ring_entries) return error.InvalidReactorCapacity;
+    var entries: u16 = 8;
+    while (entries < required) entries *= 2;
+    return entries;
 }
 
 test "pending connections use a lock-free handoff stack" {
@@ -420,8 +453,8 @@ test "pending connections use a lock-free handoff stack" {
         .io = std.Io.failing,
         .wake_fd = -1,
         .max_connections = 2,
-        .poll_fds = undefined,
-        .poll_connections = undefined,
+        .ring = undefined,
+        .completions = undefined,
     };
     var first: Connection = .{ .client = undefined, .upstream = undefined, .last_activity = .zero };
     var second: Connection = .{ .client = undefined, .upstream = undefined, .last_activity = .zero };
@@ -466,7 +499,8 @@ test "raw reactor cleanup callback has single-owner semantics" {
         .last_activity = .zero,
         .cleanup = .{ .context = &count, .callback = Counter.increment },
     };
-    const cleanup = connection.cleanup.take().?;
+    const cleanup = connection.cleanup.?;
+    connection.cleanup = null;
     cleanup.run();
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expect(connection.cleanup == null);
@@ -489,4 +523,144 @@ test "raw reactor cleanup health callback can terminate hybrid ownership" {
     };
     try std.testing.expect(!cleanup.healthy());
     try std.testing.expect(called);
+}
+
+test "io_uring completions preserve partial receive and send state" {
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reactor: Reactor = .{
+        .allocator = std.testing.allocator,
+        .io = threaded.io(),
+        .wake_fd = -1,
+        .max_connections = 1,
+        .ring = undefined,
+        .completions = undefined,
+    };
+    var connection: Connection = .{
+        .client = undefined,
+        .upstream = undefined,
+        .last_activity = .zero,
+        .client_recv_pending = true,
+    };
+    @memcpy(connection.client_to_upstream.bytes[0..6], "abcdef");
+
+    reactor.complete(.{
+        .user_data = connectionUserData(&connection, Reactor.client_recv_tag),
+        .res = 6,
+        .flags = 0,
+    });
+    try std.testing.expectEqualStrings("abcdef", connection.client_to_upstream.readable());
+    try std.testing.expect(!connection.client_recv_pending);
+
+    connection.upstream_send_pending = true;
+    reactor.complete(.{
+        .user_data = connectionUserData(&connection, Reactor.upstream_send_tag),
+        .res = 2,
+        .flags = 0,
+    });
+    try std.testing.expectEqualStrings("cdef", connection.client_to_upstream.readable());
+    try std.testing.expect(!connection.upstream_send_pending);
+}
+
+test "canceled CQE clears ownership before failed connection can be freed" {
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reactor: Reactor = .{
+        .allocator = std.testing.allocator,
+        .io = threaded.io(),
+        .wake_fd = -1,
+        .max_connections = 1,
+        .ring = undefined,
+        .completions = undefined,
+    };
+    var connection: Connection = .{
+        .client = undefined,
+        .upstream = undefined,
+        .last_activity = .zero,
+        .failed = true,
+        .client_recv_pending = true,
+        .cancellation_requested = true,
+    };
+
+    try std.testing.expect(finished(&connection));
+    try std.testing.expect(hasPending(&connection));
+    reactor.complete(.{
+        .user_data = Reactor.cancel_user_data,
+        .res = 0,
+        .flags = 0,
+    });
+    try std.testing.expect(hasPending(&connection));
+    reactor.complete(.{
+        .user_data = connectionUserData(&connection, Reactor.client_recv_tag),
+        .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        .flags = 0,
+    });
+    try std.testing.expect(!hasPending(&connection));
+    try std.testing.expect(connection.failed);
+    try std.testing.expect(connection.cancellation_requested);
+}
+
+test "raw io_uring capacity is bounded before ring creation" {
+    try std.testing.expectError(
+        error.InvalidReactorCapacity,
+        Reactor.init(std.testing.allocator, std.Io.failing, max_connections_per_ring + 1),
+    );
+    try std.testing.expectEqual(
+        @as(u16, maximum_ring_entries),
+        try ringEntries(max_connections_per_ring * 8 + 8),
+    );
+}
+
+test "reactor shutdown cancels pending receives before connection free" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{
+        .stack_size = 1024 * 1024,
+        .concurrent_limit = .limited(2),
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var reactor = Reactor.init(std.testing.allocator, io, 1) catch return error.SkipZigTest;
+    defer reactor.deinit();
+    const client_pair = testSocketPair() catch return error.SkipZigTest;
+    defer client_pair[0].close(io);
+    defer client_pair[1].close(io);
+    const upstream_pair = testSocketPair() catch return error.SkipZigTest;
+    defer upstream_pair[0].close(io);
+    defer upstream_pair[1].close(io);
+    try reactor.adoptDuplicate(client_pair[0], upstream_pair[0]);
+
+    var future = io.concurrent(runReactorTest, .{&reactor}) catch return error.SkipZigTest;
+    defer _ = future.cancel(io) catch {};
+    try io.sleep(.fromMilliseconds(10), .awake);
+    reactor.stop();
+    try future.await(io);
+    try std.testing.expect(!reactor.ring_live);
+    try std.testing.expectEqual(@as(usize, 0), reactor.active_count);
+}
+
+fn runReactorTest(reactor: *Reactor) Io.Cancelable!void {
+    reactor.run() catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return,
+    };
+}
+
+fn testSocketPair() ![2]net.Stream {
+    var fds: [2]posix.socket_t = undefined;
+    while (true) switch (posix.errno(posix.system.socketpair(
+        posix.AF.UNIX,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+        0,
+        &fds,
+    ))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        else => return error.SocketPairFailed,
+    };
+    const address = net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    return .{
+        .{ .socket = .{ .handle = fds[0], .address = address } },
+        .{ .socket = .{ .handle = fds[1], .address = address } },
+    };
 }

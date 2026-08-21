@@ -365,6 +365,16 @@ test "FIN requires both half closes before terminal state" {
     try std.testing.expectEqual(Phase.terminal, state.phase);
 }
 
+test "RST terminates an established flow immediately" {
+    var state = State.init(10, 20, 65535, 1000, 0);
+    _ = state.queueSynAck(0);
+    _ = state.onSegment(11, 21, .{ .ack = true }, 65535, 0, 1);
+    const result = state.onSegment(11, 21, .{ .rst = true }, 65535, 0, 2);
+    try std.testing.expect(result.reset);
+    try std.testing.expect(result.became_terminal);
+    try std.testing.expectEqual(Phase.terminal, state.phase);
+}
+
 test "handshake and established idle deadlines are bounded" {
     var half_open = State.init(1, 2, 65535, 1000, 0);
     _ = half_open.queueSynAck(0);

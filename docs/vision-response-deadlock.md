@@ -117,10 +117,12 @@ connections never emitted `reality-ready`:
   ClientHello payload.
 
 Adding a 10 ms client launch delay produced 128/128, identifying the trigger as
-the simultaneous outbound handshake burst. VLESS setup now uses a 32-permit
-semaphore around TCP connect plus REALITY initialization. The permit is released
-before the long-lived Vision bridge, so established connection capacity remains
-128 workers while CPU-heavy crypto and ClientHello bursts are bounded.
+the simultaneous outbound handshake burst. VLESS setup now uses a runtime-owned
+semaphore around TCP connect plus REALITY initialization. It defaults to 32
+permits and is configurable with `XRAY_ZIG_REALITY_HANDSHAKE_LIMIT`. The permit
+is released before the long-lived Vision bridge, so established connection
+capacity is governed separately by the heavy-worker and raw-reactor limits
+while CPU-heavy crypto and ClientHello bursts are bounded.
 
 Three immediate 128-client runs then completed 128/128, with the two stable
 fresh-process runs taking 6.55 and 6.38 seconds. The first measured run reached

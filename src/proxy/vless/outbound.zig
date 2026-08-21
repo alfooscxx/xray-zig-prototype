@@ -21,12 +21,10 @@ pub const Error = error{
 
 const max_initial_tls_record_len = 18 * 1024;
 const max_response_header_len = 2 + std.math.maxInt(u8);
-const max_concurrent_handshakes = 32;
 const initialization_timeout_seconds = 15;
 var next_connection_id: std.atomic.Value(u32) = .init(1);
-var handshake_slots: Io.Semaphore = .{ .permits = max_concurrent_handshakes };
 
-pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: session.Session, preface: session.Preface, raw_reactor: *session.RawReactor, sockhash_manager: ?*sockhash.Manager, io: Io) !void {
+pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: session.Session, preface: session.Preface, raw_reactor: *session.RawReactor, handshake_slots: *Io.Semaphore, sockhash_manager: ?*sockhash.Manager, io: Io) !void {
     diagnostics.setThreadName("xz-vless-init");
     defer diagnostics.setThreadName("xray-zig");
     const connection_id = next_connection_id.fetchAdd(1, .monotonic);
@@ -37,7 +35,7 @@ pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: sessio
     logTarget(connection_id, sess.target);
 
     var upstream: session.OutboundConnection = undefined;
-    connect(&upstream, outbound, settings, io) catch |err| {
+    connect(&upstream, outbound, settings, handshake_slots, io) catch |err| {
         log.warn("vless {d} REALITY initialization failed: {s}\n", .{ connection_id, @errorName(err) });
         return err;
     };
@@ -221,7 +219,7 @@ fn expectedInitialTlsRecordLen(bytes: []const u8) !?usize {
     return record_len;
 }
 
-fn connect(upstream: *session.OutboundConnection, outbound: *const config.Outbound, settings: config.VlessOutboundSettings, io: Io) !void {
+fn connect(upstream: *session.OutboundConnection, outbound: *const config.Outbound, settings: config.VlessOutboundSettings, handshake_slots: *Io.Semaphore, io: Io) !void {
     try handshake_slots.wait(io);
     defer handshake_slots.post(io);
 

@@ -103,3 +103,13 @@ while FDs returned to five. The 1 MiB stack is demand-paged rather than charged
 fully to RSS, but touched pages stay resident until process exit. Reducing
 per-flow tasks therefore saves real memory without reintroducing the TLS stack
 overflow risk of smaller worker stacks.
+
+## io_uring follow-up
+
+The later `research/tun-shared-reactor` change removes both long-lived TUN pump
+tasks. A low-level io_uring owns the established TUN bridge, and the shared raw
+bridge also uses io_uring after Vision direct-copy handoff. Only preface/routing
+and TLS/VLESS/Vision setup remain on the heavy executor. This section records
+the previous field baseline only: the io_uring implementation was compiled for
+the AArch64 Cortex-A53 target and tested deterministically on the host, but was
+not deployed to or benchmarked on the active router as part of that change.
