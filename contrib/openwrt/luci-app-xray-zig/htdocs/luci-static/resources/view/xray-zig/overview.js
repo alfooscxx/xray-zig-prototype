@@ -156,18 +156,18 @@ function sparkline(samples, key, color) {
 	const baseline = document.createElementNS(svgNamespace, 'line');
 	const line = document.createElementNS(svgNamespace, 'polyline');
 	svg.setAttribute('class', 'xz-spark');
+	svg.setAttribute('width', '100%');
+	svg.setAttribute('height', '80');
+	svg.setAttribute('version', '1.1');
 	svg.setAttribute('viewBox', '0 0 600 96');
 	svg.setAttribute('preserveAspectRatio', 'none');
 	baseline.setAttribute('x1', '0');
 	baseline.setAttribute('y1', '92');
 	baseline.setAttribute('x2', '600');
 	baseline.setAttribute('y2', '92');
-	baseline.setAttribute('stroke', 'rgba(100, 116, 139, .35)');
-	baseline.setAttribute('stroke-width', '1');
+	baseline.setAttribute('style', 'stroke:#94a3b8;stroke-opacity:.35;stroke-width:1');
 	line.setAttribute('points', points);
-	line.setAttribute('fill', 'none');
-	line.setAttribute('stroke', color);
-	line.setAttribute('stroke-width', '3');
+	line.setAttribute('style', 'fill:none;stroke:' + color + ';stroke-width:3');
 	svg.appendChild(baseline);
 	svg.appendChild(line);
 	return svg;
@@ -240,7 +240,7 @@ function renderDashboard(snapshot) {
 		]),
 		E('div', { 'class': 'xz-card-grid' }, [
 			card('Version', status.version || 'unknown', status.dataplane || 'unknown'),
-			card('Uptime', formatDuration(status.uptime_seconds), 'runtime'),
+			card('Process uptime', formatDuration(status.uptime_seconds), 'xray-zig runtime'),
 			card('Connections', formatNumber(successes), formatNumber(errors) + ' errors', errors ? 'warn' : 'good'),
 			card('SOCKHASH', formatNumber(offloaded), 'active flows', bpf.sockhash_monitor ? 'good' : 'warn'),
 			card('Uplink', formatBytes(current.uplink) + '/s', 'live browser rate'),
