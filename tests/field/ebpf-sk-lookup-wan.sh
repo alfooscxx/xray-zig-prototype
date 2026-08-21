@@ -19,14 +19,17 @@ WAN_ROOT_IF=xzwb$SUFFIX
 WAN_NS_IF=xzww$SUFFIX
 TUN_IF=xztun0
 XRAY_PID=
+CONTROL_SOCKET=$LAB_ROOT/control.sock
 DHCP_PID=
 CLIENT_JOBS=
 BATCH_WATCHDOG_PID=
+RSS_SAMPLER_PID=
 BPF_LINK_ID=
 BPF_PROG_ID=
 BPF_MAP4_ID=
 BPF_MAP6_ID=
 BPF_LISTENERS_ID=
+BPF_COUNTERS_ID=
 SH_PARSER_ID=
 SH_VERDICT_ID=
 SH_TARGETS_ID=
@@ -37,6 +40,17 @@ SH_STATS_ID=
 SH_TOTAL_ID=
 BASE_MAP4_IDS=
 BASE_MAP6_IDS=
+BASE_BPF_PROG_IDS=
+BASE_BPF_LISTENERS_IDS=
+BASE_BPF_COUNTERS_IDS=
+BASE_SH_PARSER_IDS=
+BASE_SH_VERDICT_IDS=
+BASE_SH_TARGETS_IDS=
+BASE_SH_SOURCES_IDS=
+BASE_SH_PEERS_IDS=
+BASE_SH_STATE_IDS=
+BASE_SH_STATS_IDS=
+BASE_SH_TOTAL_IDS=
 OFFLOAD=0
 DOWNLOAD_BYTES=${SOCKHASH_DOWNLOAD_BYTES:-1048576}
 LOAD_CONCURRENCY=${SOCKHASH_LOAD_CONCURRENCY:-1}
@@ -93,6 +107,11 @@ named_map_ids() {
         sed -n 's/^\([0-9][0-9]*\):.*/\1/p' || true
 }
 
+named_prog_ids() {
+    bpftool prog show name "$1" 2>/dev/null |
+        sed -n 's/^\([0-9][0-9]*\):.*/\1/p' || true
+}
+
 new_named_map_id() {
     map_name=$1
     baseline_ids=$2
@@ -109,6 +128,27 @@ new_named_map_id() {
     done
     [ -n "$found" ] || {
         echo "no new BPF map named $map_name" >&2
+        return 1
+    }
+    printf '%s\n' "$found"
+}
+
+new_named_prog_id() {
+    prog_name=$1
+    baseline_ids=$2
+    found=
+    for candidate_id in $(named_prog_ids "$prog_name"); do
+        case " $baseline_ids " in
+            *" $candidate_id "*) continue ;;
+        esac
+        [ -z "$found" ] || {
+            echo "multiple new BPF programs named $prog_name" >&2
+            return 1
+        }
+        found=$candidate_id
+    done
+    [ -n "$found" ] || {
+        echo "no new BPF program named $prog_name" >&2
         return 1
     }
     printf '%s\n' "$found"
@@ -180,6 +220,10 @@ cleanup() {
         kill "$BATCH_WATCHDOG_PID" 2>/dev/null
         wait "$BATCH_WATCHDOG_PID" 2>/dev/null
     fi
+    if [ -n "$RSS_SAMPLER_PID" ]; then
+        kill "$RSS_SAMPLER_PID" 2>/dev/null
+        wait "$RSS_SAMPLER_PID" 2>/dev/null
+    fi
     for client_job in $CLIENT_JOBS; do
         client_pid=${client_job%%:*}
         client_index=${client_job#*:}
@@ -237,13 +281,15 @@ cleanup() {
     index=1
     while [ "$index" -le "$LOAD_CONCURRENCY" ]; do
         rm -f "$LAB_ROOT/https-$index.bin" "$LAB_ROOT/client-$index.log" \
-            "$LAB_ROOT/client-$index.status"
+            "$LAB_ROOT/client-$index.status" "$LAB_ROOT/client-$index.latency-ns"
         index=$((index + 1))
     done
     rm -f "$LAB_ROOT/xray.log" "$LAB_ROOT/dhcp.log" "$LAB_ROOT/dhcp-bound" \
         "$LAB_ROOT/dhcp-address" "$LAB_ROOT/udhcpc.sh" \
         "$LAB_ROOT/resolv.conf" "$LAB_ROOT/https-client.sh" \
-        "$LAB_ROOT/batch-timeout"
+        "$LAB_ROOT/batch-timeout" "$LAB_ROOT/control.sock" \
+        "$LAB_ROOT/status.json" "$LAB_ROOT/bpf-status.json" "$LAB_ROOT/metrics.prom" \
+        "$LAB_ROOT/rss-kb.samples"
     rmdir "$LAB_ROOT" 2>/dev/null
     exit "$status"
 }
@@ -282,30 +328,19 @@ ip -o -4 address show dev br-lan | grep -q ' 192\.168\.8\.1/24 ' || {
 }
 ip netns list | grep -Eq "^$CLIENT_NS|^$ROUTER_NS" && { echo "lab namespace collision" >&2; exit 1; }
 ip link show "$WAN_ROOT_IF" >/dev/null 2>&1 && { echo "lab WAN interface collision" >&2; exit 1; }
-if bpftool prog show name xz_sk_lookup 2>/dev/null | grep -q 'xz_sk_lookup'; then
-    echo "refusing to run: BPF program name xz_sk_lookup already exists" >&2
-    exit 1
-fi
 BASE_MAP4_IDS=$(named_map_ids xz_fake4)
 BASE_MAP6_IDS=$(named_map_ids xz_fake6)
-if bpftool map show name xz_listeners 2>/dev/null | grep -q xz_listeners; then
-    echo "refusing to run: BPF map name xz_listeners already exists" >&2
-    exit 1
-fi
-if [ "$OFFLOAD" -eq 1 ]; then
-    for prog_name in xz_sh_parser xz_sh_verdict; do
-        if bpftool prog show name "$prog_name" 2>/dev/null | grep -q "$prog_name"; then
-            echo "refusing to run: BPF program name $prog_name already exists" >&2
-            exit 1
-        fi
-    done
-    for map_name in xz_sh_targets xz_sh_sources xz_sh_peers xz_sh_state xz_sh_stats xz_sh_total; do
-        if bpftool map show name "$map_name" 2>/dev/null | grep -q "$map_name"; then
-            echo "refusing to run: BPF map name $map_name already exists" >&2
-            exit 1
-        fi
-    done
-fi
+BASE_BPF_PROG_IDS=$(named_prog_ids xz_sk_lookup)
+BASE_BPF_LISTENERS_IDS=$(named_map_ids xz_listeners)
+BASE_BPF_COUNTERS_IDS=$(named_map_ids xz_sk_count)
+BASE_SH_PARSER_IDS=$(named_prog_ids xz_sh_parser)
+BASE_SH_VERDICT_IDS=$(named_prog_ids xz_sh_verdict)
+BASE_SH_TARGETS_IDS=$(named_map_ids xz_sh_targets)
+BASE_SH_SOURCES_IDS=$(named_map_ids xz_sh_sources)
+BASE_SH_PEERS_IDS=$(named_map_ids xz_sh_peers)
+BASE_SH_STATE_IDS=$(named_map_ids xz_sh_state)
+BASE_SH_STATS_IDS=$(named_map_ids xz_sh_stats)
+BASE_SH_TOTAL_IDS=$(named_map_ids xz_sh_total)
 
 "$XRAY_BIN" check -config "$CONFIG_FILE" >/dev/null
 mkdir "$LAB_ROOT"
@@ -339,11 +374,21 @@ cat >"$LAB_ROOT/https-client.sh" <<'SH'
 #!/bin/sh
 set -eu
 index=$1
+now_ns() {
+    value=$(date +%s%N)
+    case "$value" in
+        *N*) printf '%s000000000\n' "$(date +%s)" ;;
+        *) printf '%s\n' "$value" ;;
+    esac
+}
 mount --bind "$LAB_ROOT/resolv.conf" /etc/resolv.conf
-exec uclient-fetch -4 --quiet --timeout=45 --no-proxy \
+started_ns=$(now_ns)
+uclient-fetch -4 --quiet --timeout=45 --no-proxy \
     --ca-certificate=/etc/ssl/certs/ca-certificates.crt \
     -O "$LAB_ROOT/https-$index.bin" \
     "https://speed.cloudflare.com/__down?bytes=$LAB_DOWNLOAD_BYTES"
+finished_ns=$(now_ns)
+printf '%s\n' "$((finished_ns - started_ns))" >"$LAB_ROOT/client-$index.latency-ns"
 SH
 chmod 700 "$LAB_ROOT/https-client.sh"
 
@@ -390,7 +435,8 @@ done
 ip -n "$ROUTER_NS" route show default | grep -q "dev $WAN_NS_IF"
 run_bounded ip netns exec "$ROUTER_NS" ping -c 1 -W 5 1.1.1.1 >/dev/null
 
-ip netns exec "$ROUTER_NS" "$XRAY_BIN" run -config "$CONFIG_FILE" >"$LAB_ROOT/xray.log" 2>&1 &
+ip netns exec "$ROUTER_NS" env XRAY_ZIG_CONTROL_SOCKET="$CONTROL_SOCKET" \
+    "$XRAY_BIN" run -config "$CONFIG_FILE" >"$LAB_ROOT/xray.log" 2>&1 &
 XRAY_PID=$!
 attempt=0
 while ! ip -n "$ROUTER_NS" link show "$TUN_IF" >/dev/null 2>&1; do
@@ -400,11 +446,30 @@ while ! ip -n "$ROUTER_NS" link show "$TUN_IF" >/dev/null 2>&1; do
     sleep 1
 done
 
-BPF_PROG_ID=$(bpftool prog show name xz_sk_lookup | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
+attempt=0
+while [ ! -S "$CONTROL_SOCKET" ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 20 ] || { echo "xray-zig control socket was not created" >&2; exit 1; }
+    kill -0 "$XRAY_PID" 2>/dev/null || { echo "isolated WAN xray-zig exited" >&2; exit 1; }
+    sleep 1
+done
+attempt=0
+while :; do
+    "$XRAY_BIN" ctl status --socket "$CONTROL_SOCKET" >"$LAB_ROOT/status.json"
+    grep -q '"ready":true' "$LAB_ROOT/status.json" && break
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 20 ] || { echo "xray-zig control API did not become ready" >&2; exit 1; }
+    sleep 1
+done
+"$XRAY_BIN" ctl bpf --socket "$CONTROL_SOCKET" >"$LAB_ROOT/bpf-status.json"
+grep -q '"sk_lookup":true' "$LAB_ROOT/bpf-status.json"
+
+BPF_PROG_ID=$(new_named_prog_id xz_sk_lookup "$BASE_BPF_PROG_IDS")
 BPF_MAP4_ID=$(new_named_map_id xz_fake4 "$BASE_MAP4_IDS")
 BPF_MAP6_ID=$(new_named_map_id xz_fake6 "$BASE_MAP6_IDS")
-BPF_LISTENERS_ID=$(bpftool map show name xz_listeners | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-[ -n "$BPF_PROG_ID" ] && [ -n "$BPF_MAP4_ID" ] && [ -n "$BPF_MAP6_ID" ] && [ -n "$BPF_LISTENERS_ID" ]
+BPF_LISTENERS_ID=$(new_named_map_id xz_listeners "$BASE_BPF_LISTENERS_IDS")
+BPF_COUNTERS_ID=$(new_named_map_id xz_sk_count "$BASE_BPF_COUNTERS_IDS")
+[ -n "$BPF_PROG_ID" ] && [ -n "$BPF_MAP4_ID" ] && [ -n "$BPF_MAP6_ID" ] && [ -n "$BPF_LISTENERS_ID" ] && [ -n "$BPF_COUNTERS_ID" ]
 BPF_LINK_ID=$(bpftool link show | awk -v prog_id="$BPF_PROG_ID" '
     $0 ~ ("prog[[:space:]]+" prog_id "([[:space:]]|$)") {
         gsub(":", "", $1)
@@ -413,15 +478,16 @@ BPF_LINK_ID=$(bpftool link show | awk -v prog_id="$BPF_PROG_ID" '
     }
 ')
 [ -n "$BPF_LINK_ID" ]
+bpftool map show id "$BPF_COUNTERS_ID" | grep -q 'percpu_array'
 if [ "$OFFLOAD" -eq 1 ]; then
-    SH_PARSER_ID=$(bpftool prog show name xz_sh_parser | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-    SH_VERDICT_ID=$(bpftool prog show name xz_sh_verdict | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-    SH_TARGETS_ID=$(bpftool map show name xz_sh_targets | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-    SH_SOURCES_ID=$(bpftool map show name xz_sh_sources | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-    SH_PEERS_ID=$(bpftool map show name xz_sh_peers | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-    SH_STATE_ID=$(bpftool map show name xz_sh_state | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-    SH_STATS_ID=$(bpftool map show name xz_sh_stats | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-    SH_TOTAL_ID=$(bpftool map show name xz_sh_total | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
+    SH_PARSER_ID=$(new_named_prog_id xz_sh_parser "$BASE_SH_PARSER_IDS")
+    SH_VERDICT_ID=$(new_named_prog_id xz_sh_verdict "$BASE_SH_VERDICT_IDS")
+    SH_TARGETS_ID=$(new_named_map_id xz_sh_targets "$BASE_SH_TARGETS_IDS")
+    SH_SOURCES_ID=$(new_named_map_id xz_sh_sources "$BASE_SH_SOURCES_IDS")
+    SH_PEERS_ID=$(new_named_map_id xz_sh_peers "$BASE_SH_PEERS_IDS")
+    SH_STATE_ID=$(new_named_map_id xz_sh_state "$BASE_SH_STATE_IDS")
+    SH_STATS_ID=$(new_named_map_id xz_sh_stats "$BASE_SH_STATS_IDS")
+    SH_TOTAL_ID=$(new_named_map_id xz_sh_total "$BASE_SH_TOTAL_IDS")
     [ -n "$SH_PARSER_ID" ] && [ -n "$SH_VERDICT_ID" ] &&
         [ -n "$SH_TARGETS_ID" ] && [ -n "$SH_SOURCES_ID" ] &&
         [ -n "$SH_PEERS_ID" ] && [ -n "$SH_STATE_ID" ] &&
@@ -442,6 +508,14 @@ fi
 
 cpu_start=$(awk '{print $14 + $15}' "/proc/$XRAY_PID/stat")
 elapsed_start=$(date +%s)
+: >"$LAB_ROOT/rss-kb.samples"
+(
+    while kill -0 "$XRAY_PID" 2>/dev/null; do
+        awk '/^VmRSS:/ {print $2}' "/proc/$XRAY_PID/status" 2>/dev/null || true
+        sleep 1
+    done
+) >>"$LAB_ROOT/rss-kb.samples" &
+RSS_SAMPLER_PID=$!
 index=1
 while [ "$index" -le "$LOAD_CONCURRENCY" ]; do
     ip netns exec "$CLIENT_NS" env LAB_ROOT="$LAB_ROOT" LAB_DOWNLOAD_BYTES="$DOWNLOAD_BYTES" \
@@ -476,6 +550,9 @@ set -e
 kill "$BATCH_WATCHDOG_PID" 2>/dev/null || true
 wait "$BATCH_WATCHDOG_PID" 2>/dev/null || true
 BATCH_WATCHDOG_PID=
+kill "$RSS_SAMPLER_PID" 2>/dev/null || true
+wait "$RSS_SAMPLER_PID" 2>/dev/null || true
+RSS_SAMPLER_PID=
 [ "$batch_status" -eq 0 ] || {
     echo "bounded HTTPS load clients failed: count=$failed_clients first_status=$batch_status" >&2
     exit 1
@@ -485,6 +562,11 @@ cpu_end=$(awk '{print $14 + $15}' "/proc/$XRAY_PID/stat")
 elapsed_seconds=$((elapsed_end - elapsed_start))
 [ "$elapsed_seconds" -gt 0 ] || elapsed_seconds=1
 cpu_ticks=$((cpu_end - cpu_start))
+peak_rss_kb=$(awk 'BEGIN {peak=0} $1 > peak {peak=$1} END {print peak}' "$LAB_ROOT/rss-kb.samples")
+latency_summary=$(awk '{sum += $1; if ($1 > max) max=$1; count++} END {printf "%.0f %.0f", count ? sum/count : 0, max}' "$LAB_ROOT"/client-*.latency-ns)
+set -- $latency_summary
+mean_latency_ns=$1
+max_latency_ns=$2
 
 download_bytes=0
 index=1
@@ -532,8 +614,22 @@ else
     handoff_count=$(grep -Ec 'vision [0-9]+ raw-reactor-handoff target=speed\.cloudflare\.com:443 tls=true tls12=true xtls=true write_direct=true read_direct=true' "$LAB_ROOT/xray.log")
     [ "$handoff_count" -ge "$LOAD_CONCURRENCY" ]
 fi
+scrape_start_ns=$(date +%s%N)
+"$XRAY_BIN" ctl metrics --socket "$CONTROL_SOCKET" >"$LAB_ROOT/metrics.prom"
+scrape_end_ns=$(date +%s%N)
+scrape_bytes=$(wc -c <"$LAB_ROOT/metrics.prom")
+scrape_time_ns=$((scrape_end_ns - scrape_start_ns))
+[ "$scrape_bytes" -le 65536 ]
+grep -q '^xray_zig_ready 1$' "$LAB_ROOT/metrics.prom"
+grep -q '^xray_zig_connections_total{' "$LAB_ROOT/metrics.prom"
+awk '$1 == "xray_zig_bpf_lookup_total{hook=\"sk_lookup\",result=\"hit\"}" && $2 > 0 { found=1 } END { exit !found }' "$LAB_ROOT/metrics.prom"
+awk '$1 == "xray_zig_bpf_lookup_total{hook=\"sk_lookup\",result=\"pass\"}" && $2 > 0 { found=1 } END { exit !found }' "$LAB_ROOT/metrics.prom"
+awk '$1 == "xray_zig_bpf_socket_assign_total{family=\"ipv4\",result=\"success\"}" && $2 > 0 { found=1 } END { exit !found }' "$LAB_ROOT/metrics.prom"
+if [ "$OFFLOAD" -eq 1 ]; then
+    grep -q 'xray_zig_bpf_offload_total{network="tcp",owner="vless_vision",result="offloaded"}' "$LAB_ROOT/metrics.prom"
+fi
 kill -0 "$DHCP_PID"
-echo "PASS WAN HTTPS speed.cloudflare.com flows=$LOAD_CONCURRENCY bytes=$download_bytes elapsed_s=$elapsed_seconds throughput_Bps=$throughput_bytes_per_second cpu_ticks=$cpu_ticks certificate=verified offload=$OFFLOAD"
+echo "PASS WAN HTTPS speed.cloudflare.com flows=$LOAD_CONCURRENCY bytes=$download_bytes elapsed_s=$elapsed_seconds throughput_Bps=$throughput_bytes_per_second cpu_ticks=$cpu_ticks peak_rss_kb=$peak_rss_kb mean_latency_ns=$mean_latency_ns max_latency_ns=$max_latency_ns scrape_bytes=$scrape_bytes scrape_time_ns=$scrape_time_ns monitoring=${XRAY_ZIG_MONITORING:-1} certificate=verified offload=$OFFLOAD"
 
 terminate_pid "$XRAY_PID"
 XRAY_PID=
@@ -544,7 +640,14 @@ XRAY_PID=
 ! bpftool map show id "$BPF_MAP4_ID" >/dev/null 2>&1
 ! bpftool map show id "$BPF_MAP6_ID" >/dev/null 2>&1
 ! bpftool map show id "$BPF_LISTENERS_ID" >/dev/null 2>&1
-for baseline_id in $BASE_MAP4_IDS $BASE_MAP6_IDS; do
+! bpftool map show id "$BPF_COUNTERS_ID" >/dev/null 2>&1
+for baseline_id in $BASE_BPF_PROG_IDS $BASE_SH_PARSER_IDS $BASE_SH_VERDICT_IDS; do
+    bpftool prog show id "$baseline_id" >/dev/null
+done
+for baseline_id in $BASE_MAP4_IDS $BASE_MAP6_IDS \
+    $BASE_BPF_LISTENERS_IDS $BASE_BPF_COUNTERS_IDS \
+    $BASE_SH_TARGETS_IDS $BASE_SH_SOURCES_IDS $BASE_SH_PEERS_IDS \
+    $BASE_SH_STATE_IDS $BASE_SH_STATS_IDS $BASE_SH_TOTAL_IDS; do
     bpftool map show id "$baseline_id" >/dev/null
 done
 if [ "$OFFLOAD" -eq 1 ]; then

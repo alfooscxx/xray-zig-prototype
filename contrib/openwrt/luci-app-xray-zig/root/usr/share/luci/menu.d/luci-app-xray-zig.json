@@ -1,0 +1,13 @@
+{
+  "admin/status/xray-zig": {
+    "title": "xray-zig",
+    "order": 35,
+    "action": {
+      "type": "view",
+      "path": "xray-zig/overview"
+    },
+    "depends": {
+      "acl": [ "luci-app-xray-zig" ]
+    }
+  }
+}

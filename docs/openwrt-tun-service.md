@@ -14,11 +14,24 @@ contains both the `xray0` TUN inbound and any optional SOCKS inbound:
 ```sh
 install -m 0755 xray-zig /usr/bin/xray-zig
 install -m 0755 contrib/openwrt/xray-zig-service /usr/libexec/xray-zig-service
+install -m 0755 contrib/openwrt/xray-zig-prometheus-collector /usr/libexec/xray-zig-prometheus-collector
 install -m 0755 contrib/openwrt/xray-zig.init /etc/init.d/xray-zig
 install -m 0600 xray-zig.json /etc/xray-zig/xray-zig.json
 /etc/init.d/xray-zig enable
 /etc/init.d/xray-zig start
 ```
+
+The service creates the root-only `/run/xray-zig/control.sock`. Read status or
+the bounded Prometheus snapshot locally with:
+
+```sh
+xray-zig ctl status
+/usr/libexec/xray-zig-prometheus-collector
+```
+
+The collector only reads the control socket; it does not open bpffs or locate
+BPF objects by name. An external exporter should invoke it at a 15- or
+30-second interval and keep the resulting endpoint on the management network.
 
 The live nftables chain considers only TCP arriving from `br-lan`. UDP stays
 on the ordinary router path because the runtime does not yet wire UDP into the

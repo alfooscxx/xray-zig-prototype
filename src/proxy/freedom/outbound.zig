@@ -5,6 +5,7 @@ const net = Io.net;
 const config = @import("../../config/mod.zig");
 const dns_client = @import("../../dns/client.zig");
 const log = @import("../../log.zig");
+const monitoring = @import("../../monitoring.zig");
 const session = @import("../../net/session.zig");
 const sockhash = @import("../sk_lookup/sockhash.zig");
 
@@ -87,6 +88,7 @@ pub fn handle(
         return;
     }
     if (sockhash_manager != null) {
+        monitoring.registry.offload(.freedom, .raw_fallback, .nonempty_preface, nowNs(io));
         log.warn("freedom sockhash admission skipped (nonempty-preface); using raw reactor\n", .{});
     }
 
@@ -97,6 +99,11 @@ pub fn handle(
         try writer.interface.flush();
     }
     try raw_reactor.adoptDuplicate(client, upstream);
+}
+
+fn nowNs(io: Io) u64 {
+    const value = Io.Timestamp.now(io, .awake).nanoseconds;
+    return if (value > 0) @intCast(value) else 0;
 }
 
 fn canAttemptSockhash(manager_available: bool, preface_len: usize) bool {

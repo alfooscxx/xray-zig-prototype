@@ -7,11 +7,11 @@ USE_PROCD=1
 start_service() {
     procd_open_instance
     procd_set_param command /usr/libexec/xray-zig-service
-    procd_set_param env XRAY_ZIG_MEMORY_BUDGET_MIB=768 XRAY_ZIG_WORKER_LIMIT=896 XRAY_ZIG_RAW_CONNECTION_LIMIT=1500
+    procd_set_param env XRAY_ZIG_MEMORY_BUDGET_MIB=512 XRAY_ZIG_REALITY_HANDSHAKE_LIMIT=64 XRAY_ZIG_MONITORING=1 XRAY_ZIG_CONTROL_SOCKET=/run/xray-zig/control.sock
     procd_set_param respawn 3600 5 5
     procd_set_param stdout 1
     procd_set_param stderr 1
-    procd_set_param file /etc/xray-zig/xray-zig.json /usr/bin/xray-zig /usr/libexec/xray-zig-service
+    procd_set_param file /etc/xray-zig/xray-zig.json /usr/bin/xray-zig /usr/libexec/xray-zig-service /usr/libexec/xray-zig-prometheus-collector
     procd_set_param term_timeout 15
     procd_close_instance
 }

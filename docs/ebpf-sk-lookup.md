@@ -86,12 +86,16 @@ synthetic address that the dataplane cannot route.
 
 ## Ownership And Ordering
 
-xray-zig creates two HASH maps for exact IPv4 and IPv6 addresses and one
-SOCKMAP for the listener sockets. Values contain `domain_id`, `generation`, and
-the monotonic `route_valid_until_ns`. The program accepts TCP only, checks an
-exact address-map hit and its `bpf_ktime_get_ns` expiry, and calls
-`bpf_sk_assign`. Non-TCP traffic, unknown families, misses, expired entries,
-missing listeners, and assignment failures are fail-open (`SK_PASS`).
+xray-zig creates two HASH maps for exact IPv4 and IPv6 addresses, one SOCKMAP
+for the listener sockets, and a nine-entry per-CPU ARRAY named `xz_sk_count`
+for bounded monitoring counters. Values in the address maps contain
+`domain_id`, `generation`, and the monotonic `route_valid_until_ns`. The program
+accepts TCP only, checks an exact address-map hit and its
+`bpf_ktime_get_ns` expiry, and calls `bpf_sk_assign`. Non-TCP traffic, unknown
+families, misses, expired entries, missing listeners, and assignment failures
+are fail-open (`SK_PASS`). The counter map records hit, miss, expiry, IPv4/IPv6
+assignment success and error, pass, and drop without contended global updates;
+the local control API aggregates it through the process-owned FD.
 
 The runtime uses `bpf()` syscalls directly. It has no runtime dependency on
 bpftool or libbpf and does not use CO-RE or kernel BTF. The program consists
@@ -478,6 +482,12 @@ defaults are eight concurrent verified HTTPS downloads of 8 MiB per arm and a
 180-second whole-batch watchdog. `SOCKHASH_LOAD_CONCURRENCY`,
 `SOCKHASH_DOWNLOAD_BYTES`, and `SOCKHASH_LOAD_TIMEOUT_SECONDS` can override
 those bounds.
+
+The WAN harness snapshots same-name production BPF object IDs before each arm,
+selects only the newly created test objects, and requires those new IDs to be
+gone while every baseline ID remains present after cleanup. This permits the
+isolated namespace test to coexist with the live service without signaling it
+or relying on globally unique BPF object names.
 
 Each flow has a unique output file and certificate verification must succeed.
 The control requires at least N `raw-reactor-handoff` events. The candidate

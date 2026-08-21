@@ -11,11 +11,13 @@ const estimated_raw_connection_kib = 112;
 const estimated_worker_kib = estimated_raw_connection_kib * raw_connections_per_worker;
 const max_memory_budget_mib = 4096;
 const max_requested_capacity = 1_000_000;
+const default_reality_handshake_limit = 32;
 
 const RuntimeCapacity = struct {
     memory_budget_mib: usize,
     worker_limit: usize,
     raw_connection_limit: usize,
+    reality_handshake_limit: usize,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -53,6 +55,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "ctl")) {
+        try runControlClient(args[2..], init.environ_map, io, stdout, stderr);
+        return;
+    }
+
     const config_path = findConfigPath(args[2..]) orelse {
         try stderr.print("missing -config <path>\n\n", .{});
         try usage(stderr);
@@ -86,11 +93,12 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "run")) {
         try xray.core.validate(&cfg);
         try stdout.print(
-            "runtime capacity: memory_budget_mib={d} workers={d} raw_connections={d}\n",
+            "runtime capacity: memory_budget_mib={d} heavy_workers={d} io_uring_raw_connections={d} reality_handshakes={d}\n",
             .{
                 capacity.memory_budget_mib,
                 capacity.worker_limit,
                 capacity.raw_connection_limit,
+                capacity.reality_handshake_limit,
             },
         );
         try stdout.flush();
@@ -100,10 +108,13 @@ pub fn main(init: std.process.Init) !void {
             .cfg = &cfg,
             .allocator = init.gpa,
             .raw_connection_limit = capacity.raw_connection_limit,
+            .reality_handshake_slots = .{ .permits = capacity.reality_handshake_limit },
             // Raw connections are page-sized, long-lived allocations. Freeing
             // them should unmap their storage instead of retaining it in the
             // ReleaseFast SMP allocator's caches.
             .reactor_allocator = std.heap.page_allocator,
+            .monitoring_enabled = monitoringEnabled(init.environ_map),
+            .control_socket_path = init.environ_map.get("XRAY_ZIG_CONTROL_SOCKET") orelse xray.control.default_socket_path,
         };
         try runtime.run(io, stdout);
         return;
@@ -131,9 +142,17 @@ fn runtimeCapacity(environ: *const std.process.Environ.Map) !RuntimeCapacity {
         "XRAY_ZIG_RAW_CONNECTION_LIMIT",
         max_requested_capacity,
     );
+    const reality_handshake_limit = try parseEnvironmentLimit(
+        environ,
+        "XRAY_ZIG_REALITY_HANDSHAKE_LIMIT",
+        default_reality_handshake_limit,
+        max_requested_capacity,
+    );
 
     if (requested_workers == null and requested_raw == null) {
-        return calculateAutomaticCapacity(memory_budget_mib);
+        var capacity = try calculateAutomaticCapacity(memory_budget_mib);
+        capacity.reality_handshake_limit = reality_handshake_limit;
+        return capacity;
     }
 
     if (requested_workers) |workers| {
@@ -142,7 +161,9 @@ fn runtimeCapacity(environ: *const std.process.Environ.Map) !RuntimeCapacity {
             workers,
             raw_connections_per_worker,
         ) catch return error.InvalidRuntimeCapacity;
-        return calculateCapacity(memory_budget_mib, workers, raw_connections);
+        var capacity = try calculateCapacity(memory_budget_mib, workers, raw_connections);
+        capacity.reality_handshake_limit = reality_handshake_limit;
+        return capacity;
     }
 
     const raw_connections = requested_raw.?;
@@ -154,7 +175,9 @@ fn runtimeCapacity(environ: *const std.process.Environ.Map) !RuntimeCapacity {
         @max(@as(usize, 1), (budget_kib - raw_kib) / estimated_worker_kib)
     else
         1;
-    return calculateCapacity(memory_budget_mib, requested_from_remainder, raw_connections);
+    var capacity = try calculateCapacity(memory_budget_mib, requested_from_remainder, raw_connections);
+    capacity.reality_handshake_limit = reality_handshake_limit;
+    return capacity;
 }
 
 fn parseEnvironmentLimit(
@@ -195,12 +218,16 @@ fn calculateAutomaticCapacity(memory_budget_mib: usize) !RuntimeCapacity {
         return error.InvalidRuntimeCapacity;
     const workers = budget_kib / bundle_kib;
     if (workers == 0) return error.MemoryBudgetTooSmall;
-    const raw_connections = std.math.mul(usize, workers, raw_connections_per_worker) catch
-        return error.InvalidRuntimeCapacity;
+    const raw_connections = @min(
+        std.math.mul(usize, workers, raw_connections_per_worker) catch
+            return error.InvalidRuntimeCapacity,
+        xray.net.reactor.max_connections_per_ring,
+    );
     return .{
         .memory_budget_mib = memory_budget_mib,
         .worker_limit = workers,
         .raw_connection_limit = raw_connections,
+        .reality_handshake_limit = default_reality_handshake_limit,
     };
 }
 
@@ -211,6 +238,8 @@ fn calculateCapacity(
 ) !RuntimeCapacity {
     if (memory_budget_mib == 0 or requested_workers == 0 or requested_raw == 0)
         return error.InvalidRuntimeCapacity;
+    if (requested_raw > xray.net.reactor.max_connections_per_ring)
+        return error.RawReactorCapacityTooLarge;
 
     const budget_kib = std.math.mul(usize, memory_budget_mib, 1024) catch
         return error.InvalidRuntimeCapacity;
@@ -224,6 +253,7 @@ fn calculateCapacity(
         .memory_budget_mib = memory_budget_mib,
         .worker_limit = requested_workers,
         .raw_connection_limit = requested_raw,
+        .reality_handshake_limit = default_reality_handshake_limit,
     };
 
     var workers: usize = @intCast(
@@ -251,6 +281,7 @@ fn calculateCapacity(
         .memory_budget_mib = memory_budget_mib,
         .worker_limit = workers,
         .raw_connection_limit = raw_connections,
+        .reality_handshake_limit = default_reality_handshake_limit,
     };
 }
 
@@ -260,9 +291,58 @@ fn usage(writer: *Io.Writer) !void {
         \\  xray-zig check -config <path>
         \\  xray-zig run -config <path>
         \\  xray-zig fakedns-unpin -config <path>
+        \\  xray-zig ctl status|top|metrics|bpf|events [--limit N] [--socket <path>]
         \\  xray-zig version
         \\
     );
+}
+
+fn monitoringEnabled(environ: *const std.process.Environ.Map) bool {
+    const value = environ.get("XRAY_ZIG_MONITORING") orelse return true;
+    return !std.mem.eql(u8, value, "0") and
+        !std.ascii.eqlIgnoreCase(value, "false") and
+        !std.ascii.eqlIgnoreCase(value, "off");
+}
+
+fn runControlClient(
+    args: []const []const u8,
+    environ: *const std.process.Environ.Map,
+    io: Io,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) !void {
+    if (args.len == 0) {
+        try usage(stderr);
+        std.process.exit(2);
+    }
+    const operation = args[0];
+    var socket_path = environ.get("XRAY_ZIG_CONTROL_SOCKET") orelse xray.control.default_socket_path;
+    var limit: ?usize = null;
+    var index: usize = 1;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--socket")) {
+            if (index + 1 >= args.len) return error.MissingControlSocketPath;
+            socket_path = args[index + 1];
+            index += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, args[index], "--limit")) {
+            if (index + 1 >= args.len) return error.MissingEventLimit;
+            limit = try std.fmt.parseUnsigned(usize, args[index + 1], 10);
+            index += 2;
+            continue;
+        }
+        return error.UnknownControlOption;
+    }
+
+    var request_buffer: [xray.control.max_request_bytes]u8 = undefined;
+    const request = if (std.mem.eql(u8, operation, "events"))
+        try std.fmt.bufPrint(&request_buffer, "events {d}", .{limit orelse 50})
+    else blk: {
+        if (limit != null) return error.EventLimitRequiresEvents;
+        break :blk try std.fmt.bufPrint(&request_buffer, "{s}", .{operation});
+    };
+    try xray.control.runClient(io, socket_path, request, stdout);
 }
 
 fn findConfigPath(args: []const []const u8) ?[]const u8 {
@@ -346,6 +426,24 @@ test "automatic 512 MiB capacity has no fixed worker ceiling" {
     try std.testing.expectEqual(@as(usize, 512), capacity.memory_budget_mib);
     try std.testing.expectEqual(@as(usize, 468), capacity.worker_limit);
     try std.testing.expectEqual(@as(usize, 2340), capacity.raw_connection_limit);
+    try std.testing.expectEqual(@as(usize, 32), capacity.reality_handshake_limit);
+}
+
+test "REALITY handshake capacity is configurable through the environment" {
+    var environ: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("XRAY_ZIG_REALITY_HANDSHAKE_LIMIT", "64");
+
+    const capacity = try runtimeCapacity(&environ);
+    try std.testing.expectEqual(@as(usize, 64), capacity.reality_handshake_limit);
+}
+
+test "REALITY handshake capacity rejects zero" {
+    var environ: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("XRAY_ZIG_REALITY_HANDSHAKE_LIMIT", "0");
+
+    try std.testing.expectError(error.InvalidRuntimeCapacity, runtimeCapacity(&environ));
 }
 
 test "explicit runtime requests are proportionally bounded by memory" {
@@ -366,4 +464,13 @@ test "runtime capacity rejects a zero memory budget" {
         error.InvalidRuntimeCapacity,
         calculateCapacity(0, 1, 1),
     );
+}
+
+test "runtime capacity bounds one io_uring shard" {
+    try std.testing.expectError(
+        error.RawReactorCapacityTooLarge,
+        calculateCapacity(4096, 128, xray.net.reactor.max_connections_per_ring + 1),
+    );
+    const automatic = try calculateAutomaticCapacity(4096);
+    try std.testing.expectEqual(xray.net.reactor.max_connections_per_ring, automatic.raw_connection_limit);
 }

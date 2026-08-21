@@ -3,6 +3,7 @@ const Io = std.Io;
 const net = Io.net;
 
 const config = @import("../config/mod.zig");
+const monitoring = @import("../monitoring.zig");
 
 pub const Error = error{
     InvalidFakeDnsPool,
@@ -175,6 +176,9 @@ pub const Store = struct {
         errdefer store.deinit();
         var restore_context: RestoreContext = .{ .store = &store, .now_ns = now_ns };
         try publisher.restore(now_ns, &restore_context, restoreLease);
+        monitoring.registry.fakedns_capacity[@intFromEnum(monitoring.Family.ipv4)].store(store.usable_count, .release);
+        monitoring.registry.fakedns_capacity[@intFromEnum(monitoring.Family.ipv6)].store(store.pool6_usable_count, .release);
+        store.publishLeaseCounts();
         return store;
     }
 
@@ -218,12 +222,22 @@ pub const Store = struct {
         defer self.mutex.unlock(io);
         if (self.domains.get(normalized)) |record| if (record.lease4) |lease| {
             const deadlines = self.expiration(now_ns);
-            try self.publisher.publish4(lease.address, leasePublication(record, lease.generation, deadlines.dns, deadlines.reuse_after));
+            self.publisher.publish4(lease.address, leasePublication(record, lease.generation, deadlines.dns, deadlines.reuse_after)) catch |err| {
+                monitoring.registry.fakeDnsAllocation(.ipv4, .publish_error);
+                return err;
+            };
             lease.dns_expires_ns = deadlines.dns;
             lease.reuse_after_ns = deadlines.reuse_after;
+            monitoring.registry.fakeDnsAllocation(.ipv4, .reused);
             return lease.address;
         };
-        return self.allocate4(normalized, now_ns);
+        const address = self.allocate4(normalized, now_ns) catch |err| {
+            monitoring.registry.fakeDnsAllocation(.ipv4, if (err == error.FakeDnsPoolExhausted) .exhausted else .publish_error);
+            return err;
+        };
+        monitoring.registry.fakeDnsAllocation(.ipv4, .allocated);
+        self.publishLeaseCounts();
+        return address;
     }
 
     pub fn resolveAAAAAt(self: *Store, domain: []const u8, now_ns: u64, io: Io) ![16]u8 {
@@ -233,12 +247,22 @@ pub const Store = struct {
         defer self.mutex.unlock(io);
         if (self.domains.get(normalized)) |record| if (record.lease6) |lease| {
             const deadlines = self.expiration(now_ns);
-            try self.publisher.publish6(lease.address, leasePublication(record, lease.generation, deadlines.dns, deadlines.reuse_after));
+            self.publisher.publish6(lease.address, leasePublication(record, lease.generation, deadlines.dns, deadlines.reuse_after)) catch |err| {
+                monitoring.registry.fakeDnsAllocation(.ipv6, .publish_error);
+                return err;
+            };
             lease.dns_expires_ns = deadlines.dns;
             lease.reuse_after_ns = deadlines.reuse_after;
+            monitoring.registry.fakeDnsAllocation(.ipv6, .reused);
             return lease.address;
         };
-        return self.allocate6(normalized, now_ns);
+        const address = self.allocate6(normalized, now_ns) catch |err| {
+            monitoring.registry.fakeDnsAllocation(.ipv6, if (err == error.FakeDnsPoolExhausted) .exhausted else .publish_error);
+            return err;
+        };
+        monitoring.registry.fakeDnsAllocation(.ipv6, .allocated);
+        self.publishLeaseCounts();
+        return address;
     }
 
     pub fn lookup(self: *Store, address: net.IpAddress, io: Io) ?LeaseHandle {
@@ -249,9 +273,30 @@ pub const Store = struct {
         self.mutex.lock(io) catch return null;
         defer self.mutex.unlock(io);
         return switch (address) {
-            .ip4 => |ip| if (self.leases4.get(bytesToIp(ip.bytes))) |lease| self.acquire4(lease, now_ns) else null,
-            .ip6 => |ip| if (self.leases6.get(ip.bytes)) |lease| self.acquire6(lease, now_ns) else null,
+            .ip4 => |ip| blk: {
+                const lease = self.leases4.get(bytesToIp(ip.bytes)) orelse {
+                    monitoring.registry.fakeDnsLookup(.ipv4, .miss);
+                    break :blk null;
+                };
+                const result = self.acquire4(lease, now_ns);
+                monitoring.registry.fakeDnsLookup(.ipv4, if (result == null) .expired else .hit);
+                break :blk result;
+            },
+            .ip6 => |ip| blk: {
+                const lease = self.leases6.get(ip.bytes) orelse {
+                    monitoring.registry.fakeDnsLookup(.ipv6, .miss);
+                    break :blk null;
+                };
+                const result = self.acquire6(lease, now_ns);
+                monitoring.registry.fakeDnsLookup(.ipv6, if (result == null) .expired else .hit);
+                break :blk result;
+            },
         };
+    }
+
+    fn publishLeaseCounts(self: *const Store) void {
+        monitoring.registry.fakedns_leases[@intFromEnum(monitoring.Family.ipv4)].store(self.leases4.count(), .release);
+        monitoring.registry.fakedns_leases[@intFromEnum(monitoring.Family.ipv6)].store(self.leases6.count(), .release);
     }
 
     pub fn contains(self: *const Store, address: net.IpAddress) bool {

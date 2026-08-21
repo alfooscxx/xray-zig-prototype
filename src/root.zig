@@ -1,7 +1,9 @@
-pub const version = "0.0.8";
+pub const version = @import("version.zig").string;
 
 pub const config = @import("config/mod.zig");
+pub const control = @import("control.zig");
 pub const core = @import("core/mod.zig");
+pub const monitoring = @import("monitoring.zig");
 pub const dns = struct {
     pub const client = @import("dns/client.zig");
     pub const fakedns = @import("dns/fakedns.zig");
@@ -9,6 +11,7 @@ pub const dns = struct {
     pub const upstream = @import("dns/upstream.zig");
 };
 pub const net = struct {
+    pub const reactor = @import("net/reactor.zig");
     pub const session = @import("net/session.zig");
     pub const sniff = @import("net/sniff.zig");
 };
@@ -40,12 +43,15 @@ pub const transport = struct {
 
 test {
     _ = config;
+    _ = control;
     _ = core;
+    _ = monitoring;
     _ = dns.client;
     _ = dns.fakedns;
     _ = dns.protocol;
     _ = dns.upstream;
     _ = net.session;
+    _ = net.reactor;
     _ = net.sniff;
     _ = proxy.blackhole;
     _ = proxy.dns.inbound;

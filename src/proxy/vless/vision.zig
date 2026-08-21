@@ -6,6 +6,7 @@ const session = @import("../../net/session.zig");
 const sockhash = @import("../sk_lookup/sockhash.zig");
 const diagnostics = @import("../../diagnostics.zig");
 const log = @import("../../log.zig");
+const monitoring = @import("../../monitoring.zig");
 
 pub const flow_name = "xtls-rprx-vision";
 
@@ -285,6 +286,8 @@ pub const TrafficState = struct {
 };
 
 pub fn bridge(client: net.Stream, upstream: *session.OutboundConnection, state: *TrafficState, target: session.Target, raw_reactor: *session.RawReactor, sockhash_manager: ?*sockhash.Manager, io: Io) Io.Cancelable!void {
+    monitoring.registry.visionPhaseStart(.scanning);
+    defer monitoring.registry.visionPhaseEnd(.scanning);
     var client_read_buffer: [16 * 1024]u8 = undefined;
     var client_reader = client.reader(io, &client_read_buffer);
     var client_write_buffer: [16 * 1024]u8 = undefined;
@@ -301,6 +304,9 @@ pub fn bridge(client: net.Stream, upstream: *session.OutboundConnection, state: 
             uplink_pending == 0 and client_reader.interface.buffered().len == 0 and
             upstream.rawHandoffReady())
         {
+            monitoring.registry.visionGate(.uplink, .command_direct);
+            monitoring.registry.visionGate(.downlink, .command_direct);
+            monitoring.registry.visionTransition(.command_direct, true);
             upstream.flush() catch |err| {
                 logBridgeExit(@errorName(err), state, target);
                 return;
@@ -308,27 +314,42 @@ pub fn bridge(client: net.Stream, upstream: *session.OutboundConnection, state: 
             if (sockhash_manager) |manager| {
                 const admission = manager.admitOwned(client, upstream.pollStream(), raw_reactor, .vless_vision);
                 switch (admission) {
-                    .offloaded => logTargetEvent("sockhash-handoff", state, target),
-                    .hybrid_raw => |reason| log.warn("vless {d} sockhash partial admission ({s}); hybrid raw fallback\n", .{ state.connection_id, @tagName(reason) }),
+                    .offloaded => {
+                        monitoring.registry.visionTransition(.sockhash_handoff, true);
+                        logTargetEvent("sockhash-handoff", state, target);
+                    },
+                    .hybrid_raw => |reason| {
+                        monitoring.registry.visionTransition(.sockhash_handoff, false);
+                        monitoring.registry.visionTransition(.raw_handoff, true);
+                        log.warn("vless {d} sockhash partial admission ({s}); hybrid raw fallback\n", .{ state.connection_id, @tagName(reason) });
+                    },
                     .fallback => |reason| {
+                        monitoring.registry.visionTransition(.sockhash_handoff, false);
                         log.warn("vless {d} sockhash admission fallback ({s}); using raw reactor\n", .{ state.connection_id, @tagName(reason) });
                         raw_reactor.adoptDuplicate(client, upstream.pollStream()) catch |err| {
+                            monitoring.registry.visionTransition(.raw_handoff, false);
                             logBridgeExit(@errorName(err), state, target);
                             return;
                         };
+                        monitoring.registry.visionTransition(.raw_handoff, true);
                         logTargetEvent("raw-reactor-handoff", state, target);
                     },
-                    .terminal => |reason| log.warn(
-                        "vless {d} sockhash cutover failed closed ({s})\n",
-                        .{ state.connection_id, @tagName(reason) },
-                    ),
+                    .terminal => |reason| {
+                        monitoring.registry.visionTransition(.sockhash_handoff, false);
+                        log.warn(
+                            "vless {d} sockhash cutover failed closed ({s})\n",
+                            .{ state.connection_id, @tagName(reason) },
+                        );
+                    },
                 }
                 return;
             }
             raw_reactor.adoptDuplicate(client, upstream.pollStream()) catch |err| {
+                monitoring.registry.visionTransition(.raw_handoff, false);
                 logBridgeExit(@errorName(err), state, target);
                 return;
             };
+            monitoring.registry.visionTransition(.raw_handoff, true);
             logTargetEvent("raw-reactor-handoff", state, target);
             return;
         }
@@ -481,6 +502,7 @@ fn forwardDownlinkOnce(
     chunk: *[16 * 1024]u8,
     decoded: *[16 * 1024 + first_frame_overhead]u8,
 ) bool {
+    const was_direct = state.outbound.reader_direct_copy;
     const n = source.read(chunk, io) catch |err| switch (err) {
         error.ReadPending => return true,
         else => return false,
@@ -490,6 +512,7 @@ fn forwardDownlinkOnce(
     var decoded_writer: Io.Writer = .fixed(decoded);
     decodeChunk(state, .downlink, chunk[0..n], &decoded_writer) catch return false;
     const cleartext = decoded_writer.buffered();
+    monitoring.registry.addVisionBytes(.downlink, if (was_direct) .direct else .framed, cleartext.len);
     log.trace(
         "vision {d} downlink chunk outer_clear={d} decoded={d} read_direct={}\n",
         .{ state.connection_id, n, cleartext.len, state.outbound.reader_direct_copy },
@@ -510,6 +533,10 @@ fn forwardDownlinkOnce(
 
 fn writeVision(direction: Direction, destination: *session.OutboundConnection, state: *TrafficState, bytes: []const u8, io: Io) !void {
     const link = writerState(state, direction);
+    monitoring.registry.addVisionBytes(switch (direction) {
+        .uplink => .uplink,
+        .downlink => .downlink,
+    }, if (link.writer_direct_copy) .direct else .framed, bytes.len);
     if (link.writer_direct_copy) {
         destination.enableDirectWrite();
         try destination.writeAll(bytes, io);

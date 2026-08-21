@@ -5,6 +5,7 @@ const Io = std.Io;
 const fakedns = @import("../../dns/fakedns.zig");
 const config = @import("../../config/mod.zig");
 const log = @import("../../log.zig");
+const monitoring = @import("../../monitoring.zig");
 
 const linux = std.os.linux;
 const BPF = linux.BPF;
@@ -16,6 +17,28 @@ const ipproto_tcp = 6;
 const sk_pass = 1;
 const listener4_key: u32 = 0;
 const listener6_key: u32 = 1;
+const counter_count = 9;
+const max_counter_cpus = 256;
+
+pub const Counter = enum(u32) {
+    lookup_hit,
+    lookup_miss,
+    lookup_expiry,
+    assign4_success,
+    assign4_error,
+    assign6_success,
+    assign6_error,
+    pass,
+    drop,
+};
+
+pub const CounterSnapshot = struct {
+    values: [counter_count]u64,
+
+    pub fn get(self: CounterSnapshot, counter: Counter) u64 {
+        return self.values[@intFromEnum(counter)];
+    }
+};
 const metadata_magic: u64 = 0x585a46444e534d31; // XZFDNSM1
 const metadata_schema_version: u32 = 1;
 const metadata_header_kind: u16 = 1;
@@ -103,6 +126,8 @@ pub const Dataplane = struct {
     fake6_fd: fd_t,
     metadata_fd: ?fd_t,
     listeners_fd: fd_t,
+    counters_fd: fd_t,
+    counter_cpu_count: usize,
     program_fd: fd_t,
     link_fd: ?fd_t = null,
     persistence_lock_fd: ?fd_t,
@@ -151,11 +176,15 @@ pub const Dataplane = struct {
         const listeners_fd = try createMap(.sockmap, @sizeOf(u32), @sizeOf(u32), 2, 0, "xz_listeners");
         errdefer closeFd(listeners_fd);
 
+        const counter_cpu_count = try possibleCpuCount(io);
+        const counters_fd = try createMap(.percpu_array, @sizeOf(u32), @sizeOf(u64), counter_count, 0, "xz_sk_count");
+        errdefer closeFd(counters_fd);
+
         try update(listeners_fd, std.mem.asBytes(&listener4_key), std.mem.asBytes(&listener4_fd));
         try update(listeners_fd, std.mem.asBytes(&listener6_key), std.mem.asBytes(&listener6_fd));
 
-        const instructions = program(owned_maps.fake4_fd, owned_maps.fake6_fd, listeners_fd);
-        const program_fd = try loadProgram(&instructions);
+        const instructions = program(owned_maps.fake4_fd, owned_maps.fake6_fd, listeners_fd, counters_fd);
+        const program_fd = try loadProgram(instructions.slice());
         errdefer closeFd(program_fd);
 
         return .{
@@ -163,6 +192,8 @@ pub const Dataplane = struct {
             .fake6_fd = owned_maps.fake6_fd,
             .metadata_fd = owned_maps.metadata_fd,
             .listeners_fd = listeners_fd,
+            .counters_fd = counters_fd,
+            .counter_cpu_count = counter_cpu_count,
             .program_fd = program_fd,
             .persistence_lock_fd = persistence_lock_fd,
             .config_fingerprint = fingerprint,
@@ -180,6 +211,7 @@ pub const Dataplane = struct {
         if (self.link_fd) |fd| closeFd(fd);
         closeFd(self.program_fd);
         closeFd(self.listeners_fd);
+        closeFd(self.counters_fd);
         if (self.metadata_fd) |fd| closeFd(fd);
         closeFd(self.fake6_fd);
         closeFd(self.fake4_fd);
@@ -198,14 +230,38 @@ pub const Dataplane = struct {
         };
     }
 
+    pub fn counterSnapshot(self: *const Dataplane) !CounterSnapshot {
+        var snapshot: CounterSnapshot = .{ .values = @splat(0) };
+        var per_cpu: [max_counter_cpus]u64 = @splat(0);
+        for (0..counter_count) |index| {
+            const key: u32 = @intCast(index);
+            @memset(per_cpu[0..self.counter_cpu_count], 0);
+            _ = try lookup(
+                self.counters_fd,
+                std.mem.asBytes(&key),
+                std.mem.sliceAsBytes(per_cpu[0..self.counter_cpu_count]),
+            );
+            for (per_cpu[0..self.counter_cpu_count]) |value| snapshot.values[index] +%= value;
+        }
+        return snapshot;
+    }
+
     fn publish4(context: ?*anyopaque, address: [4]u8, value: fakedns.LeasePublication) !void {
         const self: *Dataplane = @ptrCast(@alignCast(context.?));
-        try self.publishFamily(metadata_family4, &address, self.fake4_fd, value);
+        self.publishFamily(metadata_family4, &address, self.fake4_fd, value) catch |err| {
+            monitoring.registry.bpfMapUpdate(.ipv4, false);
+            return err;
+        };
+        monitoring.registry.bpfMapUpdate(.ipv4, true);
     }
 
     fn publish6(context: ?*anyopaque, address: [16]u8, value: fakedns.LeasePublication) !void {
         const self: *Dataplane = @ptrCast(@alignCast(context.?));
-        try self.publishFamily(metadata_family6, &address, self.fake6_fd, value);
+        self.publishFamily(metadata_family6, &address, self.fake6_fd, value) catch |err| {
+            monitoring.registry.bpfMapUpdate(.ipv6, false);
+            return err;
+        };
+        monitoring.registry.bpfMapUpdate(.ipv6, true);
     }
 
     fn remove4(context: ?*anyopaque, address: [4]u8) void {
@@ -896,90 +952,211 @@ fn closeFd(fd: fd_t) void {
     _ = linux.close(fd);
 }
 
-fn program(fake4_fd: fd_t, fake6_fd: fd_t, listeners_fd: fd_t) [68]BPF.Insn {
-    return .{
-        BPF.Insn.mov(.r6, .r1),
-        BPF.Insn.mov(.r0, sk_pass),
-        BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "protocol")),
-        BPF.Insn.jne(.r2, ipproto_tcp, 62),
-        BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "family")),
-        BPF.Insn.jeq(.r2, af_inet, 34),
-        BPF.Insn.jne(.r2, af_inet6, 59),
+fn possibleCpuCount(io: Io) !usize {
+    var file = try Io.Dir.openFileAbsolute(io, "/sys/devices/system/cpu/possible", .{});
+    defer file.close(io);
+    var buffer: [128]u8 = undefined;
+    const len = try file.readStreaming(io, &.{&buffer});
+    if (len == 0 or len == buffer.len) return error.InvalidPossibleCpuList;
+    return parsePossibleCpuCount(std.mem.trim(u8, buffer[0..len], " \t\r\n"));
+}
 
-        BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "local_ip6")),
-        BPF.Insn.stx(.word, .r10, -16, .r2),
-        BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "local_ip6") + 4),
-        BPF.Insn.stx(.word, .r10, -12, .r2),
-        BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "local_ip6") + 8),
-        BPF.Insn.stx(.word, .r10, -8, .r2),
-        BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "local_ip6") + 12),
-        BPF.Insn.stx(.word, .r10, -4, .r2),
-        BPF.Insn.ld_map_fd1(.r1, fake6_fd),
-        BPF.Insn.ld_map_fd2(fake6_fd),
-        BPF.Insn.mov(.r2, .r10),
-        BPF.Insn.add(.r2, -16),
-        BPF.Insn.call(.map_lookup_elem),
-        BPF.Insn.jeq(.r0, 0, 45),
-        BPF.Insn.mov(.r7, .r0),
-        BPF.Insn.call(.ktime_get_ns),
-        BPF.Insn.ldx(.double_word, .r8, .r7, 16),
-        BPF.Insn.jge(.r0, .r8, 41),
-        BPF.Insn.st(.word, .r10, -20, listener6_key),
-        BPF.Insn.ld_map_fd1(.r1, listeners_fd),
-        BPF.Insn.ld_map_fd2(listeners_fd),
-        BPF.Insn.mov(.r2, .r10),
-        BPF.Insn.add(.r2, -20),
-        BPF.Insn.call(.map_lookup_elem),
-        BPF.Insn.jeq(.r0, 0, 34),
-        BPF.Insn.mov(.r7, .r0),
-        BPF.Insn.mov(.r1, .r6),
-        BPF.Insn.mov(.r2, .r7),
-        BPF.Insn.mov(.r3, 0),
-        BPF.Insn.call(.sk_assign),
-        BPF.Insn.mov(.r1, .r7),
-        BPF.Insn.call(.sk_release),
-        BPF.Insn.ja(26),
+fn parsePossibleCpuCount(text: []const u8) !usize {
+    var count: usize = 0;
+    var ranges = std.mem.splitScalar(u8, text, ',');
+    while (ranges.next()) |range| {
+        if (range.len == 0) return error.InvalidPossibleCpuList;
+        if (std.mem.indexOfScalar(u8, range, '-')) |dash| {
+            const first = std.fmt.parseUnsigned(usize, range[0..dash], 10) catch
+                return error.InvalidPossibleCpuList;
+            const last = std.fmt.parseUnsigned(usize, range[dash + 1 ..], 10) catch
+                return error.InvalidPossibleCpuList;
+            if (last < first) return error.InvalidPossibleCpuList;
+            count = std.math.add(usize, count, last - first + 1) catch
+                return error.UnsupportedBpfCounterCpuCount;
+        } else {
+            _ = std.fmt.parseUnsigned(usize, range, 10) catch
+                return error.InvalidPossibleCpuList;
+            count = std.math.add(usize, count, 1) catch
+                return error.UnsupportedBpfCounterCpuCount;
+        }
+    }
+    if (count == 0 or count > max_counter_cpus) return error.UnsupportedBpfCounterCpuCount;
+    return count;
+}
 
-        BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "local_ip4")),
-        BPF.Insn.stx(.word, .r10, -4, .r2),
-        BPF.Insn.ld_map_fd1(.r1, fake4_fd),
-        BPF.Insn.ld_map_fd2(fake4_fd),
-        BPF.Insn.mov(.r2, .r10),
-        BPF.Insn.add(.r2, -4),
-        BPF.Insn.call(.map_lookup_elem),
-        BPF.Insn.jeq(.r0, 0, 18),
-        BPF.Insn.mov(.r7, .r0),
-        BPF.Insn.call(.ktime_get_ns),
-        BPF.Insn.ldx(.double_word, .r8, .r7, 16),
-        BPF.Insn.jge(.r0, .r8, 14),
-        BPF.Insn.st(.word, .r10, -20, listener4_key),
-        BPF.Insn.ld_map_fd1(.r1, listeners_fd),
-        BPF.Insn.ld_map_fd2(listeners_fd),
-        BPF.Insn.mov(.r2, .r10),
-        BPF.Insn.add(.r2, -20),
-        BPF.Insn.call(.map_lookup_elem),
-        BPF.Insn.jeq(.r0, 0, 7),
-        BPF.Insn.mov(.r7, .r0),
-        BPF.Insn.mov(.r1, .r6),
-        BPF.Insn.mov(.r2, .r7),
-        BPF.Insn.mov(.r3, 0),
-        BPF.Insn.call(.sk_assign),
-        BPF.Insn.mov(.r1, .r7),
-        BPF.Insn.call(.sk_release),
+const Program = struct {
+    instructions: [192]BPF.Insn = undefined,
+    len: usize = 0,
 
-        BPF.Insn.mov(.r0, sk_pass),
-        BPF.Insn.exit(),
-    };
+    fn emit(self: *Program, instruction: BPF.Insn) usize {
+        std.debug.assert(self.len < self.instructions.len);
+        const index = self.len;
+        self.instructions[index] = instruction;
+        self.len += 1;
+        return index;
+    }
+
+    fn patch(self: *Program, jump_index: usize, target_index: usize) void {
+        const distance = @as(isize, @intCast(target_index)) - @as(isize, @intCast(jump_index)) - 1;
+        self.instructions[jump_index].off = @intCast(distance);
+    }
+
+    fn slice(self: *const Program) []const BPF.Insn {
+        return self.instructions[0..self.len];
+    }
+};
+
+fn emitCounter(result: *Program, counters_fd: fd_t, counter: Counter) void {
+    _ = result.emit(BPF.Insn.st(.word, .r10, -24, @intCast(@intFromEnum(counter))));
+    _ = result.emit(BPF.Insn.ld_map_fd1(.r1, counters_fd));
+    _ = result.emit(BPF.Insn.ld_map_fd2(counters_fd));
+    _ = result.emit(BPF.Insn.mov(.r2, .r10));
+    _ = result.emit(BPF.Insn.add(.r2, -24));
+    _ = result.emit(BPF.Insn.call(.map_lookup_elem));
+    _ = result.emit(BPF.Insn.jeq(.r0, 0, 2));
+    _ = result.emit(BPF.Insn.mov(.r1, 1));
+    _ = result.emit(BPF.Insn.xadd(.r0, .r1));
+}
+
+fn program(fake4_fd: fd_t, fake6_fd: fd_t, listeners_fd: fd_t, counters_fd: fd_t) Program {
+    var result: Program = .{};
+    _ = result.emit(BPF.Insn.mov(.r6, .r1));
+    _ = result.emit(BPF.Insn.mov(.r0, sk_pass));
+    _ = result.emit(BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "protocol")));
+    const non_tcp_jump = result.emit(BPF.Insn.jne(.r2, ipproto_tcp, 0));
+    _ = result.emit(BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "family")));
+    const ipv4_jump = result.emit(BPF.Insn.jeq(.r2, af_inet, 0));
+    const unknown_family_jump = result.emit(BPF.Insn.jne(.r2, af_inet6, 0));
+
+    _ = result.emit(BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "local_ip6")));
+    _ = result.emit(BPF.Insn.stx(.word, .r10, -16, .r2));
+    _ = result.emit(BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "local_ip6") + 4));
+    _ = result.emit(BPF.Insn.stx(.word, .r10, -12, .r2));
+    _ = result.emit(BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "local_ip6") + 8));
+    _ = result.emit(BPF.Insn.stx(.word, .r10, -8, .r2));
+    _ = result.emit(BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "local_ip6") + 12));
+    _ = result.emit(BPF.Insn.stx(.word, .r10, -4, .r2));
+    _ = result.emit(BPF.Insn.ld_map_fd1(.r1, fake6_fd));
+    _ = result.emit(BPF.Insn.ld_map_fd2(fake6_fd));
+    _ = result.emit(BPF.Insn.mov(.r2, .r10));
+    _ = result.emit(BPF.Insn.add(.r2, -16));
+    _ = result.emit(BPF.Insn.call(.map_lookup_elem));
+    const ipv6_miss_jump = result.emit(BPF.Insn.jeq(.r0, 0, 0));
+    _ = result.emit(BPF.Insn.mov(.r7, .r0));
+    _ = result.emit(BPF.Insn.call(.ktime_get_ns));
+    _ = result.emit(BPF.Insn.ldx(.double_word, .r8, .r7, 16));
+    const ipv6_expiry_jump = result.emit(BPF.Insn.jge(.r0, .r8, 0));
+    emitCounter(&result, counters_fd, .lookup_hit);
+    _ = result.emit(BPF.Insn.st(.word, .r10, -20, listener6_key));
+    _ = result.emit(BPF.Insn.ld_map_fd1(.r1, listeners_fd));
+    _ = result.emit(BPF.Insn.ld_map_fd2(listeners_fd));
+    _ = result.emit(BPF.Insn.mov(.r2, .r10));
+    _ = result.emit(BPF.Insn.add(.r2, -20));
+    _ = result.emit(BPF.Insn.call(.map_lookup_elem));
+    const ipv6_listener_miss_jump = result.emit(BPF.Insn.jeq(.r0, 0, 0));
+    _ = result.emit(BPF.Insn.mov(.r7, .r0));
+    _ = result.emit(BPF.Insn.mov(.r1, .r6));
+    _ = result.emit(BPF.Insn.mov(.r2, .r7));
+    _ = result.emit(BPF.Insn.mov(.r3, 0));
+    _ = result.emit(BPF.Insn.call(.sk_assign));
+    _ = result.emit(BPF.Insn.mov(.r8, .r0));
+    _ = result.emit(BPF.Insn.mov(.r1, .r7));
+    _ = result.emit(BPF.Insn.call(.sk_release));
+    const ipv6_assign_error_jump = result.emit(BPF.Insn.jne(.r8, 0, 0));
+    emitCounter(&result, counters_fd, .assign6_success);
+    const ipv6_success_exit_jump = result.emit(BPF.Insn.ja(0));
+    const ipv6_assign_error = result.len;
+    emitCounter(&result, counters_fd, .assign6_error);
+    const ipv6_error_exit_jump = result.emit(BPF.Insn.ja(0));
+
+    const ipv4_start = result.len;
+    _ = result.emit(BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "local_ip4")));
+    _ = result.emit(BPF.Insn.stx(.word, .r10, -4, .r2));
+    _ = result.emit(BPF.Insn.ld_map_fd1(.r1, fake4_fd));
+    _ = result.emit(BPF.Insn.ld_map_fd2(fake4_fd));
+    _ = result.emit(BPF.Insn.mov(.r2, .r10));
+    _ = result.emit(BPF.Insn.add(.r2, -4));
+    _ = result.emit(BPF.Insn.call(.map_lookup_elem));
+    const ipv4_miss_jump = result.emit(BPF.Insn.jeq(.r0, 0, 0));
+    _ = result.emit(BPF.Insn.mov(.r7, .r0));
+    _ = result.emit(BPF.Insn.call(.ktime_get_ns));
+    _ = result.emit(BPF.Insn.ldx(.double_word, .r8, .r7, 16));
+    const ipv4_expiry_jump = result.emit(BPF.Insn.jge(.r0, .r8, 0));
+    emitCounter(&result, counters_fd, .lookup_hit);
+    _ = result.emit(BPF.Insn.st(.word, .r10, -20, listener4_key));
+    _ = result.emit(BPF.Insn.ld_map_fd1(.r1, listeners_fd));
+    _ = result.emit(BPF.Insn.ld_map_fd2(listeners_fd));
+    _ = result.emit(BPF.Insn.mov(.r2, .r10));
+    _ = result.emit(BPF.Insn.add(.r2, -20));
+    _ = result.emit(BPF.Insn.call(.map_lookup_elem));
+    const ipv4_listener_miss_jump = result.emit(BPF.Insn.jeq(.r0, 0, 0));
+    _ = result.emit(BPF.Insn.mov(.r7, .r0));
+    _ = result.emit(BPF.Insn.mov(.r1, .r6));
+    _ = result.emit(BPF.Insn.mov(.r2, .r7));
+    _ = result.emit(BPF.Insn.mov(.r3, 0));
+    _ = result.emit(BPF.Insn.call(.sk_assign));
+    _ = result.emit(BPF.Insn.mov(.r8, .r0));
+    _ = result.emit(BPF.Insn.mov(.r1, .r7));
+    _ = result.emit(BPF.Insn.call(.sk_release));
+    const ipv4_assign_error_jump = result.emit(BPF.Insn.jne(.r8, 0, 0));
+    emitCounter(&result, counters_fd, .assign4_success);
+    const ipv4_success_exit_jump = result.emit(BPF.Insn.ja(0));
+    const ipv4_assign_error = result.len;
+    emitCounter(&result, counters_fd, .assign4_error);
+    const ipv4_error_exit_jump = result.emit(BPF.Insn.ja(0));
+
+    const lookup_miss = result.len;
+    emitCounter(&result, counters_fd, .lookup_miss);
+    const miss_exit_jump = result.emit(BPF.Insn.ja(0));
+    const lookup_expiry = result.len;
+    emitCounter(&result, counters_fd, .lookup_expiry);
+    const exit_index = result.len;
+    emitCounter(&result, counters_fd, .pass);
+    _ = result.emit(BPF.Insn.mov(.r0, sk_pass));
+    _ = result.emit(BPF.Insn.exit());
+
+    result.patch(non_tcp_jump, exit_index);
+    result.patch(ipv4_jump, ipv4_start);
+    result.patch(unknown_family_jump, exit_index);
+    result.patch(ipv6_miss_jump, lookup_miss);
+    result.patch(ipv6_expiry_jump, lookup_expiry);
+    result.patch(ipv6_listener_miss_jump, ipv6_assign_error);
+    result.patch(ipv6_assign_error_jump, ipv6_assign_error);
+    result.patch(ipv6_success_exit_jump, exit_index);
+    result.patch(ipv6_error_exit_jump, exit_index);
+    result.patch(ipv4_miss_jump, lookup_miss);
+    result.patch(ipv4_expiry_jump, lookup_expiry);
+    result.patch(ipv4_listener_miss_jump, ipv4_assign_error);
+    result.patch(ipv4_assign_error_jump, ipv4_assign_error);
+    result.patch(ipv4_success_exit_jump, exit_index);
+    result.patch(ipv4_error_exit_jump, exit_index);
+    result.patch(miss_exit_jump, exit_index);
+    return result;
 }
 
 test "SK_LOOKUP program has stable UAPI-only instruction layout" {
-    const instructions = program(10, 11, 12);
-    try std.testing.expectEqual(@as(usize, 68), instructions.len);
-    try std.testing.expectEqual(BPF.Insn.call(.sk_assign), instructions[36]);
-    try std.testing.expectEqual(BPF.Insn.call(.sk_release), instructions[38]);
-    try std.testing.expectEqual(BPF.Insn.call(.sk_assign), instructions[63]);
-    try std.testing.expectEqual(BPF.Insn.call(.sk_release), instructions[65]);
+    const generated = program(10, 11, 12, 13);
+    const instructions = generated.slice();
+    var assign_count: usize = 0;
+    var release_count: usize = 0;
+    var counter_updates: usize = 0;
+    for (instructions) |instruction| {
+        if (std.meta.eql(BPF.Insn.call(.sk_assign), instruction)) assign_count += 1;
+        if (std.meta.eql(BPF.Insn.call(.sk_release), instruction)) release_count += 1;
+        if (std.meta.eql(BPF.Insn.xadd(.r0, .r1), instruction)) counter_updates += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), assign_count);
+    try std.testing.expectEqual(@as(usize, 2), release_count);
+    try std.testing.expectEqual(@as(usize, 9), counter_updates);
     try std.testing.expectEqual(BPF.Insn.exit(), instructions[instructions.len - 1]);
+}
+
+test "possible CPU list parser bounds per-CPU snapshots" {
+    try std.testing.expectEqual(@as(usize, 4), try parsePossibleCpuCount("0-3"));
+    try std.testing.expectEqual(@as(usize, 6), try parsePossibleCpuCount("0-3,8,10"));
+    try std.testing.expectError(error.InvalidPossibleCpuList, parsePossibleCpuCount("3-1"));
+    try std.testing.expectError(error.UnsupportedBpfCounterCpuCount, parsePossibleCpuCount("0-256"));
 }
 
 test "FakeDNS persistence schema validates exact map ABI" {

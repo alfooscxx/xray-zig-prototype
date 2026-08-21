@@ -5,6 +5,7 @@ const net = Io.net;
 const config = @import("../../config/mod.zig");
 const diagnostics = @import("../../diagnostics.zig");
 const log = @import("../../log.zig");
+const monitoring = @import("../../monitoring.zig");
 const session = @import("../../net/session.zig");
 const sockhash = @import("../sk_lookup/sockhash.zig");
 pub const vision = @import("vision.zig");
@@ -21,12 +22,10 @@ pub const Error = error{
 
 const max_initial_tls_record_len = 18 * 1024;
 const max_response_header_len = 2 + std.math.maxInt(u8);
-const max_concurrent_handshakes = 32;
 const initialization_timeout_seconds = 15;
 var next_connection_id: std.atomic.Value(u32) = .init(1);
-var handshake_slots: Io.Semaphore = .{ .permits = max_concurrent_handshakes };
 
-pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: session.Session, preface: session.Preface, raw_reactor: *session.RawReactor, sockhash_manager: ?*sockhash.Manager, io: Io) !void {
+pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: session.Session, preface: session.Preface, raw_reactor: *session.RawReactor, handshake_slots: *Io.Semaphore, sockhash_manager: ?*sockhash.Manager, io: Io) !void {
     diagnostics.setThreadName("xz-vless-init");
     defer diagnostics.setThreadName("xray-zig");
     const connection_id = next_connection_id.fetchAdd(1, .monotonic);
@@ -36,11 +35,16 @@ pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: sessio
     };
     logTarget(connection_id, sess.target);
 
+    const handshake_started = nowNs(io);
+    monitoring.registry.realityStart();
     var upstream: session.OutboundConnection = undefined;
-    connect(&upstream, outbound, settings, io) catch |err| {
+    connect(&upstream, outbound, settings, handshake_slots, io) catch |err| {
+        monitoring.registry.realityEnd(.server_response, false, nowNs(io) -| handshake_started);
+        monitoring.registry.addEvent(.reality_failure, .none, nowNs(io));
         log.warn("vless {d} REALITY initialization failed: {s}\n", .{ connection_id, @errorName(err) });
         return err;
     };
+    monitoring.registry.realityEnd(.established, true, nowNs(io) -| handshake_started);
     defer upstream.close(io);
     log.trace("vless {d} reality-ready\n", .{connection_id});
 
@@ -60,9 +64,11 @@ pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: sessio
         try upstream.flush();
         diagnostics.setThreadName("xz-vless-wait");
         waitResponseHeader(client, &upstream, &traffic_state, io) catch |err| {
+            monitoring.registry.realityOutcome(.vless_response_header, false);
             log.warn("vless {d} response wait failed: {s}\n", .{ connection_id, @errorName(err) });
             return err;
         };
+        monitoring.registry.realityOutcome(.vless_response_header, true);
         log.trace("vless {d} response-ready\n", .{connection_id});
         logEstablished(connection_id, sess.target, traffic_state.is_tls);
         diagnostics.setThreadName("xz-vision-scan");
@@ -76,6 +82,11 @@ pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: sessio
     try readResponseHeader(&upstream, io);
 
     try session.bridgeOutbound(client, &upstream, io);
+}
+
+fn nowNs(io: Io) u64 {
+    const value = Io.Timestamp.now(io, .awake).nanoseconds;
+    return if (value > 0) @intCast(value) else 0;
 }
 
 fn logEstablished(connection_id: u32, target: session.Target, client_tls: bool) void {
@@ -221,7 +232,7 @@ fn expectedInitialTlsRecordLen(bytes: []const u8) !?usize {
     return record_len;
 }
 
-fn connect(upstream: *session.OutboundConnection, outbound: *const config.Outbound, settings: config.VlessOutboundSettings, io: Io) !void {
+fn connect(upstream: *session.OutboundConnection, outbound: *const config.Outbound, settings: config.VlessOutboundSettings, handshake_slots: *Io.Semaphore, io: Io) !void {
     try handshake_slots.wait(io);
     defer handshake_slots.post(io);
 

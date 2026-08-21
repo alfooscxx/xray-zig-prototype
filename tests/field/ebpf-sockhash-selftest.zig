@@ -105,7 +105,10 @@ fn runManager(manager: *sockhash.Manager) Io.Cancelable!void {
 }
 
 fn runReactor(reactor: *session.RawReactor) Io.Cancelable!void {
-    try reactor.run();
+    reactor.run() catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => std.debug.panic("raw io_uring reactor stopped: {s}", .{@errorName(err)}),
+    };
 }
 
 fn testPrequeuedOrderingAndHalfClose(
