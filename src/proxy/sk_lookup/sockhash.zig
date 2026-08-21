@@ -502,16 +502,14 @@ pub const Manager = struct {
             var current = active_head;
             while (current) |flow| : (current = flow.next) {
                 self.poll_flows[count] = flow;
-                self.poll_fds[count * 2 + 1] = .{
-                    .fd = flow.client.socket.handle,
-                    .events = posix.POLL.IN | poll_rdhup,
-                    .revents = 0,
-                };
-                self.poll_fds[count * 2 + 2] = .{
-                    .fd = flow.upstream.socket.handle,
-                    .events = posix.POLL.IN | poll_rdhup,
-                    .revents = 0,
-                };
+                self.poll_fds[count * 2 + 1] = sourcePollFd(
+                    flow.client.socket.handle,
+                    flow.lifecycle.client_eof,
+                );
+                self.poll_fds[count * 2 + 2] = sourcePollFd(
+                    flow.upstream.socket.handle,
+                    flow.lifecycle.upstream_eof,
+                );
                 count += 1;
             }
 
@@ -752,6 +750,18 @@ fn inspectSource(fd: fd_t, events: i16) Observation {
         .redirected => .none,
         .eof => .eof,
         .payload => .reset,
+    };
+}
+
+fn sourcePollFd(fd: fd_t, eof: bool) posix.pollfd {
+    // POLLIN and POLLRDHUP are level-triggered at EOF. Once that FIN has been
+    // propagated, leaving the descriptor in poll makes the manager wake
+    // continuously until the opposite half closes. A negative descriptor is
+    // explicitly ignored by poll while ownership of the socket is retained.
+    return .{
+        .fd = if (eof) -1 else fd,
+        .events = if (eof) 0 else posix.POLL.IN | poll_rdhup,
+        .revents = 0,
     };
 }
 
@@ -1153,6 +1163,17 @@ test "SOCKHASH lifecycle handles FIN in both orders and half-close response" {
     const second = upstream_first.observe(.client, .eof);
     try std.testing.expect(second.shutdown_upstream_send);
     try std.testing.expect(second.close);
+}
+
+test "SOCKHASH monitor ignores a source after observing its FIN" {
+    const active = sourcePollFd(42, false);
+    try std.testing.expectEqual(@as(fd_t, 42), active.fd);
+    try std.testing.expect(active.events & posix.POLL.IN != 0);
+    try std.testing.expect(active.events & poll_rdhup != 0);
+
+    const half_closed = sourcePollFd(42, true);
+    try std.testing.expectEqual(@as(fd_t, -1), half_closed.fd);
+    try std.testing.expectEqual(@as(i16, 0), half_closed.events);
 }
 
 test "SOCKHASH admission propagates FIN observed by initial source kicks exactly once" {
