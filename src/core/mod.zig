@@ -15,6 +15,8 @@ const blackhole = @import("../proxy/blackhole/outbound.zig");
 const freedom = @import("../proxy/freedom/outbound.zig");
 const redirect = @import("../proxy/redirect/inbound.zig");
 const socks = @import("../proxy/socks/inbound.zig");
+const sk_lookup = @import("../proxy/sk_lookup/inbound.zig");
+const sockhash = @import("../proxy/sk_lookup/sockhash.zig");
 const tun = @import("../proxy/tun/inbound.zig");
 const reality = @import("../transport/reality/client.zig");
 const vless = @import("../proxy/vless/outbound.zig");
@@ -25,18 +27,43 @@ pub const Runtime = struct {
     reactor_allocator: std.mem.Allocator = std.heap.page_allocator,
     raw_connection_limit: usize = 256,
     reactor: ?*raw_reactor.Reactor = null,
+    sockhash_manager: ?*sockhash.Manager = null,
 
     pub fn run(self: *Runtime, io: Io, log_writer: *Io.Writer) !void {
         const dispatch_interface = self.dispatcher();
 
+        var sk_lookup_inbound: ?sk_lookup.Inbound = null;
+        for (self.cfg.inbounds) |inbound| {
+            if (!std.mem.eql(u8, inbound.protocol, "sk_lookup")) continue;
+            const fake_dns_cfg = if (self.cfg.dns) |dns_cfg|
+                dns_cfg.fake_dns orelse return error.MissingFakeDnsConfig
+            else
+                return error.MissingFakeDnsConfig;
+            sk_lookup_inbound = try sk_lookup.Inbound.init(inbound, fake_dns_cfg, self.allocator, io);
+            break;
+        }
+        defer if (sk_lookup_inbound) |*inbound| inbound.deinit(io);
+
+        const fake_dns_publisher: fakedns.Publisher = if (sk_lookup_inbound) |*inbound|
+            inbound.publisher()
+        else
+            .{};
+
         var fake_dns_store: ?fakedns.Store = if (self.cfg.dns) |dns_cfg|
             if (dns_cfg.fake_dns) |fake_dns_cfg|
-                try fakedns.Store.init(self.allocator, fake_dns_cfg)
+                try fakedns.Store.initRestored(
+                    self.allocator,
+                    fake_dns_cfg,
+                    fake_dns_publisher,
+                    fakedns.monotonicNowNs(io),
+                )
             else
                 null
         else
             null;
         defer if (fake_dns_store) |*store| store.deinit();
+
+        if (sk_lookup_inbound) |*inbound| try inbound.attach(io);
 
         var log_mutex: Io.Mutex = .init;
         var reactor = try raw_reactor.Reactor.init(
@@ -52,7 +79,11 @@ pub const Runtime = struct {
         }
         self.reactor = &reactor;
         defer self.reactor = null;
+        self.sockhash_manager = if (sk_lookup_inbound) |*inbound| inbound.sockhashManager() else null;
+        defer self.sockhash_manager = null;
         try group.concurrent(io, runRawReactor, .{&reactor});
+        if (self.sockhash_manager) |manager|
+            try group.concurrent(io, runSockhashManager, .{manager});
 
         for (self.cfg.inbounds) |inbound| {
             if (std.mem.eql(u8, inbound.protocol, "socks")) {
@@ -70,6 +101,12 @@ pub const Runtime = struct {
             }
             if (std.mem.eql(u8, inbound.protocol, "tun")) {
                 try group.concurrent(io, runTunInbound, .{ inbound, dispatch_interface, self.allocator, io, log_writer, &log_mutex });
+                continue;
+            }
+            if (std.mem.eql(u8, inbound.protocol, "sk_lookup")) {
+                const state = if (sk_lookup_inbound) |*value| value else return error.MissingSkLookupSettings;
+                const store = if (fake_dns_store) |*value| value else return error.MissingFakeDnsConfig;
+                try group.concurrent(io, runSkLookupInbound, .{ state, dispatch_interface, store, io, log_writer, &log_mutex });
                 continue;
             }
             return error.UnsupportedInboundProtocol;
@@ -96,7 +133,16 @@ pub const Runtime = struct {
                 if (dns_cfg.fake_dns != null) dns_cfg else null
             else
                 null;
-            try freedom.handle(client, sess, preface, fake_dns_config, self.dispatcher(), reactor, io);
+            try freedom.handle(
+                client,
+                sess,
+                preface,
+                fake_dns_config,
+                self.dispatcher(),
+                reactor,
+                if (sess.allow_sockhash_offload) self.sockhash_manager else null,
+                io,
+            );
             return;
         }
         if (std.mem.eql(u8, outbound.protocol, "blackhole")) {
@@ -108,7 +154,15 @@ pub const Runtime = struct {
             return;
         }
         if (std.mem.eql(u8, outbound.protocol, "vless")) {
-            try vless.handle(outbound, client, sess, preface, reactor, io);
+            try vless.handle(
+                outbound,
+                client,
+                sess,
+                preface,
+                reactor,
+                if (sess.allow_sockhash_offload) self.sockhash_manager else null,
+                io,
+            );
             return;
         }
         return error.UnsupportedOutboundProtocol;
@@ -118,6 +172,10 @@ pub const Runtime = struct {
 fn runRawReactor(reactor: *raw_reactor.Reactor) Io.Cancelable!void {
     diagnostics.setRawReactorCount(0);
     try reactor.run();
+}
+
+fn runSockhashManager(manager: *sockhash.Manager) Io.Cancelable!void {
+    try manager.run();
 }
 
 fn runSocksInbound(inbound: config.Inbound, dispatcher: session.Dispatcher, io: Io, log_writer: *Io.Writer, log_mutex: *Io.Mutex) Io.Cancelable!void {
@@ -152,6 +210,14 @@ fn runTunInbound(inbound: config.Inbound, dispatcher: session.Dispatcher, alloca
     };
 }
 
+fn runSkLookupInbound(inbound: *sk_lookup.Inbound, dispatcher: session.Dispatcher, fake_dns: *fakedns.Store, io: Io, log_writer: *Io.Writer, log_mutex: *Io.Mutex) Io.Cancelable!void {
+    diagnostics.setThreadName("xz-sk-lookup");
+    inbound.run(dispatcher, fake_dns, io, log_writer, log_mutex) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return,
+    };
+}
+
 fn dispatchThunk(context: *anyopaque, client: net.Stream, sess: session.Session, preface: session.Preface, io: Io) anyerror!void {
     const runtime: *Runtime = @ptrCast(@alignCast(context));
     try runtime.dispatch(client, sess, preface, io);
@@ -160,6 +226,7 @@ fn dispatchThunk(context: *anyopaque, client: net.Stream, sess: session.Session,
 pub fn validate(cfg: *const config.Config) !void {
     if (cfg.inbounds.len == 0) return error.MissingInbounds;
 
+    var sk_lookup_count: usize = 0;
     for (cfg.inbounds) |inbound| {
         if (std.mem.eql(u8, inbound.protocol, "socks")) continue;
         if (std.mem.eql(u8, inbound.protocol, "redirect")) {
@@ -174,6 +241,14 @@ pub fn validate(cfg: *const config.Config) !void {
         if (std.mem.eql(u8, inbound.protocol, "tun")) {
             if (builtin.os.tag != .linux) return error.TunRequiresLinux;
             if (inbound.tun == null) return error.MissingTunSettings;
+            continue;
+        }
+        if (std.mem.eql(u8, inbound.protocol, "sk_lookup")) {
+            if (builtin.os.tag != .linux) return error.SkLookupRequiresLinux;
+            if (inbound.sk_lookup == null) return error.MissingSkLookupSettings;
+            if (cfg.dns == null or cfg.dns.?.fake_dns == null) return error.MissingFakeDnsConfig;
+            sk_lookup_count += 1;
+            if (sk_lookup_count > 1) return error.MultipleSkLookupInbounds;
             continue;
         }
         return error.UnsupportedInboundProtocol;
@@ -257,6 +332,42 @@ test "validates supported SOCKS graph" {
     defer cfg.deinit();
 
     try validate(&cfg);
+}
+
+test "validates sk_lookup only with FakeDNS" {
+    const source =
+        \\{
+        \\  "inbounds": [{
+        \\    "tag": "ebpf-in", "protocol": "sk_lookup",
+        \\    "settings": {"listen4":"0.0.0.0","port4":19080,"listen6":"::","port6":19081}
+        \\  }],
+        \\  "outbounds": [{"tag":"direct","protocol":"freedom"}],
+        \\  "dns": {
+        \\    "servers": [{"resolver":"1.1.1.1","outboundTag":"direct","domains":["domain:"]}],
+        \\    "fakeDns": {}
+        \\  },
+        \\  "routing": {"defaultOutboundTag":"direct"}
+        \\}
+    ;
+    var cfg = try config.parse(std.testing.allocator, source);
+    defer cfg.deinit();
+    try validate(&cfg);
+}
+
+test "rejects sk_lookup without FakeDNS" {
+    const source =
+        \\{
+        \\  "inbounds": [{
+        \\    "protocol": "sk_lookup",
+        \\    "settings": {"listen4":"0.0.0.0","port4":19080,"listen6":"::","port6":19081}
+        \\  }],
+        \\  "outbounds": [{"tag":"direct","protocol":"freedom"}],
+        \\  "routing": {"defaultOutboundTag":"direct"}
+        \\}
+    ;
+    var cfg = try config.parse(std.testing.allocator, source);
+    defer cfg.deinit();
+    try std.testing.expectError(error.MissingFakeDnsConfig, validate(&cfg));
 }
 
 test "validates redirect VLESS Reality graph" {

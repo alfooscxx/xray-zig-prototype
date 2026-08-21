@@ -6,6 +6,7 @@ const config = @import("../../config/mod.zig");
 const diagnostics = @import("../../diagnostics.zig");
 const log = @import("../../log.zig");
 const session = @import("../../net/session.zig");
+const sockhash = @import("../sk_lookup/sockhash.zig");
 pub const vision = @import("vision.zig");
 
 pub const Error = error{
@@ -25,7 +26,7 @@ const initialization_timeout_seconds = 15;
 var next_connection_id: std.atomic.Value(u32) = .init(1);
 var handshake_slots: Io.Semaphore = .{ .permits = max_concurrent_handshakes };
 
-pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: session.Session, preface: session.Preface, raw_reactor: *session.RawReactor, io: Io) !void {
+pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: session.Session, preface: session.Preface, raw_reactor: *session.RawReactor, sockhash_manager: ?*sockhash.Manager, io: Io) !void {
     diagnostics.setThreadName("xz-vless-init");
     defer diagnostics.setThreadName("xray-zig");
     const connection_id = next_connection_id.fetchAdd(1, .monotonic);
@@ -65,7 +66,7 @@ pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: sessio
         log.trace("vless {d} response-ready\n", .{connection_id});
         logEstablished(connection_id, sess.target, traffic_state.is_tls);
         diagnostics.setThreadName("xz-vision-scan");
-        try vision.bridge(client, &upstream, &traffic_state, sess.target, raw_reactor, io);
+        try vision.bridge(client, &upstream, &traffic_state, sess.target, raw_reactor, sockhash_manager, io);
         log.trace("vless {d} bridge-returned\n", .{connection_id});
         return;
     }

@@ -40,14 +40,47 @@ pub const Inbound = struct {
     port: u16,
     protocol: []const u8,
     tun: ?TunInboundSettings,
+    sk_lookup: ?SkLookupInboundSettings,
 
     pub fn deinit(self: *Inbound, allocator: std.mem.Allocator) void {
         if (self.tag) |tag| allocator.free(tag);
         allocator.free(self.listen);
         allocator.free(self.protocol);
         if (self.tun) |*tun| tun.deinit(allocator);
+        if (self.sk_lookup) |*settings| settings.deinit(allocator);
         self.* = undefined;
     }
+};
+
+pub const SkLookupInboundSettings = struct {
+    listen4: []const u8,
+    port4: u16,
+    listen6: []const u8,
+    port6: u16,
+    max_map_entries: u32,
+    fake_dns_persistence: ?FakeDnsPersistenceSettings,
+    sockhash_offload: ?SockhashOffloadSettings,
+
+    pub fn deinit(self: *SkLookupInboundSettings, allocator: std.mem.Allocator) void {
+        allocator.free(self.listen4);
+        allocator.free(self.listen6);
+        if (self.fake_dns_persistence) |*persistence| persistence.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const FakeDnsPersistenceSettings = struct {
+    pin_directory: []const u8,
+
+    pub fn deinit(self: *FakeDnsPersistenceSettings, allocator: std.mem.Allocator) void {
+        allocator.free(self.pin_directory);
+        self.* = undefined;
+    }
+};
+
+pub const SockhashOffloadSettings = struct {
+    max_flows: u32,
+    idle_timeout_seconds: u32,
 };
 
 pub const TunInboundSettings = struct {
@@ -174,6 +207,7 @@ pub const FakeDnsConfig = struct {
     ip_pool: []const u8,
     ip_pool6: []const u8,
     ttl: u32,
+    reuse_grace_seconds: u32,
 
     pub fn deinit(self: *FakeDnsConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.ip_pool);
@@ -289,6 +323,7 @@ pub const ParseConfigError = error{
     DnsServerMustBeObject,
     DnsServerDomainsMustBeArray,
     FakeDnsMustBeObject,
+    UnsupportedFakeDnsSetting,
     VnextMustBeArray,
     VnextMustContainServer,
     VnextServerMustBeObject,
@@ -301,6 +336,20 @@ pub const ParseConfigError = error{
     MissingTunName,
     TunMustNotHaveListenOrPort,
     UnsupportedTunSetting,
+    MissingSkLookupSettings,
+    MissingSkLookupListen4,
+    MissingSkLookupPort4,
+    MissingSkLookupListen6,
+    MissingSkLookupPort6,
+    SkLookupMustNotHaveListenOrPort,
+    UnsupportedSkLookupSetting,
+    InvalidSkLookupListen4,
+    InvalidSkLookupListen6,
+    InvalidSkLookupMapEntries,
+    FakeDnsPersistenceMustBeObject,
+    MissingFakeDnsPinDirectory,
+    UnsupportedFakeDnsPersistenceSetting,
+    InvalidFakeDnsPinDirectory,
     MissingOutboundProtocol,
     MissingVlessAddress,
     MissingVlessPort,
@@ -319,6 +368,7 @@ pub const ParseConfigError = error{
     InvalidTunMtu,
     InvalidTunConnectionLimit,
     InvalidDnsTtl,
+    InvalidFakeDnsReuseGrace,
     UnsupportedPortFormat,
     UnsupportedIpRule,
     FieldMustBeString,
@@ -381,8 +431,9 @@ fn parseInbound(allocator: std.mem.Allocator, value: std.json.Value) !Inbound {
     const protocol = try requiredString(allocator, object, "protocol", error.MissingInboundProtocol);
     errdefer allocator.free(protocol);
     const is_tun = std.mem.eql(u8, protocol, "tun");
-    if (is_tun and (object.get("listen") != null or object.get("port") != null))
-        return error.TunMustNotHaveListenOrPort;
+    const is_sk_lookup = std.mem.eql(u8, protocol, "sk_lookup");
+    if ((is_tun or is_sk_lookup) and (object.get("listen") != null or object.get("port") != null))
+        return if (is_tun) error.TunMustNotHaveListenOrPort else error.SkLookupMustNotHaveListenOrPort;
 
     const listen = try optionalString(allocator, object, "listen") orelse try allocator.dupe(u8, "127.0.0.1");
     errdefer allocator.free(listen);
@@ -396,13 +447,135 @@ fn parseInbound(allocator: std.mem.Allocator, value: std.json.Value) !Inbound {
         null;
     errdefer if (tun) |*owned| owned.deinit(allocator);
 
+    var sk_lookup = if (is_sk_lookup)
+        try parseSkLookupInboundSettings(allocator, object.get("settings"))
+    else
+        null;
+    errdefer if (sk_lookup) |*owned| owned.deinit(allocator);
+
     return .{
         .tag = tag,
         .listen = listen,
-        .port = if (is_tun) 0 else try requiredPort(object, "port", error.MissingInboundPort),
+        .port = if (is_tun or is_sk_lookup) 0 else try requiredPort(object, "port", error.MissingInboundPort),
         .protocol = protocol,
         .tun = tun,
+        .sk_lookup = sk_lookup,
     };
+}
+
+fn parseSkLookupInboundSettings(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) !?SkLookupInboundSettings {
+    const value = maybe_value orelse return error.MissingSkLookupSettings;
+    if (value != .object) return error.SettingsMustBeObject;
+    const object = &value.object;
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.eql(u8, key, "listen4") and
+            !std.mem.eql(u8, key, "port4") and
+            !std.mem.eql(u8, key, "listen6") and
+            !std.mem.eql(u8, key, "port6") and
+            !std.mem.eql(u8, key, "maxMapEntries") and
+            !std.mem.eql(u8, key, "fakeDnsPersistence") and
+            !std.mem.eql(u8, key, "sockhashOffload"))
+        {
+            return error.UnsupportedSkLookupSetting;
+        }
+    }
+
+    const listen4 = try requiredString(allocator, object, "listen4", error.MissingSkLookupListen4);
+    errdefer allocator.free(listen4);
+    const parsed4 = net.IpAddress.parse(listen4, 0) catch return error.InvalidSkLookupListen4;
+    if (parsed4 != .ip4) return error.InvalidSkLookupListen4;
+
+    const listen6 = try requiredString(allocator, object, "listen6", error.MissingSkLookupListen6);
+    errdefer allocator.free(listen6);
+    const parsed6 = net.IpAddress.parse(listen6, 0) catch return error.InvalidSkLookupListen6;
+    if (parsed6 != .ip6) return error.InvalidSkLookupListen6;
+
+    const max_map_entries = try optionalUnsigned(u32, object, "maxMapEntries", 65536, error.InvalidSkLookupMapEntries);
+    if (max_map_entries == 0 or max_map_entries > 1_048_576) return error.InvalidSkLookupMapEntries;
+
+    const fake_dns_persistence = try parseFakeDnsPersistenceSettings(allocator, object.get("fakeDnsPersistence"));
+    errdefer if (fake_dns_persistence) |owned_value| {
+        var owned = owned_value;
+        owned.deinit(allocator);
+    };
+    const sockhash_offload = try parseSockhashOffloadSettings(object.get("sockhashOffload"));
+
+    return .{
+        .listen4 = listen4,
+        .port4 = try requiredPort(object, "port4", error.MissingSkLookupPort4),
+        .listen6 = listen6,
+        .port6 = try requiredPort(object, "port6", error.MissingSkLookupPort6),
+        .max_map_entries = max_map_entries,
+        .fake_dns_persistence = fake_dns_persistence,
+        .sockhash_offload = sockhash_offload,
+    };
+}
+
+fn parseFakeDnsPersistenceSettings(
+    allocator: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) !?FakeDnsPersistenceSettings {
+    const value = maybe_value orelse return null;
+    if (value != .object) return error.FakeDnsPersistenceMustBeObject;
+    const object = &value.object;
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "pinDirectory"))
+            return error.UnsupportedFakeDnsPersistenceSetting;
+    }
+
+    const pin_directory = try requiredString(
+        allocator,
+        object,
+        "pinDirectory",
+        error.MissingFakeDnsPinDirectory,
+    );
+    errdefer allocator.free(pin_directory);
+    if (!validAbsoluteDirectory(pin_directory)) return error.InvalidFakeDnsPinDirectory;
+    return .{ .pin_directory = pin_directory };
+}
+
+fn validAbsoluteDirectory(path: []const u8) bool {
+    if (path.len < 2 or path.len >= std.posix.PATH_MAX or path[0] != '/' or path[path.len - 1] == '/')
+        return false;
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or
+            std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, "..") or
+            std.mem.indexOfScalar(u8, component, 0) != null)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn parseSockhashOffloadSettings(maybe_value: ?std.json.Value) !?SockhashOffloadSettings {
+    const value = maybe_value orelse return null;
+    if (value != .object) return error.SockhashOffloadMustBeObject;
+    const object = &value.object;
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.eql(u8, key, "mode") and
+            !std.mem.eql(u8, key, "maxFlows") and
+            !std.mem.eql(u8, key, "idleTimeoutSeconds"))
+        {
+            return error.UnsupportedSockhashOffloadSetting;
+        }
+    }
+
+    const mode_value = object.get("mode") orelse return error.MissingSockhashOffloadMode;
+    if (mode_value != .string or !std.mem.eql(u8, mode_value.string, "required"))
+        return error.UnsupportedSockhashOffloadMode;
+    const max_flows = try optionalUnsigned(u32, object, "maxFlows", 1024, error.InvalidSockhashFlowLimit);
+    if (max_flows == 0 or max_flows > 131_072) return error.InvalidSockhashFlowLimit;
+    const idle_timeout_seconds = try optionalUnsigned(u32, object, "idleTimeoutSeconds", 300, error.InvalidSockhashIdleTimeout);
+    if (idle_timeout_seconds == 0 or idle_timeout_seconds > 86_400) return error.InvalidSockhashIdleTimeout;
+    return .{ .max_flows = max_flows, .idle_timeout_seconds = idle_timeout_seconds };
 }
 
 fn parseTunInboundSettings(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) !?TunInboundSettings {
@@ -637,6 +810,18 @@ fn parseFakeDns(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) !?Fa
     if (value != .object) return error.FakeDnsMustBeObject;
     const object = &value.object;
 
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.eql(u8, key, "ipPool") and
+            !std.mem.eql(u8, key, "ipPool6") and
+            !std.mem.eql(u8, key, "ttl") and
+            !std.mem.eql(u8, key, "reuseGraceSeconds"))
+        {
+            return error.UnsupportedFakeDnsSetting;
+        }
+    }
+
     const ip_pool = try optionalString(allocator, object, "ipPool") orelse try allocator.dupe(u8, default_pool);
     errdefer allocator.free(ip_pool);
     const ip_pool6 = try optionalString(allocator, object, "ipPool6") orelse try allocator.dupe(u8, default_pool6);
@@ -650,10 +835,19 @@ fn parseFakeDns(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) !?Fa
         else => return error.InvalidDnsTtl,
     } else 60;
 
+    const reuse_grace_seconds = try optionalUnsigned(
+        u32,
+        object,
+        "reuseGraceSeconds",
+        30,
+        error.InvalidFakeDnsReuseGrace,
+    );
+
     return .{
         .ip_pool = ip_pool,
         .ip_pool6 = ip_pool6,
         .ttl = ttl,
+        .reuse_grace_seconds = reuse_grace_seconds,
     };
 }
 
@@ -1061,6 +1255,63 @@ test "rejects invalid TUN settings" {
     );
 }
 
+test "parses strict sk_lookup inbound settings" {
+    const source =
+        \\{"inbounds":[{"tag":"bpf-in","protocol":"sk_lookup","settings":{
+        \\  "listen4":"0.0.0.0","port4":19080,
+        \\  "listen6":"::","port6":19081,"maxMapEntries":1024,
+        \\  "fakeDnsPersistence":{"pinDirectory":"/sys/fs/bpf/xray-zig"},
+        \\  "sockhashOffload":{"mode":"required","maxFlows":64,"idleTimeoutSeconds":45}
+        \\}}]}
+    ;
+    var cfg = try parse(std.testing.allocator, source);
+    defer cfg.deinit();
+    const settings = cfg.inbounds[0].sk_lookup.?;
+    try std.testing.expectEqualStrings("0.0.0.0", settings.listen4);
+    try std.testing.expectEqual(@as(u16, 19080), settings.port4);
+    try std.testing.expectEqualStrings("::", settings.listen6);
+    try std.testing.expectEqual(@as(u16, 19081), settings.port6);
+    try std.testing.expectEqual(@as(u32, 1024), settings.max_map_entries);
+    try std.testing.expectEqualStrings("/sys/fs/bpf/xray-zig", settings.fake_dns_persistence.?.pin_directory);
+    try std.testing.expectEqual(@as(u32, 64), settings.sockhash_offload.?.max_flows);
+    try std.testing.expectEqual(@as(u32, 45), settings.sockhash_offload.?.idle_timeout_seconds);
+}
+
+test "rejects ambiguous or unsupported sk_lookup settings" {
+    try std.testing.expectError(
+        error.SkLookupMustNotHaveListenOrPort,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"listen\":\"0.0.0.0\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1}}]}"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSkLookupSetting,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"udp\":true}}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidSkLookupMapEntries,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"maxMapEntries\":0}}]}"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSockhashOffloadSetting,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"sockhashOffload\":{\"mode\":\"required\",\"udp\":true}}}]}"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSockhashOffloadMode,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"sockhashOffload\":{\"mode\":\"best-effort\"}}}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidSockhashFlowLimit,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"sockhashOffload\":{\"mode\":\"required\",\"maxFlows\":0}}}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidFakeDnsPinDirectory,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"fakeDnsPersistence\":{\"pinDirectory\":\"../bpf\"}}}]}"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedFakeDnsPersistenceSetting,
+        parse(std.testing.allocator, "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"fakeDnsPersistence\":{\"pinDirectory\":\"/sys/fs/bpf/xray-zig\",\"cleanup\":true}}}]}"),
+    );
+}
+
 test "parses dns config without enabling fakedns" {
     const source =
         \\{
@@ -1111,6 +1362,14 @@ test "parses explicit fakedns with defaults" {
     try std.testing.expectEqualStrings("198.18.0.0/15", fake_dns.ip_pool);
     try std.testing.expectEqualStrings("fc00::/18", fake_dns.ip_pool6);
     try std.testing.expectEqual(@as(u32, 60), fake_dns.ttl);
+    try std.testing.expectEqual(@as(u32, 30), fake_dns.reuse_grace_seconds);
+}
+
+test "rejects unsupported FakeDNS settings" {
+    try std.testing.expectError(
+        error.UnsupportedFakeDnsSetting,
+        parse(std.testing.allocator, "{\"dns\":{\"servers\":[{\"resolver\":\"1.1.1.1\",\"outboundTag\":\"direct\",\"domains\":[\"domain:\"]}],\"fakeDns\":{\"unknown\":true}}}"),
+    );
 }
 
 test "rejects dns config without final fallback resolver" {

@@ -3,6 +3,7 @@ const Io = std.Io;
 const net = Io.net;
 
 const session = @import("../../net/session.zig");
+const sockhash = @import("../sk_lookup/sockhash.zig");
 const diagnostics = @import("../../diagnostics.zig");
 const log = @import("../../log.zig");
 
@@ -283,7 +284,7 @@ pub const TrafficState = struct {
     }
 };
 
-pub fn bridge(client: net.Stream, upstream: *session.OutboundConnection, state: *TrafficState, target: session.Target, raw_reactor: *session.RawReactor, io: Io) Io.Cancelable!void {
+pub fn bridge(client: net.Stream, upstream: *session.OutboundConnection, state: *TrafficState, target: session.Target, raw_reactor: *session.RawReactor, sockhash_manager: ?*sockhash.Manager, io: Io) Io.Cancelable!void {
     var client_read_buffer: [16 * 1024]u8 = undefined;
     var client_reader = client.reader(io, &client_read_buffer);
     var client_write_buffer: [16 * 1024]u8 = undefined;
@@ -304,11 +305,31 @@ pub fn bridge(client: net.Stream, upstream: *session.OutboundConnection, state: 
                 logBridgeExit(@errorName(err), state, target);
                 return;
             };
+            if (sockhash_manager) |manager| {
+                const admission = manager.admitOwned(client, upstream.pollStream(), raw_reactor, .vless_vision);
+                switch (admission) {
+                    .offloaded => logTargetEvent("sockhash-handoff", state, target),
+                    .hybrid_raw => |reason| log.warn("vless {d} sockhash partial admission ({s}); hybrid raw fallback\n", .{ state.connection_id, @tagName(reason) }),
+                    .fallback => |reason| {
+                        log.warn("vless {d} sockhash admission fallback ({s}); using raw reactor\n", .{ state.connection_id, @tagName(reason) });
+                        raw_reactor.adoptDuplicate(client, upstream.pollStream()) catch |err| {
+                            logBridgeExit(@errorName(err), state, target);
+                            return;
+                        };
+                        logTargetEvent("raw-reactor-handoff", state, target);
+                    },
+                    .terminal => |reason| log.warn(
+                        "vless {d} sockhash cutover failed closed ({s})\n",
+                        .{ state.connection_id, @tagName(reason) },
+                    ),
+                }
+                return;
+            }
             raw_reactor.adoptDuplicate(client, upstream.pollStream()) catch |err| {
                 logBridgeExit(@errorName(err), state, target);
                 return;
             };
-            logTargetEvent("raw-handoff", state, target);
+            logTargetEvent("raw-reactor-handoff", state, target);
             return;
         }
         const ready: session.Readable = if (client_reader.interface.buffered().len != 0 or

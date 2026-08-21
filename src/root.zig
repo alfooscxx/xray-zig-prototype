@@ -21,6 +21,11 @@ pub const proxy = struct {
     pub const freedom = @import("proxy/freedom/outbound.zig");
     pub const redirect = @import("proxy/redirect/inbound.zig");
     pub const socks = @import("proxy/socks/inbound.zig");
+    pub const sk_lookup = struct {
+        pub const bpf = @import("proxy/sk_lookup/bpf.zig");
+        pub const inbound = @import("proxy/sk_lookup/inbound.zig");
+        pub const sockhash = @import("proxy/sk_lookup/sockhash.zig");
+    };
     pub const tun = @import("proxy/tun/inbound.zig");
     pub const vless = @import("proxy/vless/outbound.zig");
 };
@@ -48,6 +53,9 @@ test {
     _ = proxy.freedom;
     _ = proxy.redirect;
     _ = proxy.socks;
+    _ = proxy.sk_lookup.bpf;
+    _ = proxy.sk_lookup.inbound;
+    _ = proxy.sk_lookup.sockhash;
     _ = proxy.tun;
     _ = proxy.tun.packet;
     _ = proxy.vless;

@@ -68,6 +68,21 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "fakedns-unpin")) {
+        try xray.core.validate(&cfg);
+        const fake_dns_cfg = if (cfg.dns) |dns_cfg|
+            dns_cfg.fake_dns orelse return error.MissingFakeDnsConfig
+        else
+            return error.MissingFakeDnsConfig;
+        for (cfg.inbounds) |inbound| {
+            if (!std.mem.eql(u8, inbound.protocol, "sk_lookup")) continue;
+            try xray.proxy.sk_lookup.bpf.unpinPersistent(inbound.sk_lookup.?, fake_dns_cfg, io);
+            try stdout.print("FakeDNS BPF pins removed\n", .{});
+            return;
+        }
+        return error.MissingSkLookupSettings;
+    }
+
     if (std.mem.eql(u8, command, "run")) {
         try xray.core.validate(&cfg);
         try stdout.print(
@@ -244,6 +259,7 @@ fn usage(writer: *Io.Writer) !void {
         \\usage:
         \\  xray-zig check -config <path>
         \\  xray-zig run -config <path>
+        \\  xray-zig fakedns-unpin -config <path>
         \\  xray-zig version
         \\
     );
@@ -281,6 +297,26 @@ fn printSummary(writer: *Io.Writer, cfg: *const xray.config.Config) !void {
                 settings.name,
                 settings.mtu,
             });
+            continue;
+        }
+        if (std.mem.eql(u8, inbound.protocol, "sk_lookup")) {
+            const settings = inbound.sk_lookup.?;
+            try writer.print("inbound {s}: sk_lookup TCP on {s}:{d} and [{s}]:{d}, map entries {d}\n", .{
+                inbound.tag orelse "-",
+                settings.listen4,
+                settings.port4,
+                settings.listen6,
+                settings.port6,
+                settings.max_map_entries,
+            });
+            if (settings.fake_dns_persistence) |persistence|
+                try writer.print("  persistent FakeDNS BPF maps: {s}\n", .{persistence.pin_directory});
+            if (settings.sockhash_offload) |offload| {
+                try writer.print("  required TCP SOCKHASH offload: max flows {d}, idle timeout {d}s\n", .{
+                    offload.max_flows,
+                    offload.idle_timeout_seconds,
+                });
+            }
             continue;
         }
         try writer.print("inbound {s}: {s} on {s}:{d}\n", .{

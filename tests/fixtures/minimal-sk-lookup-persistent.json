@@ -1,0 +1,34 @@
+{
+  "inbounds": [
+    {
+      "tag": "ebpf-in",
+      "protocol": "sk_lookup",
+      "settings": {
+        "listen4": "0.0.0.0",
+        "port4": 19080,
+        "listen6": "::",
+        "port6": 19081,
+        "maxMapEntries": 1024,
+        "fakeDnsPersistence": {
+          "pinDirectory": "/sys/fs/bpf/xray-zig"
+        }
+      }
+    },
+    {"tag": "dns-in", "listen": "127.0.0.1", "port": 1053, "protocol": "dns"}
+  ],
+  "outbounds": [
+    {"tag": "direct", "protocol": "freedom"}
+  ],
+  "dns": {
+    "servers": [
+      {"resolver": "1.1.1.1", "outboundTag": "direct", "domains": ["domain:"]}
+    ],
+    "fakeDns": {
+      "ipPool": "198.18.0.0/15",
+      "ipPool6": "fc00::/18",
+      "ttl": 60,
+      "reuseGraceSeconds": 30
+    }
+  },
+  "routing": {"defaultOutboundTag": "direct"}
+}

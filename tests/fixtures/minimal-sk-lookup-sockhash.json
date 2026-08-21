@@ -1,0 +1,35 @@
+{
+  "inbounds": [
+    {
+      "tag": "ebpf-in",
+      "protocol": "sk_lookup",
+      "settings": {
+        "listen4": "0.0.0.0",
+        "port4": 19080,
+        "listen6": "::",
+        "port6": 19081,
+        "maxMapEntries": 64,
+        "sockhashOffload": {
+          "mode": "required",
+          "maxFlows": 32,
+          "idleTimeoutSeconds": 300
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {"tag": "direct", "protocol": "freedom"}
+  ],
+  "dns": {
+    "servers": [
+      {"resolver": "1.1.1.1", "outboundTag": "direct", "domains": ["domain:"]}
+    ],
+    "fakeDns": {
+      "ipPool": "198.18.254.0/24",
+      "ipPool6": "fd00:7872:6179::/120",
+      "ttl": 60,
+      "reuseGraceSeconds": 30
+    }
+  },
+  "routing": {"defaultOutboundTag": "direct"}
+}

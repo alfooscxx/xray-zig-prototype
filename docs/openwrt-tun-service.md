@@ -1,10 +1,12 @@
 # OpenWrt TUN Service
 
 The GL-MT6000 deployment uses the `procd` definitions in
-`contrib/openwrt/`. The service starts xray-zig with a 512 MiB sizing budget,
-waits for `xray0`, installs live-only policy routing and nftables rules, and
-removes only its own state when stopped. It does not modify UCI or any file in
-`/etc/config`.
+`contrib/openwrt/`. The service starts xray-zig with a 768 MiB sizing budget,
+896 workers, and 1,500 raw-reactor slots. This leaves enough executor headroom
+for a TUN configuration with `maxConnections` set to 256, since each active
+TUN flow can occupy three concurrent tasks. The wrapper waits for `xray0`,
+installs live-only policy routing and nftables rules, and removes only its own
+state when stopped. It does not modify UCI or any file in `/etc/config`.
 
 Install an AArch64 `cortex_a53` ReleaseFast binary and a native config that
 contains both the `xray0` TUN inbound and any optional SOCKS inbound:

@@ -83,12 +83,27 @@ process reached all 80 workers and approximately 540 open descriptors while
 remaining below its RSS limit.
 
 Connections that have completed the Vision direct-copy transition, plus plain
-freedom connections, move to the shared raw reactor. Producers publish them
-through a lock-free atomic stack and signal an `eventfd`; there is no producer
-spin lock. The reactor blocks in `poll` until socket activity, a new connection,
-or its one-second cooperative-cancellation check. Reactor shutdown drains and
-closes both active and not-yet-adopted connections before its allocator and wake
-descriptor are released.
+freedom connections that are not eligible for kernel offload, move to the
+shared raw reactor. Producers publish them through a lock-free atomic stack and
+signal an `eventfd`; there is no producer spin lock. The reactor blocks in
+`poll` until socket activity, a new connection, or its one-second
+cooperative-cancellation check. Reactor shutdown drains and closes both active
+and not-yet-adopted connections before its allocator and wake descriptor are
+released.
+
+An optional Linux-only backend can move eligible connections originating from
+the `sk_lookup` inbound into a pair of SOCKHASH maps. Vision waits for its
+strict bidirectional direct-copy gate and drains all userspace buffers first.
+Freedom has no transformation gate: the `sk_lookup` session has an empty
+preface, so it attempts admission immediately after target resolution and TCP
+connect, before constructing a userspace writer or entering the raw reactor.
+SOCKS, redirect, TUN, recursively dispatched DNS, and every other inbound leave
+`allow_sockhash_offload` false and therefore cannot enter this path. Passive
+targets are installed before programmed sources, and an identity SK_SKB parser
+drives pre-existing receive queues through the verdict path. Its manager owns
+duplicate FDs, FIN/RST/idle handling, exact non-LRU state, and teardown.
+Admission pressure falls back to the raw reactor only when ordering safety
+permits it; see `ebpf-sk-lookup.md`.
 
 Inbound startup and error messages share one buffered writer, protected by an `Io.Mutex`. Any new concurrent log site must use the same mutex.
 
@@ -122,6 +137,15 @@ If no rule matches, `routing.defaultOutboundTag` is used.
 ## DNS
 
 `src/dns/protocol.zig` handles DNS wire parsing and A/AAAA response writing. `src/dns/fakedns.zig` owns the optional independent IPv4 and IPv6 FakeDNS pools and reverse mappings. Without `dns.fakeDns`, the DNS inbound selects the first matching resolver rule, frames the query as DNS-over-TCP, and dispatches it through that rule's `outboundTag`. A `vless` tag therefore protects DNS with REALITY without exposing direct DoH. With FakeDNS enabled, reverse-mapped `freedom` targets are resolved through the same selected DNS rule before the direct connection is opened; they must not use the host resolver, which could return the synthetic address again. `src/dns/client.zig` owns routed DNS-over-TCP exchange and direct-target resolution, while `src/dns/upstream.zig` owns resolver address parsing. On Linux, the DNS client connects its caller and dispatcher with a local `AF_UNIX` socket pair, avoiding a temporary loopback TCP listener per query. Other platforms retain the loopback TCP fallback.
+
+The experimental Linux `sk_lookup` inbound is documented in
+`ebpf-sk-lookup.md`. FakeDNS uses stable domain records and refcounted leases;
+when its optional bpffs persistence is configured, startup reconstructs those
+records from validated pinned address/metadata maps before attaching the new
+namespace link. The metadata map is control-plane-only and has no dataplane
+lookup cost. Listener and dataplane SOCKHASH maps are never restored across a
+process boundary. The BPF publisher runs before the DNS response, while an accepted session holds
+its lease across the complete synchronous dispatch.
 
 DNS server selection should not be implemented in protocol code. Protocol code should ask the DNS config/upstream layer for the selected resolver based on the queried domain.
 

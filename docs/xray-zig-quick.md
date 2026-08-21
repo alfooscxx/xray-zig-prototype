@@ -1,9 +1,9 @@
 # xray-zig-quick
 
 `contrib/xray-zig-quick` is a small `wg-quick`-style controller for running
-xray-zig as a transparent proxy on a Linux gateway. It starts and checks the
-process, installs isolated `iptables`/`ip6tables` NAT chains, reports status,
-and removes only the rules that it owns.
+xray-zig. It starts and checks the process, reports status, and handles clean
+shutdown. On a Linux gateway it also installs isolated `iptables`/`ip6tables`
+NAT chains and removes only the rules that it owns.
 
 The helper is intentionally separate from xray-zig's strict JSON format. Its
 profile contains device lifecycle and firewall settings; `Config` points to
@@ -69,7 +69,7 @@ ordered routing rules.
 |---|---|---|---|
 | `Config` | yes | - | Native xray-zig JSON path |
 | `Binary` | no | `xray-zig` | Executable path or command |
-| `LanInterface` | yes | - | One interface, or a comma/space-separated list |
+| `LanInterface` | with redirect | - | One interface, or a comma/space-separated list |
 | `IPv4` | no | `yes` | Install rules when an IPv4 redirect inbound exists |
 | `IPv6` | no | `yes` | Install rules when an IPv6 redirect inbound exists |
 | `HijackDNS` | no | `yes` | Redirect LAN UDP/53 to matching DNS inbounds |
@@ -82,6 +82,11 @@ ordered routing rules.
 The firewall requires the `nat`, `REDIRECT`, and `addrtype` iptables modules.
 Set `BypassLocal = no` only if the device lacks `addrtype`; doing so can send
 connections to router-hosted TCP services through xray-zig.
+
+Profiles with only explicit listeners such as a loopback SOCKS inbound do not
+need `LanInterface`. They manage the xray-zig process without installing any
+firewall rules or requiring root. Set `XRAY_ZIG_QUICK_STATE_DIR` to a
+user-writable directory when using the helper this way.
 
 The helper controls forwarded traffic arriving on `LanInterface`. It does not
 install `OUTPUT` rules, which avoids recursively capturing xray-zig's own
