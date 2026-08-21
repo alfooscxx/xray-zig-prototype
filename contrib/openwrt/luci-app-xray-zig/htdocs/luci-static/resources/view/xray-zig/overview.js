@@ -1,4 +1,5 @@
 'use strict';
+'require dom';
 'require poll';
 'require rpc';
 'require view';
@@ -140,7 +141,9 @@ function section(title, subtitle, content) {
 }
 
 function sparkline(samples, key, color) {
-	const values = samples.map(function(sample) { return sample[key] || 0; });
+	let values = samples.map(function(sample) { return sample[key] || 0; });
+	if (values.length === 1)
+		values = [ values[0], values[0] ];
 	const maxValue = Math.max(1, ...values);
 	const width = 600;
 	const height = 96;
@@ -150,14 +153,22 @@ function sparkline(samples, key, color) {
 		return x.toFixed(1) + ',' + y.toFixed(1);
 	}).join(' ');
 	const svg = document.createElementNS(svgNamespace, 'svg');
+	const baseline = document.createElementNS(svgNamespace, 'line');
 	const line = document.createElementNS(svgNamespace, 'polyline');
 	svg.setAttribute('class', 'xz-spark');
 	svg.setAttribute('viewBox', '0 0 600 96');
 	svg.setAttribute('preserveAspectRatio', 'none');
+	baseline.setAttribute('x1', '0');
+	baseline.setAttribute('y1', '92');
+	baseline.setAttribute('x2', '600');
+	baseline.setAttribute('y2', '92');
+	baseline.setAttribute('stroke', 'rgba(100, 116, 139, .35)');
+	baseline.setAttribute('stroke-width', '1');
 	line.setAttribute('points', points);
 	line.setAttribute('fill', 'none');
 	line.setAttribute('stroke', color);
 	line.setAttribute('stroke-width', '3');
+	svg.appendChild(baseline);
 	svg.appendChild(line);
 	return svg;
 }
@@ -297,7 +308,7 @@ return view.extend({
 		const root = E('div', { 'id': 'xz-dashboard-root' }, [ renderDashboard(snapshot || {}) ]);
 		poll.add(function() {
 			return callSnapshot().then(function(next) {
-				root.replaceChildren(renderDashboard(next || {}));
+				dom.content(root, renderDashboard(next || {}));
 			});
 		}, 15);
 		return root;
