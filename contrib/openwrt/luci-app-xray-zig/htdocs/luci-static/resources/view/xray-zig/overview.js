@@ -11,6 +11,7 @@ const callSnapshot = rpc.declare({
 
 const history = [];
 let previousSample = null;
+const svgNamespace = 'http://www.w3.org/2000/svg';
 
 function text(value) {
 	return document.createTextNode(String(value == null ? '—' : value));
@@ -148,9 +149,17 @@ function sparkline(samples, key, color) {
 		const y = height - (value / maxValue * (height - 8)) - 4;
 		return x.toFixed(1) + ',' + y.toFixed(1);
 	}).join(' ');
-	return E('svg', { 'class': 'xz-spark', 'viewBox': '0 0 600 96', 'preserveAspectRatio': 'none' }, [
-		E('polyline', { 'points': points, 'fill': 'none', 'stroke': color, 'stroke-width': '3' })
-	]);
+	const svg = document.createElementNS(svgNamespace, 'svg');
+	const line = document.createElementNS(svgNamespace, 'polyline');
+	svg.setAttribute('class', 'xz-spark');
+	svg.setAttribute('viewBox', '0 0 600 96');
+	svg.setAttribute('preserveAspectRatio', 'none');
+	line.setAttribute('points', points);
+	line.setAttribute('fill', 'none');
+	line.setAttribute('stroke', color);
+	line.setAttribute('stroke-width', '3');
+	svg.appendChild(line);
+	return svg;
 }
 
 function updateHistory(metrics) {
