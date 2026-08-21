@@ -1098,3 +1098,160 @@ test "TUN io_uring capacity fits the u16 ring API" {
         tunRingEntries(maximum_ring_entries + 1),
     );
 }
+
+test "TUN io_uring preserves an interactive request response stream" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const packet_pair = try createTestSocketPair(posix.SOCK.SEQPACKET);
+    var device_file: Io.File = .{
+        .handle = packet_pair[0].socket.handle,
+        .flags = .{ .nonblocking = false },
+    };
+    defer device_file.close(io);
+    defer packet_pair[1].close(io);
+
+    var device: Device = .{ .file = device_file, .mtu = packet.max_mtu };
+    var manager = try FlowManager.init(std.testing.allocator, undefined, &device, 1);
+    defer manager.deinit(io);
+    try manager.start(io);
+
+    const key: packet.FlowKey = .{
+        .version = .ip4,
+        .source = .{ 192, 0, 2, 2 } ++ ([_]u8{0} ** 12),
+        .destination = .{ 198, 51, 100, 10 } ++ ([_]u8{0} ** 12),
+        .source_port = 40000,
+        .destination_port = 443,
+    };
+    const client_sequence: u32 = 1000;
+    const server_sequence: u32 = 2000;
+    var state = tcp.State.init(client_sequence, server_sequence, 65535, 1460, nowMilliseconds(io));
+    _ = state.queueSynAck(nowMilliseconds(io));
+    _ = state.onSegment(client_sequence + 1, server_sequence + 1, .{ .ack = true }, 65535, 0, nowMilliseconds(io));
+
+    const flow = try std.testing.allocator.create(Flow);
+    flow.* = .{
+        .key = key,
+        .inbound_tag = null,
+        .manager = &manager,
+        .state = state,
+    };
+    flow.initializeQueue();
+    try manager.flows.put(key, flow);
+
+    const bridge_pair = try createLocalPair();
+    defer bridge_pair[0].close(io);
+    try manager.reactor.adopt(flow, bridge_pair[1]);
+
+    var next_client_sequence = client_sequence + 1;
+    var next_server_sequence = server_sequence + 1;
+    var packet_buffer: [packet.max_mtu]u8 = undefined;
+    var uplink_buffer: [64]u8 = undefined;
+    var bridge_write_buffer: [64]u8 = undefined;
+    var bridge_writer = bridge_pair[0].writer(io, &bridge_write_buffer);
+
+    for (0..8) |round| {
+        var request: [13]u8 = undefined;
+        @memset(&request, @intCast(round + 1));
+        const queued = try flow.queue.put(io, &.{.{
+            .sequence = next_client_sequence,
+            .acknowledgment = next_server_sequence,
+            .flags = .{ .ack = true, .psh = true },
+            .window = 65535,
+            .maximum_segment_size = null,
+            .payload_len = request.len,
+            .payload = request ++ ([_]u8{undefined} ** (packet.max_tcp_payload - request.len)),
+        }}, 0);
+        try std.testing.expectEqual(@as(usize, 1), queued);
+        manager.reactor.notify();
+
+        const uplink = try bridge_pair[0].socket.receiveTimeout(io, &uplink_buffer, .{
+            .duration = .{ .raw = Io.Duration.fromSeconds(2), .clock = .awake },
+        });
+        try std.testing.expectEqualSlices(u8, &request, uplink.data);
+        next_client_sequence +%= request.len;
+
+        const request_ack = try packet_pair[1].socket.receiveTimeout(io, &packet_buffer, .{
+            .duration = .{ .raw = Io.Duration.fromSeconds(2), .clock = .awake },
+        });
+        const parsed_ack = try packet.parse(request_ack.data);
+        try std.testing.expect(parsed_ack.flags.ack);
+        try std.testing.expectEqual(@as(usize, 0), parsed_ack.payload.len);
+        try std.testing.expectEqual(next_client_sequence, parsed_ack.acknowledgment);
+
+        if (round == 3) {
+            const stale = try flow.queue.put(io, &.{.{
+                .sequence = next_client_sequence -% @as(u32, request.len) -% 1,
+                .acknowledgment = next_server_sequence,
+                .flags = .{ .ack = true },
+                .window = 0,
+                .maximum_segment_size = null,
+                .payload_len = 0,
+                .payload = undefined,
+            }}, 0);
+            try std.testing.expectEqual(@as(usize, 1), stale);
+            const barrier = try flow.queue.put(io, &.{.{
+                .sequence = client_sequence,
+                .acknowledgment = 0,
+                .flags = .{ .syn = true },
+                .window = 65535,
+                .maximum_segment_size = 1460,
+                .payload_len = 0,
+                .payload = undefined,
+            }}, 0);
+            try std.testing.expectEqual(@as(usize, 1), barrier);
+            manager.reactor.notify();
+            const barrier_ack = try packet_pair[1].socket.receiveTimeout(io, &packet_buffer, .{
+                .duration = .{ .raw = Io.Duration.fromSeconds(2), .clock = .awake },
+            });
+            try std.testing.expectEqual(@as(usize, 0), (try packet.parse(barrier_ack.data)).payload.len);
+        }
+
+        var response: [17]u8 = undefined;
+        @memset(&response, @intCast(0x80 + round));
+        try bridge_writer.interface.writeAll(&response);
+        try bridge_writer.interface.flush();
+
+        const emitted = try packet_pair[1].socket.receiveTimeout(io, &packet_buffer, .{
+            .duration = .{ .raw = Io.Duration.fromSeconds(2), .clock = .awake },
+        });
+        const parsed = try packet.parse(emitted.data);
+        try std.testing.expectEqualSlices(u8, &response, parsed.payload);
+        try std.testing.expectEqual(next_server_sequence, parsed.sequence);
+        next_server_sequence +%= response.len;
+
+        const acked = try flow.queue.put(io, &.{.{
+            .sequence = next_client_sequence,
+            .acknowledgment = next_server_sequence,
+            .flags = .{ .ack = true },
+            .window = 65535,
+            .maximum_segment_size = null,
+            .payload_len = 0,
+            .payload = undefined,
+        }}, 0);
+        try std.testing.expectEqual(@as(usize, 1), acked);
+        manager.reactor.notify();
+    }
+}
+
+fn createTestSocketPair(socket_type: u32) ![2]net.Stream {
+    var fds: [2]posix.socket_t = undefined;
+    while (true) switch (posix.errno(posix.system.socketpair(
+        posix.AF.UNIX,
+        socket_type | posix.SOCK.CLOEXEC,
+        0,
+        &fds,
+    ))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        else => return error.SocketPairFailed,
+    };
+    const address = net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    return .{
+        .{ .socket = .{ .handle = fds[0], .address = address } },
+        .{ .socket = .{ .handle = fds[1], .address = address } },
+    };
+}
