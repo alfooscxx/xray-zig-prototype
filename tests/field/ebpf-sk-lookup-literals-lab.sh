@@ -31,7 +31,7 @@ FAKE4_ID=
 FAKE6_ID=
 COUNTERS_ID=
 PROGRAM_NAMES="xz_sk_lookup xz_sk_fake xz_sk_literal xz_sh_parser xz_sh_verdict"
-MAP_NAMES="xz_fake4 xz_fake6 xz_listeners xz_sk_count xz_exclude4 xz_exclude6 xz_admit xz_sk_progs xz_sh_targets xz_sh_sources xz_sh_peers xz_sh_state xz_sh_stats xz_sh_total"
+MAP_NAMES="xz_fake4 xz_fake6 xz_listeners xz_sk_count xz_pool4 xz_pool6 xz_exclude4 xz_exclude6 xz_admit xz_sk_progs xz_sh_targets xz_sh_sources xz_sh_peers xz_sh_state xz_sh_stats xz_sh_total"
 
 named_ids() {
     kind=$1
@@ -112,7 +112,7 @@ cleanup() {
     ip netns del "$CLIENT_NS" 2>/dev/null
     ip netns del "$WRONG_NS" 2>/dev/null
     ip netns del "$ROUTER_NS" 2>/dev/null
-    rm -f "$LAB_ROOT/config.json" "$LAB_ROOT/xray.log" "$LAB_ROOT/peer.log" "$LAB_ROOT/status.json" "$LAB_ROOT/negative.log" "$CONTROL_SOCKET" "$LAB_ROOT"/*.txt
+    rm -f "$LAB_ROOT/config.json" "$LAB_ROOT/xray.log" "$LAB_ROOT/peer.log" "$LAB_ROOT/status.json" "$LAB_ROOT/negative.log" "$LAB_ROOT/metrics.prom" "$CONTROL_SOCKET" "$LAB_ROOT"/*.txt
     rmdir "$LAB_ROOT" 2>/dev/null
     exit "$status"
 }
@@ -319,6 +319,9 @@ expect_client_failure excluded-cidr "$CLIENT_NS" 203.0.113.130 19080
 expect_client_failure excluded-proxy4 "$CLIENT_NS" 203.0.113.254 19080
 expect_client_failure excluded-proxy6 "$CLIENT_NS" 2001:db8:100::fe 19081
 expect_client_failure missing-fake4 "$CLIENT_NS" 198.18.254.2 18080
+"$XRAY_BIN" ctl metrics --socket "$CONTROL_SOCKET" >"$LAB_ROOT/metrics.prom"
+awk '$0 ~ /xray_zig_bpf_lookup_total\{hook="sk_lookup",result="pool_miss"\}/ && $2 > 0 { found=1 } END { exit !found }' "$LAB_ROOT/metrics.prom"
+awk '$0 ~ /xray_zig_bpf_lookup_total\{hook="sk_lookup",result="drop"\}/ && $2 > 0 { found=1 } END { exit !found }' "$LAB_ROOT/metrics.prom"
 
 grep -q 'freedom sockhash-handoff' "$LAB_ROOT/xray.log"
 grep -q 'rejected an excluded literal destination' "$LAB_ROOT/xray.log"

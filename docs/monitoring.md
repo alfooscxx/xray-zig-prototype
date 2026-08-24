@@ -54,7 +54,8 @@ implementation provides the following observability building blocks:
   bytes, packets, and redirect errors for the process lifetime, independent of
   individual flow cleanup. These maps are not pinned and are recreated on
   every process start.
-- SK_LOOKUP maintains hit, miss, expiry, socket-assignment, pass, and drop
+- SK_LOOKUP maintains hit, exact-map miss, FakeDNS pool-miss,
+  socket-assignment, pass, and drop
   counters in the bounded per-CPU `xz_sk_count` ARRAY. The control snapshot
   aggregates it through the FD owned by xray-zig; the map is not pinned.
 - The SOCKHASH userspace monitor owns duplicate socket FDs, observes FIN/RST,
@@ -118,7 +119,7 @@ reliably from procfs, thread names, or logs:
 - inbound acceptance, dispatch, rejection, and active session counts;
 - ordered routing decisions and selected outbound;
 - DNS query concurrency, resolver selection, result, and latency;
-- FakeDNS allocation, lookup, lease, expiry, and pool pressure;
+- FakeDNS allocation, lookup, retained mappings, reuse eligibility, and pool pressure;
 - VLESS and REALITY initialization stages and failures;
 - Vision classification and `CommandDirect` transitions;
 - Vision gate eligibility separately from subsequent SOCKHASH admission;
@@ -138,7 +139,7 @@ When the BPF dataplane is enabled, programs should update only bounded maps:
 
 - per-CPU packet, byte, lookup, and action counters;
 - map occupancy and update failures;
-- `sk_lookup` hit, miss, expiry, assignment, pass, and drop counters;
+- `sk_lookup` hit, exact-map miss, pool-miss, assignment, pass, and drop counters;
 - TC ingress action counters if TC or TCX is used;
 - SOCKHASH packet, byte, redirect, and redirect-error counters;
 - ring-buffer event loss.
@@ -199,9 +200,9 @@ xray_zig_fakedns_allocations_total{family,result}
 xray_zig_fakedns_lookup_total{family,result}
 ```
 
-Lease states should be a fixed set such as `active`, `stale`, and `reusable`.
-Pool exhaustion, publication failure, expiry, and reverse-lookup miss must be
-separate results.
+Lease states should be a fixed set such as `advertised`, `quarantined`, and
+`reusable`. Pool exhaustion, publication failure, replacement eligibility, and
+reverse-lookup miss must be separate results.
 
 ### VLESS, REALITY, And Vision
 
@@ -392,11 +393,11 @@ actions.
 
 - loaded hooks, program IDs, and JIT status;
 - map occupancy and capacity;
-- lookup hit, miss, and expiry;
+- lookup hit, exact-map miss, and fail-closed FakeDNS pool miss;
 - socket assignment failures;
 - active sockhash flows by owner and fallback reasons;
 - SOCKHASH aggregate bytes, packets, redirect errors, and last activity;
-- persistent FakeDNS pin compatibility and restored/pruned lease counts;
+- persistent FakeDNS pin compatibility and retained/replaced mapping counts;
 - ring-buffer event loss.
 
 ### Diagnostics

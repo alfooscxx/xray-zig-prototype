@@ -23,11 +23,16 @@ BPF_LINK_ID=
 BPF_PROG_ID=
 BPF_MAP4_ID=
 BPF_MAP6_ID=
+BPF_POOL4_ID=
+BPF_POOL6_ID=
 BPF_LISTENERS_ID=
 BPF_COUNTERS_ID=
+MISS_METRICS=$LAB_ROOT/miss-metrics.prom
 BASE_PROG_IDS=
 BASE_MAP4_IDS=
 BASE_MAP6_IDS=
+BASE_POOL4_IDS=
+BASE_POOL6_IDS=
 BASE_LISTENER_IDS=
 BASE_COUNTER_IDS=
 
@@ -106,7 +111,7 @@ cleanup() {
     fi
     ip netns del "$CLIENT_NS" 2>/dev/null
     ip netns del "$ROUTER_NS" 2>/dev/null
-    rm -f "$LAB_ROOT/config.json" "$LAB_ROOT/xray.log" "$LAB_ROOT/peer.log" "$CONTROL_SOCKET"
+    rm -f "$LAB_ROOT/config.json" "$LAB_ROOT/xray.log" "$LAB_ROOT/peer.log" "$MISS_METRICS" "$CONTROL_SOCKET"
     rmdir "$LAB_ROOT" 2>/dev/null
     exit "$status"
 }
@@ -127,6 +132,8 @@ ip netns list | grep -Eq "^$CLIENT_NS|^$ROUTER_NS" && { echo "lab namespace coll
 BASE_PROG_IDS=$(named_ids prog xz_sk_lookup)
 BASE_MAP4_IDS=$(named_ids map xz_fake4)
 BASE_MAP6_IDS=$(named_ids map xz_fake6)
+BASE_POOL4_IDS=$(named_ids map xz_pool4)
+BASE_POOL6_IDS=$(named_ids map xz_pool6)
 BASE_LISTENER_IDS=$(named_ids map xz_listeners)
 BASE_COUNTER_IDS=$(named_ids map xz_sk_count)
 
@@ -218,9 +225,11 @@ done
 BPF_PROG_ID=$(new_named_id prog xz_sk_lookup "$BASE_PROG_IDS")
 BPF_MAP4_ID=$(new_named_id map xz_fake4 "$BASE_MAP4_IDS")
 BPF_MAP6_ID=$(new_named_id map xz_fake6 "$BASE_MAP6_IDS")
+BPF_POOL4_ID=$(new_named_id map xz_pool4 "$BASE_POOL4_IDS")
+BPF_POOL6_ID=$(new_named_id map xz_pool6 "$BASE_POOL6_IDS")
 BPF_LISTENERS_ID=$(new_named_id map xz_listeners "$BASE_LISTENER_IDS")
 BPF_COUNTERS_ID=$(new_named_id map xz_sk_count "$BASE_COUNTER_IDS")
-[ -n "$BPF_PROG_ID" ] && [ -n "$BPF_MAP4_ID" ] && [ -n "$BPF_MAP6_ID" ] && [ -n "$BPF_LISTENERS_ID" ] && [ -n "$BPF_COUNTERS_ID" ]
+[ -n "$BPF_PROG_ID" ] && [ -n "$BPF_MAP4_ID" ] && [ -n "$BPF_MAP6_ID" ] && [ -n "$BPF_POOL4_ID" ] && [ -n "$BPF_POOL6_ID" ] && [ -n "$BPF_LISTENERS_ID" ] && [ -n "$BPF_COUNTERS_ID" ]
 BPF_LINK_ID=$(bpftool link show | awk -v prog_id="$BPF_PROG_ID" '
     $0 ~ ("prog[[:space:]]+" prog_id "([[:space:]]|$)") {
         gsub(":", "", $1)
@@ -242,30 +251,31 @@ if ip -n "$ROUTER_NS" -6 route show dev "$TUN_IF" | grep -q .; then
 fi
 
 # The exact fake address is locally routed, but it has not been published yet.
-# A miss must remain on the normal socket lookup path and cannot reach the
-# SK_LOOKUP listener, whose real bind port is deliberately different.
+# A miss must be rejected in BPF before ordinary local socket lookup.
 if assert_map4_entry >/dev/null 2>&1; then
     echo "IPv4 FakeDNS map unexpectedly contains the lab key before DNS" >&2
     exit 1
 fi
-run_bounded ip netns exec "$CLIENT_NS" "$PEER_BIN" expect-connect-fail 198.18.254.1 18080
+if run_bounded ip netns exec "$CLIENT_NS" "$PEER_BIN" direct-client 198.18.254.1 18080 pre-publication-miss; then
+    echo "unpublished FakeDNS address unexpectedly connected" >&2
+    exit 1
+fi
+sleep 1
+"$XRAY_BIN" ctl metrics --socket "$CONTROL_SOCKET" >"$MISS_METRICS"
+awk '$0 ~ /xray_zig_bpf_lookup_total\{hook="sk_lookup",result="pool_miss"\}/ && $2 > 0 { found=1 } END { exit !found }' "$MISS_METRICS"
+awk '$0 ~ /xray_zig_bpf_lookup_total\{hook="sk_lookup",result="drop"\}/ && $2 > 0 { found=1 } END { exit !found }' "$MISS_METRICS"
 
 run_bounded ip netns exec "$CLIENT_NS" "$PEER_BIN" client 192.0.2.1 53 echo4.lab 4 18080 ebpf-ipv4
 assert_map4_entry
 run_bounded ip netns exec "$CLIENT_NS" "$PEER_BIN" client 192.0.2.1 53 echo6.lab 6 18080 ebpf-ipv6
 assert_map6_entry
 
-# The map entry is intentionally retained. After ttl + reuse grace, a new SYN
-# for the same exact address must fail because bpf_ktime_get_ns has passed the
-# published monotonic route_valid_until_ns, not because userspace removed it.
+# The map entry remains authoritative after ttl + reuse grace. The lease is
+# eligible for replacement, but the domain mapping changes only when another
+# allocation actually replaces this exact map element.
 sleep 6
 assert_map4_entry
-run_bounded ip netns exec "$CLIENT_NS" "$PEER_BIN" expect-connect-fail 198.18.254.1 18080
-sleep 1
-if grep -q 'accepted an address without a live FakeDNS lease' "$LAB_ROOT/xray.log"; then
-    echo "expired IPv4 entry was still assigned to the SK_LOOKUP listener" >&2
-    exit 1
-fi
+run_bounded ip netns exec "$CLIENT_NS" "$PEER_BIN" direct-client 198.18.254.1 18080 retained-after-quarantine
 
 terminate_pid "$XRAY_PID"
 XRAY_PID=
@@ -275,8 +285,10 @@ XRAY_PID=
 ! bpftool prog show id "$BPF_PROG_ID" >/dev/null 2>&1
 ! bpftool map show id "$BPF_MAP4_ID" >/dev/null 2>&1
 ! bpftool map show id "$BPF_MAP6_ID" >/dev/null 2>&1
+! bpftool map show id "$BPF_POOL4_ID" >/dev/null 2>&1
+! bpftool map show id "$BPF_POOL6_ID" >/dev/null 2>&1
 ! bpftool map show id "$BPF_LISTENERS_ID" >/dev/null 2>&1
 ! bpftool map show id "$BPF_COUNTERS_ID" >/dev/null 2>&1
 ! ip netns exec "$ROUTER_NS" bpftool prog show id "$BPF_PROG_ID" >/dev/null 2>&1
 
-echo "PASS: isolated FakeDNS -> SK_LOOKUP IPv4/IPv6, miss/expiry, TUN coexistence, and FD cleanup"
+echo "PASS: isolated FakeDNS -> SK_LOOKUP IPv4/IPv6, fail-closed miss, durable mapping, TUN coexistence, and FD cleanup"

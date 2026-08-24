@@ -15,7 +15,7 @@ pub const DnsResult = enum { success, format_error, servfail, timeout };
 pub const Qtype = enum { a, aaaa, other };
 pub const Family = enum { ipv4, ipv6 };
 pub const AllocationResult = enum { allocated, reused, exhausted, publish_error };
-pub const LookupResult = enum { hit, miss, expired };
+pub const LookupResult = enum { hit, miss };
 pub const Owner = enum { freedom, vless_vision, generic };
 pub const OffloadResult = enum { offloaded, raw_fallback, hybrid_raw, failed_closed };
 pub const FallbackReason = enum {
@@ -444,7 +444,7 @@ pub const Registry = struct {
         self: *Registry,
         hit: u64,
         miss: u64,
-        expiry: u64,
+        pool_miss: u64,
         assign4_success: u64,
         assign4_error: u64,
         assign6_success: u64,
@@ -454,7 +454,7 @@ pub const Registry = struct {
     ) void {
         self.bpf_lookup[0].store(hit, .release);
         self.bpf_lookup[1].store(miss, .release);
-        self.bpf_lookup[2].store(expiry, .release);
+        self.bpf_lookup[2].store(pool_miss, .release);
         self.bpf_lookup[3].store(pass, .release);
         self.bpf_lookup[4].store(drop, .release);
         self.bpf_socket_assign[0].store(assign4_success, .release);
@@ -643,7 +643,7 @@ pub const Registry = struct {
         try metric(writer, "xray_zig_bpf_sockhash_redirect_errors_total{network=\"tcp\"}", self.sockhash_redirect_errors.load(.acquire));
         try metric(writer, "xray_zig_bpf_lookup_total{hook=\"sk_lookup\",result=\"hit\"}", self.bpf_lookup[0].load(.acquire));
         try metric(writer, "xray_zig_bpf_lookup_total{hook=\"sk_lookup\",result=\"miss\"}", self.bpf_lookup[1].load(.acquire));
-        try metric(writer, "xray_zig_bpf_lookup_total{hook=\"sk_lookup\",result=\"expiry\"}", self.bpf_lookup[2].load(.acquire));
+        try metric(writer, "xray_zig_bpf_lookup_total{hook=\"sk_lookup\",result=\"pool_miss\"}", self.bpf_lookup[2].load(.acquire));
         try metric(writer, "xray_zig_bpf_lookup_total{hook=\"sk_lookup\",result=\"pass\"}", self.bpf_lookup[3].load(.acquire));
         try metric(writer, "xray_zig_bpf_lookup_total{hook=\"sk_lookup\",result=\"drop\"}", self.bpf_lookup[4].load(.acquire));
         try metric(writer, "xray_zig_bpf_socket_assign_total{family=\"ipv4\",result=\"success\"}", self.bpf_socket_assign[0].load(.acquire));

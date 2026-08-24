@@ -72,9 +72,10 @@ With it, a no-lease destination is assigned only when it arrived on the named
 interface and does not match an exclusion. The name is resolved to an ifindex
 at startup; a missing interface is fatal. `excludedIPs` and `proxyServerIPs`
 are required non-empty arrays. Proxy-server entries must be exact addresses,
-not CIDRs. Both lists and both configured FakeDNS pools are loaded into BPF LPM
-tries. Consequently, an expired or missing address in a FakeDNS pool is never
-reinterpreted as a literal.
+not CIDRs. The configured FakeDNS pools use separate BPF LPM tries from the
+operator exclusions. Consequently, a missing address in a FakeDNS pool is
+dropped rather than reinterpreted as a literal or passed to a local wildcard
+listener.
 
 No other `sk_lookup`, `fakeDnsPersistence`, `sockhashOffload`, or
 `transparentIntercept` fields are accepted. The listener
@@ -82,50 +83,56 @@ addresses must have the indicated family. Ports are nonzero and
 `maxMapEntries` is bounded to 1 through 1,048,576. A `sk_lookup` inbound also
 requires `dns.fakeDns`.
 
-FakeDNS accepts `reuseGraceSeconds`, which defaults to 30:
+FakeDNS accepts `reuseGraceSeconds`, which defaults to one day:
 
 ```json
 "fakeDns": {
   "ipPool": "198.18.0.0/15",
   "ipPool6": "fc00::/18",
-  "ttl": 60,
-  "reuseGraceSeconds": 30
+  "ttl": 600,
+  "reuseGraceSeconds": 86400
 }
 ```
 
-An address lease remains valid until DNS expiry plus this grace interval. It
-cannot be reused while a dispatched TCP session holds it. Reuse increments its
-generation. A refresh keeps the address and generation but extends both DNS
-expiry and route validity. If the pool is exhausted, the BPF map is full, or
-publication fails, the DNS inbound returns SERVFAIL and does not expose a
-synthetic address that the dataplane cannot route.
+DNS expiry marks an address as no longer recently advertised. After the
+additional reuse grace it becomes eligible for replacement, but its domain
+mapping and exact BPF element remain authoritative until another allocation
+actually replaces that address. It cannot be replaced while a dispatched TCP
+session holds it. Replacement increments its generation; a refresh keeps the
+address and generation while extending DNS expiry and the reuse quarantine.
+If the pool is exhausted, the BPF map is full, or publication fails, the DNS
+inbound returns SERVFAIL and does not expose a synthetic address that the
+dataplane cannot route.
 
 ## Ownership And Ordering
 
-xray-zig creates two HASH maps for exact IPv4 and IPv6 addresses, one SOCKMAP
-for the listener sockets, and a nine-entry per-CPU ARRAY named `xz_sk_count`
-for bounded monitoring counters. Values in the address maps contain
-`domain_id`, `generation`, and the monotonic `route_valid_until_ns`.
+xray-zig creates two HASH maps for exact IPv4 and IPv6 addresses, two LPM tries
+for the configured FakeDNS pools, one SOCKMAP for the listener sockets, and a
+nine-entry per-CPU ARRAY named `xz_sk_count` for bounded monitoring counters.
+Values in the address maps contain `domain_id`, `generation`, and the monotonic
+`reuse_after_ns`; the packet program needs only the exact-map membership and
+does not expire a published mapping by time.
 
 The namespace receives one attached `xz_sk_lookup` dispatcher. It tail-calls a
 small `xz_sk_fake` handler through the private `xz_sk_progs` PROG_ARRAY; an
-exact-map miss can tail-call the separate `xz_sk_literal` handler when
-`transparentIntercept` is enabled. Tail-call failure is fail-open. Expired
-FakeDNS entries do not enter literal policy, and FakeDNS pools are always in
-the literal exclusion tries, so stale/missing leases cannot become literals.
+exact-map miss outside the FakeDNS pools can tail-call the separate
+`xz_sk_literal` handler when `transparentIntercept` is enabled. Tail-call
+failure is fail-open only for destinations outside the FakeDNS pools. A pool
+miss is terminal `SK_DROP`, so stale/missing leases cannot become literals or
+reach ordinary local sockets.
 FakeDNS and literal handling use separate listener lookup, assignment, and
 release programs. A successful
 FakeDNS assignment immediately executes `r0 = SK_PASS; BPF_EXIT`, with no
 shared branch register, long jump, admission publication, monitoring helper,
 or fallthrough into literal policy. Only the dispatcher is linked to the
 network namespace; handler FDs are owned by the PROG_ARRAY and process.
-Non-TCP traffic, unknown
-families, excluded destinations, wrong ingress interfaces, expired entries,
-missing listeners, and assignment failures are fail-open (`SK_PASS`). A
-no-lease destination outside the FakeDNS pools can reach the listener only
-through the configured ingress interface. The counter map records hit, miss,
-expiry, literal IPv4/IPv6 assignment success, IPv4/IPv6 assignment error, pass,
-and drop without contended global updates;
+Non-TCP traffic, unknown families, excluded destinations, and wrong ingress
+interfaces remain fail-open (`SK_PASS`). A live FakeDNS assignment failure is
+fail-closed, as is an exact-map miss inside either FakeDNS pool. A no-lease
+destination outside the pools can reach the listener only through the
+configured ingress interface. The counter map records hit, exact-map miss,
+pool miss, IPv4/IPv6 assignment success and error, pass, and drop without
+contended global updates;
 the local control API aggregates it through the process-owned FD.
 
 The runtime uses `bpf()` syscalls directly. It has no runtime dependency on
@@ -195,7 +202,7 @@ The listener SOCKMAP, SK_LOOKUP program/link, and every SOCKHASH object remain
 ephemeral. The packet program never references `lease_meta`, so persistence
 adds no per-packet lookup. A metadata write precedes each address-map update;
 the address map is the commit marker. Metadata keys include family, address,
-domain ID, generation, and exact monotonic route deadline. Startup can
+domain ID, generation, and exact monotonic reuse deadline. Startup can
 therefore retain the last committed version and prune an interrupted pending
 version without guessing.
 
@@ -225,11 +232,18 @@ unlinking a flock file permits two processes to lock different inodes under the
 same name. `/run` clears it on reboot without a flash write.
 
 Normal shutdown closes FDs but deliberately leaves the three bpffs pins and
-live leases. On the next process start, expired pairs and unreferenced
-transaction records are deleted, unexpired A/AAAA leases and generations are
-restored, and allocation resumes without colliding with restored addresses.
+retained mappings. On the next process start, every committed A/AAAA mapping
+and generation is restored even when it is already eligible for reuse;
+unreferenced transaction records are pruned. Allocation can replace an eligible
+mapping later without colliding with restored addresses.
 bpffs is RAM-backed: this preserves state across process restarts in one boot,
 not across a kernel reboot, and causes no flash writes.
+
+Persistence schema version 2 introduces durable-until-replaced mappings and is
+intentionally incompatible with schema version 1. Stop the old process and run
+the old binary's `fakedns-unpin` with its compatible configuration before
+starting a binary that uses the new schema; incompatible pins are never deleted
+automatically.
 
 The metadata map capacity is twice `maxMapEntries` plus two transactional/header
 slots, but `BPF_F_NO_PREALLOC` means memory is charged only for actual entries.
@@ -397,10 +411,10 @@ to the locally routed IPv4 address is not assigned. It then performs DNS
 allocation followed by real IPv4 and IPv6 TCP echo flows and uses exact
 `bpftool map lookup ... key hex` operations to prove that both address maps
 contain their published key. The lab uses a short TTL and reuse grace, retains
-the IPv4 map entry, waits past `route_valid_until_ns`, and proves that a new
-connection to the same address receives the ordinary closed-port refusal
-instead of being assigned. Timeouts and other connection errors fail the test,
-so the miss evidence does not accept a dropped SYN. It also verifies the BPF
+the IPv4 map entry, waits until it is eligible for replacement, and proves that
+a new connection still uses the retained mapping. Before publication, the same
+locally routed address must increment both the pool-miss and drop counters. It
+also verifies the BPF
 objects and idle test TUN, kills only the process it started, verifies
 link/map/TUN removal, and deletes both namespaces. All client operations have
 both an internal five-second network deadline and a shell watchdog. Traps apply
@@ -432,7 +446,7 @@ rule to a namespace-local table containing `local 0.0.0.0/0 dev lo` and
 The bounded run proves verifier/load for SK_LOOKUP and required SOCKHASH,
 authorized IPv4/IPv6 literals, direct CIDR and default blackhole decisions,
 wrong-ingress and direct-listener admission-proof rejection, excluded local
-CIDR and exact proxy-server addresses, live and stale/missing IPv4/IPv6
+CIDR and exact proxy-server addresses, live and missing IPv4/IPv6
 FakeDNS, a freedom SOCKHASH handoff, and removal of every newly observed
 program and map ID. FakeDNS checks first perform and print a bounded DNS-only
 allocation, then probe the published address separately so DNS failures and
@@ -441,8 +455,9 @@ requires an exact `bpftool map lookup` for the published IPv4/IPv6 key and
 captures the raw lease value plus per-CPU SK_LOOKUP counters before and after
 the SYN. It also captures the loaded xlated BPF program, monotonic/boottime
 snapshots, policy rules/routes, and authorized-veth packet counters. A
-60-second lab TTL keeps expiry outside the bounded live-hit diagnosis; stale
-expiry remains covered by the separate FakeDNS-only lab. Expected-negative client errors are
+60-second lab TTL keeps the live-hit diagnosis bounded; the separate
+FakeDNS-only lab proves that a mapping remains usable after becoming eligible
+for reuse. Expected-negative client errors are
 captured in the lab directory and printed only when the harness itself fails.
 Both live FakeDNS allocations/connections are now the first dataplane actions
 after verifier/load and object discovery. Literal, missing-lease, blackhole,
@@ -510,13 +525,23 @@ verifier run found that the socket reference returned by the SOCKMAP lookup
 must be released after `bpf_sk_assign`; both address-family paths now call
 `bpf_sk_release` after every assignment attempt.
 
-The final run passed IPv4 and IPv6 exact FakeDNS hits, a pre-publication miss
-that remained fail-open and returned `ECONNREFUSED`, and monotonic expiry that
-returned to the same fail-open result while the expired key was still present
-in the BPF map. An idle test TUN coexisted in the same isolated router
-namespace without owning test routes. Process shutdown removed the owned BPF
-link, program, maps, and test TUN, and the harness removed both namespaces and
-their veth state.
+The original run passed IPv4 and IPv6 exact FakeDNS hits but deliberately left
+pre-publication misses and monotonic expiry fail-open. That behavior was
+superseded after a stale Google FakeDNS address reached the router's wildcard
+HTTPS listener. The current harness instead requires fail-closed pool misses
+and durable mappings after the reuse deadline. An idle test TUN coexisted in
+the same isolated router namespace without owning test routes. Process
+shutdown removed the owned BPF link, program, maps, and test TUN, and the
+harness removed both namespaces and their veth state.
+
+The 2026-08-25 rerun on the same AArch64 router and Linux 6.12.94 passed the
+new contract: an unpublished IPv4 pool address incremented `pool_miss` and
+`drop`, published IPv4/IPv6 addresses completed echo flows, and the IPv4
+mapping still completed a flow after the short lab TTL and reuse grace. The
+transparent-literal harness then passed both FakeDNS families, IPv4/IPv6
+literal routing, wrong-ingress and exclusion rejection, SOCKHASH handoff, and
+owned BPF-object cleanup. The production service remained ready with all four
+listeners active.
 
 ### SOCKHASH Capability Result
 
@@ -680,8 +705,8 @@ Vision server that guarantees both direct commands.
 
 ## Staged Roadmap And Current Limits
 
-1. The current TCP correctness phase is implemented and field-validated for
-   exact IPv4/IPv6 FakeDNS hits, misses, monotonic expiry, and owned-object
+1. The current TCP correctness phase is implemented for exact IPv4/IPv6
+   FakeDNS hits, fail-closed pool misses, durable mappings, and owned-object
    cleanup. This does not by itself establish production performance or every
    failure mode.
 2. Optional TC per-CPU counters and events may add observability only after an

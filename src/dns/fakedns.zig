@@ -15,7 +15,7 @@ pub const Error = error{
 pub const Publication = extern struct {
     domain_id: u64,
     generation: u64,
-    route_valid_until_ns: u64,
+    reuse_after_ns: u64,
 };
 
 pub const LeasePublication = struct {
@@ -174,7 +174,7 @@ pub const Store = struct {
             .generations6 = std.AutoHashMap([16]u8, u64).init(allocator),
         };
         errdefer store.deinit();
-        var restore_context: RestoreContext = .{ .store = &store, .now_ns = now_ns };
+        var restore_context: RestoreContext = .{ .store = &store };
         try publisher.restore(now_ns, &restore_context, restoreLease);
         monitoring.registry.fakedns_capacity[@intFromEnum(monitoring.Family.ipv4)].store(store.usable_count, .release);
         monitoring.registry.fakedns_capacity[@intFromEnum(monitoring.Family.ipv6)].store(store.pool6_usable_count, .release);
@@ -270,6 +270,7 @@ pub const Store = struct {
     }
 
     pub fn lookupAt(self: *Store, address: net.IpAddress, now_ns: u64, io: Io) ?LeaseHandle {
+        _ = now_ns;
         self.mutex.lock(io) catch return null;
         defer self.mutex.unlock(io);
         return switch (address) {
@@ -278,18 +279,16 @@ pub const Store = struct {
                     monitoring.registry.fakeDnsLookup(.ipv4, .miss);
                     break :blk null;
                 };
-                const result = self.acquire4(lease, now_ns);
-                monitoring.registry.fakeDnsLookup(.ipv4, if (result == null) .expired else .hit);
-                break :blk result;
+                monitoring.registry.fakeDnsLookup(.ipv4, .hit);
+                break :blk self.acquire4(lease);
             },
             .ip6 => |ip| blk: {
                 const lease = self.leases6.get(ip.bytes) orelse {
                     monitoring.registry.fakeDnsLookup(.ipv6, .miss);
                     break :blk null;
                 };
-                const result = self.acquire6(lease, now_ns);
-                monitoring.registry.fakeDnsLookup(.ipv6, if (result == null) .expired else .hit);
-                break :blk result;
+                monitoring.registry.fakeDnsLookup(.ipv6, .hit);
+                break :blk self.acquire6(lease);
             },
         };
     }
@@ -407,14 +406,12 @@ pub const Store = struct {
         self.allocator.destroy(record);
     }
 
-    fn acquire4(self: *Store, lease: *Lease4, now_ns: u64) ?LeaseHandle {
-        if (now_ns >= lease.reuse_after_ns) return null;
+    fn acquire4(self: *Store, lease: *Lease4) LeaseHandle {
         lease.active_refs += 1;
         lease.record.active_refs += 1;
         return .{ .store = self, .record = lease.record, .family = .ip4, .generation = lease.generation };
     }
-    fn acquire6(self: *Store, lease: *Lease6, now_ns: u64) ?LeaseHandle {
-        if (now_ns >= lease.reuse_after_ns) return null;
+    fn acquire6(self: *Store, lease: *Lease6) LeaseHandle {
         lease.active_refs += 1;
         lease.record.active_refs += 1;
         return .{ .store = self, .record = lease.record, .family = .ip6, .generation = lease.generation };
@@ -463,12 +460,11 @@ pub const Store = struct {
         return .{ .dns = dns, .reuse_after = saturatingAdd(dns, self.reuse_grace_ns) };
     }
 
-    fn restoreOne(self: *Store, restored: RestoredLease, now_ns: u64) !void {
-        if (now_ns >= restored.publication.route_valid_until_ns) return;
+    fn restoreOne(self: *Store, restored: RestoredLease) !void {
         if (restored.publication.domain_id == 0 or
             restored.publication.domain_id == std.math.maxInt(u64) or
             restored.publication.generation == 0 or
-            restored.dns_expires_ns > restored.publication.route_valid_until_ns)
+            restored.dns_expires_ns > restored.publication.reuse_after_ns)
         {
             return error.InvalidFakeDnsPersistentState;
         }
@@ -534,7 +530,7 @@ pub const Store = struct {
                     .address = restored.address[0..4].*,
                     .generation = restored.publication.generation,
                     .dns_expires_ns = restored.dns_expires_ns,
-                    .reuse_after_ns = restored.publication.route_valid_until_ns,
+                    .reuse_after_ns = restored.publication.reuse_after_ns,
                 };
                 self.leases4.putAssumeCapacity(address4.?, lease);
                 self.generations4.putAssumeCapacity(address4.?, restored.publication.generation);
@@ -552,7 +548,7 @@ pub const Store = struct {
                     .address = restored.address,
                     .generation = restored.publication.generation,
                     .dns_expires_ns = restored.dns_expires_ns,
-                    .reuse_after_ns = restored.publication.route_valid_until_ns,
+                    .reuse_after_ns = restored.publication.reuse_after_ns,
                 };
                 self.leases6.putAssumeCapacity(restored.address, lease);
                 self.generations6.putAssumeCapacity(restored.address, restored.publication.generation);
@@ -566,12 +562,11 @@ pub const Store = struct {
 
 const RestoreContext = struct {
     store: *Store,
-    now_ns: u64,
 };
 
 fn restoreLease(context: ?*anyopaque, restored: RestoredLease) !void {
     const restore_context: *RestoreContext = @ptrCast(@alignCast(context.?));
-    try restore_context.store.restoreOne(restored, restore_context.now_ns);
+    try restore_context.store.restoreOne(restored);
 }
 
 fn leasePublication(
@@ -584,7 +579,7 @@ fn leasePublication(
         .dataplane = .{
             .domain_id = record.id,
             .generation = generation,
-            .route_valid_until_ns = reuse_after_ns,
+            .reuse_after_ns = reuse_after_ns,
         },
         .domain = record.name,
         .dns_expires_ns = dns_expires_ns,
@@ -709,7 +704,7 @@ fn restored4(domain: []const u8, id: u64, address: [4]u8, generation: u64, dns: 
     return .{
         .family = .ip4,
         .address = full_address,
-        .publication = .{ .domain_id = id, .generation = generation, .route_valid_until_ns = route },
+        .publication = .{ .domain_id = id, .generation = generation, .reuse_after_ns = route },
         .dns_expires_ns = dns,
         .domain = domain,
     };
@@ -719,7 +714,7 @@ fn restored6(domain: []const u8, id: u64, address: [16]u8, generation: u64, dns:
     return .{
         .family = .ip6,
         .address = address,
-        .publication = .{ .domain_id = id, .generation = generation, .route_valid_until_ns = route },
+        .publication = .{ .domain_id = id, .generation = generation, .reuse_after_ns = route },
         .dns_expires_ns = dns,
         .domain = domain,
     };
@@ -752,16 +747,25 @@ test "FakeDNS restores dual-stack leases before allocation" {
     try std.testing.expectEqualSlices(u8, &.{ 198, 18, 0, 2 }, &(try store.resolveAAt("new.example", 20, std.Io.failing)));
 }
 
-test "FakeDNS restore prunes expired input and safely reuses its address" {
-    const leases = [_]RestoredLease{restored4("expired.example", 9, .{ 198, 18, 0, 1 }, 6, 50, 60)};
+test "FakeDNS restore retains reusable mappings until replacement" {
+    const leases = [_]RestoredLease{
+        restored4("old-one.example", 9, .{ 198, 18, 0, 1 }, 6, 50, 60),
+        restored4("old-two.example", 10, .{ 198, 18, 0, 2 }, 2, 50, 60),
+    };
     var source: TestRestoreSource = .{ .leases = &leases };
     var store = try Store.initRestored(std.testing.allocator, test_config, .{
         .context = &source,
         .restore_fn = TestRestoreSource.restore,
     }, 60);
     defer store.deinit();
-    try std.testing.expectEqual(@as(usize, 0), store.leases4.count());
+    var stale = store.lookupAt(.{ .ip4 = .{ .bytes = .{ 198, 18, 0, 1 }, .port = 443 } }, 60, std.Io.failing).?;
+    try std.testing.expectEqualStrings("old-one.example", stale.domain());
+    stale.release(std.Io.failing);
+    try std.testing.expectEqual(@as(usize, 2), store.leases4.count());
     try std.testing.expectEqualSlices(u8, &.{ 198, 18, 0, 1 }, &(try store.resolveAAt("replacement.example", 60, std.Io.failing)));
+    var replacement = store.lookupAt(.{ .ip4 = .{ .bytes = .{ 198, 18, 0, 1 }, .port = 443 } }, 60, std.Io.failing).?;
+    defer replacement.release(std.Io.failing);
+    try std.testing.expectEqualStrings("replacement.example", replacement.domain());
 }
 
 test "FakeDNS restore rejects domain id collisions and rolls back partial state" {
@@ -820,7 +824,7 @@ test "FakeDNS normalizes and safely holds a session lease" {
     try std.testing.expectEqual(handle.domainId(), handle6.domainId());
 }
 
-test "FakeDNS refreshes TTL and route validity" {
+test "FakeDNS refreshes DNS expiry and reuse quarantine" {
     var capture: Publication = undefined;
     const P = struct {
         fn publish(context: ?*anyopaque, address: [4]u8, value: LeasePublication) !void {
@@ -833,9 +837,9 @@ test "FakeDNS refreshes TTL and route validity" {
     defer store.deinit();
     const second = std.time.ns_per_s;
     _ = try store.resolveAAt("example.com", second, std.Io.failing);
-    try std.testing.expectEqual(@as(u64, 16) * second, capture.route_valid_until_ns);
+    try std.testing.expectEqual(@as(u64, 16) * second, capture.reuse_after_ns);
     _ = try store.resolveAAt("EXAMPLE.COM.", 7 * second, std.Io.failing);
-    try std.testing.expectEqual(@as(u64, 22) * second, capture.route_valid_until_ns);
+    try std.testing.expectEqual(@as(u64, 22) * second, capture.reuse_after_ns);
 }
 
 test "FakeDNS exhausts before grace and reuses with new generation" {

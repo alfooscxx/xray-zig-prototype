@@ -14,6 +14,7 @@ const fd_t = std.posix.fd_t;
 const af_inet = 2;
 const af_inet6 = 10;
 const ipproto_tcp = 6;
+const sk_drop = 0;
 const sk_pass = 1;
 const listener4_key: u32 = 0;
 const listener6_key: u32 = 1;
@@ -41,7 +42,7 @@ comptime {
 pub const Counter = enum(u32) {
     lookup_hit,
     lookup_miss,
-    lookup_expiry,
+    pool_miss,
     assign4_success,
     assign4_error,
     assign6_success,
@@ -58,7 +59,7 @@ pub const CounterSnapshot = struct {
     }
 };
 const metadata_magic: u64 = 0x585a46444e534d31; // XZFDNSM1
-const metadata_schema_version: u32 = 1;
+const metadata_schema_version: u32 = 2;
 const metadata_header_kind: u16 = 1;
 const metadata_lease_kind: u16 = 2;
 const metadata_header_family: u32 = 0;
@@ -80,7 +81,7 @@ const MetadataKey = extern struct {
     address: [16]u8,
     domain_id: u64,
     generation: u64,
-    route_valid_until_ns: u64,
+    reuse_after_ns: u64,
 };
 
 const MetadataValue = extern struct {
@@ -145,6 +146,8 @@ pub const Dataplane = struct {
     metadata_fd: ?fd_t,
     listeners_fd: fd_t,
     counters_fd: fd_t,
+    fake_pool4_fd: fd_t,
+    fake_pool6_fd: fd_t,
     excluded4_fd: fd_t,
     excluded6_fd: fd_t,
     admissions_fd: fd_t,
@@ -205,24 +208,29 @@ pub const Dataplane = struct {
         const counter_cpu_count = try possibleCpuCount(io);
         const counters_fd = try createMap(.percpu_array, @sizeOf(u32), @sizeOf(u64), counter_count, 0, "xz_sk_count");
         errdefer closeFd(counters_fd);
+        const fake_pool4_fd = try createMap(.lpm_trie, 8, 1, 1, 1, "xz_pool4");
+        errdefer closeFd(fake_pool4_fd);
+        const fake_pool6_fd = try createMap(.lpm_trie, 20, 1, 1, 1, "xz_pool6");
+        errdefer closeFd(fake_pool6_fd);
+        try populateFakePools(fake_pool4_fd, fake_pool6_fd, fake_dns_cfg);
         const exclusion_capacity: u32 = if (transparent) |settings|
-            @intCast(@max(@as(usize, 2), settings.excluded_ips.len + settings.proxy_server_ips.len + 2))
+            @intCast(@max(@as(usize, 1), settings.excluded_ips.len + settings.proxy_server_ips.len))
         else
-            2;
+            1;
         const excluded4_fd = try createMap(.lpm_trie, 8, 1, exclusion_capacity, 1, "xz_exclude4");
         errdefer closeFd(excluded4_fd);
         const excluded6_fd = try createMap(.lpm_trie, 20, 1, exclusion_capacity, 1, "xz_exclude6");
         errdefer closeFd(excluded6_fd);
         const admissions_fd = try createMap(.lru_hash, @sizeOf(AdmissionKey), @sizeOf(u64), admission_capacity, 0, "xz_admit");
         errdefer closeFd(admissions_fd);
-        if (transparent) |settings| try populateExclusions(excluded4_fd, excluded6_fd, fake_dns_cfg, settings);
+        if (transparent) |settings| try populateExclusions(excluded4_fd, excluded6_fd, settings);
 
         try update(listeners_fd, std.mem.asBytes(&listener4_key), std.mem.asBytes(&listener4_fd));
         try update(listeners_fd, std.mem.asBytes(&listener6_key), std.mem.asBytes(&listener6_fd));
 
         const programs_fd = try createMap(.prog_array, @sizeOf(u32), @sizeOf(u32), 2, 0, "xz_sk_progs");
         errdefer closeFd(programs_fd);
-        const fake_instructions = fakeProgram(owned_maps.fake4_fd, owned_maps.fake6_fd, listeners_fd, counters_fd, programs_fd, transparent_ifindex != null);
+        const fake_instructions = fakeProgram(owned_maps.fake4_fd, owned_maps.fake6_fd, fake_pool4_fd, fake_pool6_fd, listeners_fd, counters_fd, programs_fd, transparent_ifindex != null);
         const fake_program_fd = try loadProgram(fake_instructions.slice(), "xz_sk_fake");
         errdefer closeFd(fake_program_fd);
         const literal_instructions = literalProgram(listeners_fd, counters_fd, excluded4_fd, excluded6_fd, admissions_fd, transparent_ifindex);
@@ -230,7 +238,7 @@ pub const Dataplane = struct {
         errdefer closeFd(literal_program_fd);
         try update(programs_fd, std.mem.asBytes(&fake_handler_index), std.mem.asBytes(&fake_program_fd));
         try update(programs_fd, std.mem.asBytes(&literal_handler_index), std.mem.asBytes(&literal_program_fd));
-        const instructions = dispatcherProgram(programs_fd);
+        const instructions = dispatcherProgram(programs_fd, fake_pool4_fd, fake_pool6_fd, counters_fd);
         const program_fd = try loadProgram(instructions.slice(), "xz_sk_lookup");
         errdefer closeFd(program_fd);
 
@@ -240,6 +248,8 @@ pub const Dataplane = struct {
             .metadata_fd = owned_maps.metadata_fd,
             .listeners_fd = listeners_fd,
             .counters_fd = counters_fd,
+            .fake_pool4_fd = fake_pool4_fd,
+            .fake_pool6_fd = fake_pool6_fd,
             .excluded4_fd = excluded4_fd,
             .excluded6_fd = excluded6_fd,
             .admissions_fd = admissions_fd,
@@ -268,6 +278,8 @@ pub const Dataplane = struct {
         closeFd(self.programs_fd);
         closeFd(self.listeners_fd);
         closeFd(self.counters_fd);
+        closeFd(self.fake_pool6_fd);
+        closeFd(self.fake_pool4_fd);
         closeFd(self.excluded6_fd);
         closeFd(self.excluded4_fd);
         closeFd(self.admissions_fd);
@@ -350,8 +362,9 @@ pub const Dataplane = struct {
     ) !void {
         const self: *Dataplane = @ptrCast(@alignCast(context.?));
         if (self.metadata_fd == null) return;
-        try self.restoreFamily(metadata_family4, self.fake4_fd, 4, now_ns, visitor_context, visitor);
-        try self.restoreFamily(metadata_family6, self.fake6_fd, 16, now_ns, visitor_context, visitor);
+        _ = now_ns;
+        try self.restoreFamily(metadata_family4, self.fake4_fd, 4, visitor_context, visitor);
+        try self.restoreFamily(metadata_family6, self.fake6_fd, 16, visitor_context, visitor);
         try self.pruneUnreferencedMetadata();
     }
 
@@ -414,7 +427,6 @@ pub const Dataplane = struct {
         family: u32,
         fake_fd: fd_t,
         key_size: usize,
-        now_ns: u64,
         visitor_context: ?*anyopaque,
         visitor: fakedns.RestoreVisitor,
     ) !void {
@@ -440,12 +452,7 @@ pub const Dataplane = struct {
                 else => return err,
             };
             try validateLeaseMetadata(value, self.config_fingerprint);
-            if (now_ns >= publication.route_valid_until_ns) {
-                delete(fake_fd, current[0..key_size]);
-                delete(self.metadata_fd.?, std.mem.asBytes(&key));
-                continue;
-            }
-            if (value.dns_expires_ns > publication.route_valid_until_ns)
+            if (value.dns_expires_ns > publication.reuse_after_ns)
                 return error.IncompatibleBpfPersistence;
             try visitor(visitor_context, .{
                 .family = if (family == metadata_family4) .ip4 else .ip6,
@@ -890,7 +897,7 @@ fn metadataKey(family: u32, address: []const u8, publication: fakedns.Publicatio
     @memcpy(key.address[0..address.len], address);
     key.domain_id = publication.domain_id;
     key.generation = publication.generation;
-    key.route_valid_until_ns = publication.route_valid_until_ns;
+    key.reuse_after_ns = publication.reuse_after_ns;
     return key;
 }
 
@@ -967,43 +974,46 @@ fn update(map_fd: fd_t, key: []const u8, value: []const u8) !void {
     if (linux.errno(rc) != .SUCCESS) return error.BpfMapUpdateFailed;
 }
 
-fn populateExclusions(fake4_fd: fd_t, fake6_fd: fd_t, fake_dns_cfg: config.FakeDnsConfig, settings: config.TransparentInterceptSettings) !void {
-    try addExclusionText(fake4_fd, fake6_fd, fake_dns_cfg.ip_pool);
-    try addExclusionText(fake4_fd, fake6_fd, fake_dns_cfg.ip_pool6);
-    for (settings.excluded_ips) |rule| try addExclusion(fake4_fd, fake6_fd, rule);
-    for (settings.proxy_server_ips) |rule| try addExclusion(fake4_fd, fake6_fd, rule);
+fn populateFakePools(fake4_fd: fd_t, fake6_fd: fd_t, fake_dns_cfg: config.FakeDnsConfig) !void {
+    try addPrefixText(fake4_fd, fake6_fd, fake_dns_cfg.ip_pool);
+    try addPrefixText(fake4_fd, fake6_fd, fake_dns_cfg.ip_pool6);
 }
 
-fn addExclusionText(fake4_fd: fd_t, fake6_fd: fd_t, source: []const u8) !void {
+fn populateExclusions(excluded4_fd: fd_t, excluded6_fd: fd_t, settings: config.TransparentInterceptSettings) !void {
+    for (settings.excluded_ips) |rule| try addPrefix(excluded4_fd, excluded6_fd, rule);
+    for (settings.proxy_server_ips) |rule| try addPrefix(excluded4_fd, excluded6_fd, rule);
+}
+
+fn addPrefixText(map4_fd: fd_t, map6_fd: fd_t, source: []const u8) !void {
     const slash = std.mem.indexOfScalar(u8, source, '/') orelse return error.InvalidFakeDnsPool;
     const address = std.Io.net.IpAddress.parse(source[0..slash], 0) catch return error.InvalidFakeDnsPool;
     const prefix = std.fmt.parseUnsigned(u8, source[slash + 1 ..], 10) catch return error.InvalidFakeDnsPool;
     switch (address) {
         .ip4 => |ip| {
             if (prefix > 32) return error.InvalidFakeDnsPool;
-            try addExclusion(fake4_fd, fake6_fd, .{ .ip4 = .{ .bytes = ip.bytes, .prefix_len = prefix } });
+            try addPrefix(map4_fd, map6_fd, .{ .ip4 = .{ .bytes = ip.bytes, .prefix_len = prefix } });
         },
         .ip6 => |ip| {
             if (prefix > 128) return error.InvalidFakeDnsPool;
-            try addExclusion(fake4_fd, fake6_fd, .{ .ip6 = .{ .bytes = ip.bytes, .prefix_len = prefix } });
+            try addPrefix(map4_fd, map6_fd, .{ .ip6 = .{ .bytes = ip.bytes, .prefix_len = prefix } });
         },
     }
 }
 
-fn addExclusion(fake4_fd: fd_t, fake6_fd: fd_t, rule: config.IpRule) !void {
+fn addPrefix(map4_fd: fd_t, map6_fd: fd_t, rule: config.IpRule) !void {
     const value: u8 = 1;
     switch (rule) {
         .ip4 => |cidr| {
             var key: [8]u8 = @splat(0);
             std.mem.writeInt(u32, key[0..4], cidr.prefix_len, .native);
             @memcpy(key[4..8], &cidr.bytes);
-            try update(fake4_fd, &key, std.mem.asBytes(&value));
+            try update(map4_fd, &key, std.mem.asBytes(&value));
         },
         .ip6 => |cidr| {
             var key: [20]u8 = @splat(0);
             std.mem.writeInt(u32, key[0..4], cidr.prefix_len, .native);
             @memcpy(key[4..20], &cidr.bytes);
-            try update(fake6_fd, &key, std.mem.asBytes(&value));
+            try update(map6_fd, &key, std.mem.asBytes(&value));
         },
     }
 }
@@ -1225,6 +1235,7 @@ fn emitLiteralAssign(result: *Program, listeners_fd: fd_t, counters_fd: fd_t, ad
 
 fn emitFakeAssign(result: *Program, listeners_fd: fd_t, counters_fd: fd_t, comptime family: std.Io.net.IpAddress.Family) usize {
     const listener_key = if (family == .ip4) listener4_key else listener6_key;
+    const success_counter: Counter = if (family == .ip4) .assign4_success else .assign6_success;
     const error_counter: Counter = if (family == .ip4) .assign4_error else .assign6_error;
     _ = result.emit(BPF.Insn.st(.word, .r10, -20, listener_key));
     _ = result.emit(BPF.Insn.ld_map_fd1(.r1, listeners_fd));
@@ -1242,6 +1253,7 @@ fn emitFakeAssign(result: *Program, listeners_fd: fd_t, counters_fd: fd_t, compt
     _ = result.emit(BPF.Insn.mov(.r1, .r7));
     _ = result.emit(BPF.Insn.call(.sk_release));
     const assign_error = result.emit(BPF.Insn.jne(.r8, 0, 0));
+    emitCounter(result, counters_fd, success_counter);
     _ = result.emit(BPF.Insn.mov(.r0, sk_pass));
     _ = result.emit(BPF.Insn.exit());
     const error_block = result.len;
@@ -1252,7 +1264,19 @@ fn emitFakeAssign(result: *Program, listeners_fd: fd_t, counters_fd: fd_t, compt
     return error_exit;
 }
 
-fn program(fake4_fd: fd_t, fake6_fd: fd_t, listeners_fd: fd_t, counters_fd: fd_t, excluded4_fd: fd_t, excluded6_fd: fd_t, admissions_fd: fd_t, transparent_ifindex: ?u32, tail_programs_fd: ?fd_t) Program {
+fn emitPoolLookup(result: *Program, pool_fd: fd_t, comptime family: std.Io.net.IpAddress.Family) usize {
+    const key_offset: i16 = if (family == .ip4) -8 else -20;
+    const prefix: i32 = if (family == .ip4) 32 else 128;
+    _ = result.emit(BPF.Insn.st(.word, .r10, key_offset, prefix));
+    _ = result.emit(BPF.Insn.ld_map_fd1(.r1, pool_fd));
+    _ = result.emit(BPF.Insn.ld_map_fd2(pool_fd));
+    _ = result.emit(BPF.Insn.mov(.r2, .r10));
+    _ = result.emit(BPF.Insn.add(.r2, key_offset));
+    _ = result.emit(BPF.Insn.call(.map_lookup_elem));
+    return result.emit(BPF.Insn.jne(.r0, 0, 0));
+}
+
+fn program(fake4_fd: fd_t, fake6_fd: fd_t, pool4_fd: fd_t, pool6_fd: fd_t, listeners_fd: fd_t, counters_fd: fd_t, excluded4_fd: fd_t, excluded6_fd: fd_t, admissions_fd: fd_t, transparent_ifindex: ?u32, tail_programs_fd: ?fd_t) Program {
     var result: Program = .{};
     _ = result.emit(BPF.Insn.mov(.r6, .r1));
     _ = result.emit(BPF.Insn.mov(.r0, sk_pass));
@@ -1276,14 +1300,13 @@ fn program(fake4_fd: fd_t, fake6_fd: fd_t, listeners_fd: fd_t, counters_fd: fd_t
     _ = result.emit(BPF.Insn.add(.r2, -16));
     _ = result.emit(BPF.Insn.call(.map_lookup_elem));
     const ipv6_miss_jump = result.emit(BPF.Insn.jeq(.r0, 0, 0));
-    _ = result.emit(BPF.Insn.mov(.r7, .r0));
-    _ = result.emit(BPF.Insn.call(.ktime_get_ns));
-    _ = result.emit(BPF.Insn.ldx(.double_word, .r8, .r7, 16));
-    const ipv6_expiry_jump = result.emit(BPF.Insn.jge(.r0, .r8, 0));
     emitCounter(&result, counters_fd, .lookup_hit);
     const ipv6_fake_error_exit = emitFakeAssign(&result, listeners_fd, counters_fd, .ip6);
 
-    const ipv6_literal = result.len;
+    const ipv6_miss = result.len;
+    emitCounter(&result, counters_fd, .lookup_miss);
+    const ipv6_pool_miss_jump = emitPoolLookup(&result, pool6_fd, .ip6);
+    var ipv6_outside_jump: ?usize = null;
     var ipv6_literal_exit_jumps: [2]usize = undefined;
     var ipv6_literal_exit_count: usize = 0;
     var ipv6_literal_assign_exits: ?AssignExits = null;
@@ -1299,9 +1322,8 @@ fn program(fake4_fd: fd_t, fake6_fd: fd_t, listeners_fd: fd_t, counters_fd: fd_t
         _ = result.emit(BPF.Insn.call(.map_lookup_elem));
         ipv6_literal_exit_jumps[ipv6_literal_exit_count] = result.emit(BPF.Insn.jne(.r0, 0, 0));
         ipv6_literal_exit_count += 1;
-        emitCounter(&result, counters_fd, .lookup_miss);
         ipv6_literal_assign_exits = emitLiteralAssign(&result, listeners_fd, counters_fd, admissions_fd, .ip6);
-    }
+    } else ipv6_outside_jump = result.emit(BPF.Insn.ja(0));
 
     const ipv4_start = result.len;
     _ = result.emit(BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "local_ip4")));
@@ -1312,14 +1334,13 @@ fn program(fake4_fd: fd_t, fake6_fd: fd_t, listeners_fd: fd_t, counters_fd: fd_t
     _ = result.emit(BPF.Insn.add(.r2, -4));
     _ = result.emit(BPF.Insn.call(.map_lookup_elem));
     const ipv4_miss_jump = result.emit(BPF.Insn.jeq(.r0, 0, 0));
-    _ = result.emit(BPF.Insn.mov(.r7, .r0));
-    _ = result.emit(BPF.Insn.call(.ktime_get_ns));
-    _ = result.emit(BPF.Insn.ldx(.double_word, .r8, .r7, 16));
-    const ipv4_expiry_jump = result.emit(BPF.Insn.jge(.r0, .r8, 0));
     emitCounter(&result, counters_fd, .lookup_hit);
     const ipv4_fake_error_exit = emitFakeAssign(&result, listeners_fd, counters_fd, .ip4);
 
-    const ipv4_literal = result.len;
+    const ipv4_miss = result.len;
+    emitCounter(&result, counters_fd, .lookup_miss);
+    const ipv4_pool_miss_jump = emitPoolLookup(&result, pool4_fd, .ip4);
+    var ipv4_outside_jump: ?usize = null;
     var ipv4_literal_exit_jumps: [2]usize = undefined;
     var ipv4_literal_exit_count: usize = 0;
     var ipv4_literal_assign_exits: ?AssignExits = null;
@@ -1335,58 +1356,57 @@ fn program(fake4_fd: fd_t, fake6_fd: fd_t, listeners_fd: fd_t, counters_fd: fd_t
         _ = result.emit(BPF.Insn.call(.map_lookup_elem));
         ipv4_literal_exit_jumps[ipv4_literal_exit_count] = result.emit(BPF.Insn.jne(.r0, 0, 0));
         ipv4_literal_exit_count += 1;
-        emitCounter(&result, counters_fd, .lookup_miss);
         ipv4_literal_assign_exits = emitLiteralAssign(&result, listeners_fd, counters_fd, admissions_fd, .ip4);
-    }
+    } else ipv4_outside_jump = result.emit(BPF.Insn.ja(0));
 
-    var miss_exit_jump: ?usize = null;
-    const lookup_miss = result.len;
-    if (transparent_ifindex == null) {
-        emitCounter(&result, counters_fd, .lookup_miss);
-        if (tail_programs_fd) |programs_fd| {
-            _ = result.emit(BPF.Insn.mov(.r1, .r6));
-            _ = result.emit(BPF.Insn.ld_map_fd1(.r2, programs_fd));
-            _ = result.emit(BPF.Insn.ld_map_fd2(programs_fd));
-            _ = result.emit(BPF.Insn.mov(.r3, @as(i32, @intCast(literal_handler_index))));
-            _ = result.emit(BPF.Insn.call(.tail_call));
-        }
-        miss_exit_jump = result.emit(BPF.Insn.ja(0));
+    const outside_index = result.len;
+    if (tail_programs_fd) |programs_fd| {
+        _ = result.emit(BPF.Insn.mov(.r1, .r6));
+        _ = result.emit(BPF.Insn.ld_map_fd1(.r2, programs_fd));
+        _ = result.emit(BPF.Insn.ld_map_fd2(programs_fd));
+        _ = result.emit(BPF.Insn.mov(.r3, @as(i32, @intCast(literal_handler_index))));
+        _ = result.emit(BPF.Insn.call(.tail_call));
     }
-    const lookup_expiry = result.len;
-    emitCounter(&result, counters_fd, .lookup_expiry);
-    const exit_index = result.len;
+    const pass_index = result.len;
     emitCounter(&result, counters_fd, .pass);
     _ = result.emit(BPF.Insn.mov(.r0, sk_pass));
     _ = result.emit(BPF.Insn.exit());
+    const pool_miss_index = result.len;
+    emitCounter(&result, counters_fd, .pool_miss);
+    const drop_index = result.len;
+    emitCounter(&result, counters_fd, .drop);
+    _ = result.emit(BPF.Insn.mov(.r0, sk_drop));
+    _ = result.emit(BPF.Insn.exit());
 
-    result.patch(non_tcp_jump, exit_index);
+    result.patch(non_tcp_jump, pass_index);
     result.patch(ipv4_jump, ipv4_start);
-    result.patch(unknown_family_jump, exit_index);
-    result.patch(ipv6_miss_jump, if (transparent_ifindex != null) ipv6_literal else lookup_miss);
-    result.patch(ipv6_expiry_jump, lookup_expiry);
-    result.patch(ipv4_miss_jump, if (transparent_ifindex != null) ipv4_literal else lookup_miss);
-    result.patch(ipv4_expiry_jump, lookup_expiry);
-    result.patch(ipv6_fake_error_exit, exit_index);
-    result.patch(ipv4_fake_error_exit, exit_index);
-    if (miss_exit_jump) |jump| result.patch(jump, exit_index);
-    for (ipv6_literal_exit_jumps[0..ipv6_literal_exit_count]) |jump| result.patch(jump, exit_index);
-    for (ipv4_literal_exit_jumps[0..ipv4_literal_exit_count]) |jump| result.patch(jump, exit_index);
+    result.patch(unknown_family_jump, pass_index);
+    result.patch(ipv6_miss_jump, ipv6_miss);
+    result.patch(ipv4_miss_jump, ipv4_miss);
+    result.patch(ipv6_pool_miss_jump, pool_miss_index);
+    result.patch(ipv4_pool_miss_jump, pool_miss_index);
+    result.patch(ipv6_fake_error_exit, drop_index);
+    result.patch(ipv4_fake_error_exit, drop_index);
+    if (ipv6_outside_jump) |jump| result.patch(jump, outside_index);
+    if (ipv4_outside_jump) |jump| result.patch(jump, outside_index);
+    for (ipv6_literal_exit_jumps[0..ipv6_literal_exit_count]) |jump| result.patch(jump, pass_index);
+    for (ipv4_literal_exit_jumps[0..ipv4_literal_exit_count]) |jump| result.patch(jump, pass_index);
     if (ipv6_literal_assign_exits) |exits| {
-        result.patch(exits.success, exit_index);
-        result.patch(exits.failure, exit_index);
+        result.patch(exits.success, pass_index);
+        result.patch(exits.failure, pass_index);
     }
     if (ipv4_literal_assign_exits) |exits| {
-        result.patch(exits.success, exit_index);
-        result.patch(exits.failure, exit_index);
+        result.patch(exits.success, pass_index);
+        result.patch(exits.failure, pass_index);
     }
     return result;
 }
 
-fn fakeProgram(fake4_fd: fd_t, fake6_fd: fd_t, listeners_fd: fd_t, counters_fd: fd_t, programs_fd: fd_t, enable_literal_tail: bool) Program {
-    return program(fake4_fd, fake6_fd, listeners_fd, counters_fd, -1, -1, -1, null, if (enable_literal_tail) programs_fd else null);
+fn fakeProgram(fake4_fd: fd_t, fake6_fd: fd_t, pool4_fd: fd_t, pool6_fd: fd_t, listeners_fd: fd_t, counters_fd: fd_t, programs_fd: fd_t, enable_literal_tail: bool) Program {
+    return program(fake4_fd, fake6_fd, pool4_fd, pool6_fd, listeners_fd, counters_fd, -1, -1, -1, null, if (enable_literal_tail) programs_fd else null);
 }
 
-fn dispatcherProgram(programs_fd: fd_t) Program {
+fn dispatcherProgram(programs_fd: fd_t, pool4_fd: fd_t, pool6_fd: fd_t, counters_fd: fd_t) Program {
     var result: Program = .{};
     _ = result.emit(BPF.Insn.mov(.r6, .r1));
     _ = result.emit(BPF.Insn.mov(.r1, .r6));
@@ -1394,8 +1414,40 @@ fn dispatcherProgram(programs_fd: fd_t) Program {
     _ = result.emit(BPF.Insn.ld_map_fd2(programs_fd));
     _ = result.emit(BPF.Insn.mov(.r3, @as(i32, @intCast(fake_handler_index))));
     _ = result.emit(BPF.Insn.call(.tail_call));
+
+    _ = result.emit(BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "protocol")));
+    const non_tcp_jump = result.emit(BPF.Insn.jne(.r2, ipproto_tcp, 0));
+    _ = result.emit(BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "family")));
+    const ipv4_jump = result.emit(BPF.Insn.jeq(.r2, af_inet, 0));
+    const unknown_family_jump = result.emit(BPF.Insn.jne(.r2, af_inet6, 0));
+
+    inline for (0..4) |index| {
+        _ = result.emit(BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "local_ip6") + index * 4));
+        _ = result.emit(BPF.Insn.stx(.word, .r10, @intCast(-16 + @as(i32, @intCast(index * 4))), .r2));
+    }
+    const ipv6_pool_jump = emitPoolLookup(&result, pool6_fd, .ip6);
+    const ipv6_pass_jump = result.emit(BPF.Insn.ja(0));
+
+    const ipv4_start = result.len;
+    _ = result.emit(BPF.Insn.ldx(.word, .r2, .r6, @offsetOf(SkLookupContext, "local_ip4")));
+    _ = result.emit(BPF.Insn.stx(.word, .r10, -4, .r2));
+    const ipv4_pool_jump = emitPoolLookup(&result, pool4_fd, .ip4);
+
+    const pass_index = result.len;
     _ = result.emit(BPF.Insn.mov(.r0, sk_pass));
     _ = result.emit(BPF.Insn.exit());
+    const pool_miss_index = result.len;
+    emitCounter(&result, counters_fd, .pool_miss);
+    emitCounter(&result, counters_fd, .drop);
+    _ = result.emit(BPF.Insn.mov(.r0, sk_drop));
+    _ = result.emit(BPF.Insn.exit());
+
+    result.patch(non_tcp_jump, pass_index);
+    result.patch(ipv4_jump, ipv4_start);
+    result.patch(unknown_family_jump, pass_index);
+    result.patch(ipv6_pool_jump, pool_miss_index);
+    result.patch(ipv6_pass_jump, pass_index);
+    result.patch(ipv4_pool_jump, pool_miss_index);
     return result;
 }
 
@@ -1422,7 +1474,6 @@ fn literalProgram(listeners_fd: fd_t, counters_fd: fd_t, excluded4_fd: fd_t, exc
     _ = result.emit(BPF.Insn.add(.r2, -20));
     _ = result.emit(BPF.Insn.call(.map_lookup_elem));
     const excluded6_jump = result.emit(BPF.Insn.jne(.r0, 0, 0));
-    emitCounter(&result, counters_fd, .lookup_miss);
     const assign6 = emitLiteralAssign(&result, listeners_fd, counters_fd, admissions_fd, .ip6);
 
     const ipv4_start = result.len;
@@ -1435,7 +1486,6 @@ fn literalProgram(listeners_fd: fd_t, counters_fd: fd_t, excluded4_fd: fd_t, exc
     _ = result.emit(BPF.Insn.add(.r2, -8));
     _ = result.emit(BPF.Insn.call(.map_lookup_elem));
     const excluded4_jump = result.emit(BPF.Insn.jne(.r0, 0, 0));
-    emitCounter(&result, counters_fd, .lookup_miss);
     const assign4 = emitLiteralAssign(&result, listeners_fd, counters_fd, admissions_fd, .ip4);
 
     const exit_index = result.len;
@@ -1456,22 +1506,28 @@ fn literalProgram(listeners_fd: fd_t, counters_fd: fd_t, excluded4_fd: fd_t, exc
 }
 
 test "SK_LOOKUP program has stable UAPI-only instruction layout" {
-    const generated = program(10, 11, 12, 13, 14, 15, 16, null, null);
+    const generated = program(10, 11, 18, 19, 12, 13, 14, 15, 16, null, null);
     const instructions = generated.slice();
     var assign_count: usize = 0;
     var release_count: usize = 0;
     var counter_updates: usize = 0;
     var admission_updates: usize = 0;
+    var clock_reads: usize = 0;
+    var drop_returns: usize = 0;
     for (instructions) |instruction| {
         if (std.meta.eql(BPF.Insn.call(.sk_assign), instruction)) assign_count += 1;
         if (std.meta.eql(BPF.Insn.call(.sk_release), instruction)) release_count += 1;
         if (std.meta.eql(BPF.Insn.xadd(.r0, .r1), instruction)) counter_updates += 1;
         if (std.meta.eql(BPF.Insn.call(.map_update_elem), instruction)) admission_updates += 1;
+        if (std.meta.eql(BPF.Insn.call(.ktime_get_ns), instruction)) clock_reads += 1;
+        if (std.meta.eql(BPF.Insn.mov(.r0, sk_drop), instruction)) drop_returns += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), assign_count);
     try std.testing.expectEqual(@as(usize, 2), release_count);
-    try std.testing.expectEqual(@as(usize, 7), counter_updates);
+    try std.testing.expectEqual(@as(usize, 11), counter_updates);
     try std.testing.expectEqual(@as(usize, 0), admission_updates);
+    try std.testing.expectEqual(@as(usize, 0), clock_reads);
+    try std.testing.expectEqual(@as(usize, 1), drop_returns);
     try std.testing.expectEqual(BPF.Insn.exit(), instructions[instructions.len - 1]);
 }
 
@@ -1533,16 +1589,16 @@ fn expectProgramReachable(instructions: []const BPF.Insn) !void {
 }
 
 test "generated SK_LOOKUP programs have no unreachable instructions" {
-    try expectProgramReachable(program(10, 11, 12, 13, 14, 15, 16, null, null).slice());
-    try expectProgramReachable(program(10, 11, 12, 13, 14, 15, 16, 7, null).slice());
-    try expectProgramReachable(dispatcherProgram(17).slice());
-    try expectProgramReachable(fakeProgram(10, 11, 12, 13, 17, true).slice());
+    try expectProgramReachable(program(10, 11, 18, 19, 12, 13, 14, 15, 16, null, null).slice());
+    try expectProgramReachable(program(10, 11, 18, 19, 12, 13, 14, 15, 16, 7, null).slice());
+    try expectProgramReachable(dispatcherProgram(17, 18, 19, 13).slice());
+    try expectProgramReachable(fakeProgram(10, 11, 18, 19, 12, 13, 17, true).slice());
     try expectProgramReachable(literalProgram(12, 13, 14, 15, 16, 7).slice());
 }
 
 test "tail-call dispatcher and handlers remain isolated" {
-    const dispatcher = dispatcherProgram(17);
-    const fake = fakeProgram(10, 11, 12, 13, 17, true);
+    const dispatcher = dispatcherProgram(17, 18, 19, 13);
+    const fake = fakeProgram(10, 11, 18, 19, 12, 13, 17, true);
     const literal = literalProgram(12, 13, 14, 15, 16, 7);
     var dispatcher_tails: usize = 0;
     var fake_tails: usize = 0;
@@ -1572,8 +1628,8 @@ test "tail-call dispatcher and handlers remain isolated" {
 }
 
 test "tail-call FakeDNS hit suffix matches standalone control" {
-    const control = fakeProgram(10, 11, 12, 13, 17, false);
-    const handler = fakeProgram(10, 11, 12, 13, 17, true);
+    const control = fakeProgram(10, 11, 18, 19, 12, 13, 17, false);
+    const handler = fakeProgram(10, 11, 18, 19, 12, 13, 17, true);
     var control_assigns: [2]usize = undefined;
     var handler_assigns: [2]usize = undefined;
     var control_count: usize = 0;
@@ -1602,7 +1658,7 @@ test "tail-call FakeDNS hit suffix matches standalone control" {
 }
 
 test "combined SK_LOOKUP program gives FakeDNS a compact terminal assignment path" {
-    const generated = program(10, 11, 12, 13, 14, 15, 16, 7, null);
+    const generated = program(10, 11, 18, 19, 12, 13, 14, 15, 16, 7, null);
     var assign_count: usize = 0;
     var ingress_loads: usize = 0;
     var admission_updates: usize = 0;
@@ -1626,15 +1682,16 @@ test "combined SK_LOOKUP program gives FakeDNS a compact terminal assignment pat
         try std.testing.expectEqual(BPF.Insn.mov(.r8, .r0), generated.slice()[index + 1]);
         try std.testing.expectEqual(BPF.Insn.mov(.r1, .r7), generated.slice()[index + 2]);
         try std.testing.expectEqual(BPF.Insn.call(.sk_release), generated.slice()[index + 3]);
-        try std.testing.expectEqual(BPF.Insn.mov(.r0, sk_pass), generated.slice()[index + 5]);
-        try std.testing.expectEqual(BPF.Insn.exit(), generated.slice()[index + 6]);
+        var exit_index = index + 4;
+        while (!std.meta.eql(BPF.Insn.exit(), generated.slice()[exit_index])) : (exit_index += 1) {}
+        try std.testing.expectEqual(BPF.Insn.mov(.r0, sk_pass), generated.slice()[exit_index - 1]);
     }
     try std.testing.expectEqual(BPF.Insn.exit(), generated.slice()[generated.slice().len - 1]);
 }
 
 test "FakeDNS-only and combined programs use identical assign and release ABI" {
-    const control = program(10, 11, 12, 13, 14, 15, 16, null, null);
-    const combined = program(10, 11, 12, 13, 14, 15, 16, 7, null);
+    const control = program(10, 11, 18, 19, 12, 13, 14, 15, 16, null, null);
+    const combined = program(10, 11, 18, 19, 12, 13, 14, 15, 16, 7, null);
     var control_assigns: [2]usize = undefined;
     var combined_assigns: [4]usize = undefined;
     var control_count: usize = 0;
@@ -1728,8 +1785,8 @@ test "FakeDNS persistence header fails closed on schema or config mismatch" {
     const cfg: config.FakeDnsConfig = .{
         .ip_pool = "198.18.0.0/15",
         .ip_pool6 = "fc00::/18",
-        .ttl = 60,
-        .reuse_grace_seconds = 30,
+        .ttl = 600,
+        .reuse_grace_seconds = 86_400,
     };
     const fingerprint = configFingerprint(cfg, 1024);
     const header = metadataHeader(fingerprint);
@@ -1754,9 +1811,9 @@ test "FakeDNS persistence header fails closed on schema or config mismatch" {
 
 test "FakeDNS metadata keys preserve old and pending transaction versions" {
     const address = [_]u8{ 198, 18, 0, 1 };
-    const old: fakedns.Publication = .{ .domain_id = 1, .generation = 1, .route_valid_until_ns = 100 };
-    const refresh: fakedns.Publication = .{ .domain_id = 1, .generation = 1, .route_valid_until_ns = 200 };
-    const reused: fakedns.Publication = .{ .domain_id = 2, .generation = 2, .route_valid_until_ns = 300 };
+    const old: fakedns.Publication = .{ .domain_id = 1, .generation = 1, .reuse_after_ns = 100 };
+    const refresh: fakedns.Publication = .{ .domain_id = 1, .generation = 1, .reuse_after_ns = 200 };
+    const reused: fakedns.Publication = .{ .domain_id = 2, .generation = 2, .reuse_after_ns = 300 };
     const old_key = metadataKey(metadata_family4, &address, old);
     const refresh_key = metadataKey(metadata_family4, &address, refresh);
     const reused_key = metadataKey(metadata_family4, &address, reused);

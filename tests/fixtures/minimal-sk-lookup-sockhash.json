@@ -27,8 +27,8 @@
     "fakeDns": {
       "ipPool": "198.18.254.0/24",
       "ipPool6": "fd00:7872:6179::/120",
-      "ttl": 60,
-      "reuseGraceSeconds": 30
+      "ttl": 600,
+      "reuseGraceSeconds": 86400
     }
   },
   "routing": {"defaultOutboundTag": "direct"}

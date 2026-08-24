@@ -12,7 +12,8 @@
     "fakeDns": {
       "ipPool": "198.18.0.0/15",
       "ipPool6": "fc00::/18",
-      "ttl": 60
+      "ttl": 600,
+      "reuseGraceSeconds": 86400
     }
   },
   "inbounds": [

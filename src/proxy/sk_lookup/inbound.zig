@@ -103,7 +103,7 @@ pub const Inbound = struct {
         monitoring.registry.updateSkLookupCounters(
             snapshot.get(.lookup_hit),
             snapshot.get(.lookup_miss),
-            snapshot.get(.lookup_expiry),
+            snapshot.get(.pool_miss),
             snapshot.get(.assign4_success),
             snapshot.get(.assign4_error),
             snapshot.get(.assign6_success),

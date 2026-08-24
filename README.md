@@ -109,7 +109,7 @@ The config format is explicit and narrower than Xray JSON:
 - DNS servers require `outboundTag`; queries use DNS-over-TCP through that
   outbound. A VLESS/REALITY outbound encrypts the resolver traffic without DoH.
 - DNS rules are evaluated top to bottom; first matching `domains` rule wins.
-- FakeDNS is opt-in through `dns.fakeDns`. Without it, A and AAAA queries are forwarded to the selected resolver.
+- FakeDNS is opt-in through `dns.fakeDns`. Its default DNS TTL is 600 seconds; mappings remain authoritative until replacement after the default 24-hour reuse quarantine. Without FakeDNS, A and AAAA queries are forwarded to the selected resolver.
 - When enabled, FakeDNS uses `ipPool` for A answers and `ipPool6` for AAAA answers. Their defaults are `198.18.0.0/15` and `fc00::/18`.
 - VLESS REALITY users may set `flow: "xtls-rprx-vision"`.
 - REALITY `cipherPolicy` defaults to `"firefox"`. Set it to `"chacha20-only"` on software-AES targets. This changes the advertised cipher-suite fingerprint and requires server-side ChaCha20 support, but still offers TLS 1.3 and TLS 1.2 and never offers ECH.

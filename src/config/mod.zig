@@ -895,13 +895,13 @@ fn parseFakeDns(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) !?Fa
             break :blk @intCast(integer);
         },
         else => return error.InvalidDnsTtl,
-    } else 60;
+    } else 600;
 
     const reuse_grace_seconds = try optionalUnsigned(
         u32,
         object,
         "reuseGraceSeconds",
-        30,
+        86_400,
         error.InvalidFakeDnsReuseGrace,
     );
 
@@ -1446,8 +1446,8 @@ test "parses explicit fakedns with defaults" {
     const fake_dns = cfg.dns.?.fake_dns.?;
     try std.testing.expectEqualStrings("198.18.0.0/15", fake_dns.ip_pool);
     try std.testing.expectEqualStrings("fc00::/18", fake_dns.ip_pool6);
-    try std.testing.expectEqual(@as(u32, 60), fake_dns.ttl);
-    try std.testing.expectEqual(@as(u32, 30), fake_dns.reuse_grace_seconds);
+    try std.testing.expectEqual(@as(u32, 600), fake_dns.ttl);
+    try std.testing.expectEqual(@as(u32, 86_400), fake_dns.reuse_grace_seconds);
 }
 
 test "rejects unsupported FakeDNS settings" {
