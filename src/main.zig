@@ -397,6 +397,13 @@ fn printSummary(writer: *Io.Writer, cfg: *const xray.config.Config) !void {
                     offload.idle_timeout_seconds,
                 });
             }
+            if (settings.transparent_intercept) |transparent| {
+                try writer.print("  transparent TCP literals: ingress {s}, {d} excluded CIDR(s), {d} proxy server address(es)\n", .{
+                    transparent.ingress_interface,
+                    transparent.excluded_ips.len,
+                    transparent.proxy_server_ips.len,
+                });
+            }
             continue;
         }
         try writer.print("inbound {s}: {s} on {s}:{d}\n", .{

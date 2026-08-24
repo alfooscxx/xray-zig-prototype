@@ -16,6 +16,7 @@ pub fn main(init: std.process.Init) !void {
     const io = threaded.io();
 
     if (args.len == 2 and std.mem.eql(u8, args[1], "server")) return runServer(io);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "server-literals")) return runLiteralServer(io);
     if (args.len == 4 and std.mem.eql(u8, args[1], "expect-connect-fail")) {
         return expectConnectFail(
             args[2],
@@ -30,6 +31,15 @@ pub fn main(init: std.process.Init) !void {
             args[4],
             io,
         );
+    }
+    if (args.len == 7 and std.mem.eql(u8, args[1], "resolve-only")) {
+        const family: net.IpAddress.Family = if (std.mem.eql(u8, args[5], "4")) .ip4 else if (std.mem.eql(u8, args[5], "6")) .ip6 else return error.InvalidFamily;
+        const target = try resolveFake(args[2], try std.fmt.parseUnsigned(u16, args[3], 10), args[4], family, try std.fmt.parseUnsigned(u16, args[6], 10), io);
+        var stdout_buffer: [256]u8 = undefined;
+        var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+        try stdout_writer.interface.print("PASS DNS {s} {f}\n", .{ args[4], target });
+        try stdout_writer.interface.flush();
+        return;
     }
     if (args.len == 7 and std.mem.eql(u8, args[1], "http-client")) {
         const family: net.IpAddress.Family = if (std.mem.eql(u8, args[5], "4")) .ip4 else if (std.mem.eql(u8, args[5], "6")) .ip6 else return error.InvalidFamily;
@@ -98,6 +108,38 @@ fn runServer(io: Io) !void {
     try group.concurrent(io, dnsAcceptLoop, .{ &dns_listener, io });
     try group.concurrent(io, echoAcceptLoop, .{ &echo4_listener, io });
     try group.concurrent(io, echoAcceptLoop, .{ &echo6_listener, io });
+    try group.await(io);
+}
+
+fn runLiteralServer(io: Io) !void {
+    var dns_address = try net.IpAddress.parse("127.0.0.1", dns_port);
+    var dns_listener = try dns_address.listen(io, .{ .reuse_address = true });
+    defer dns_listener.deinit(io);
+    var echo4_address = try net.IpAddress.parse("127.0.0.1", echo_port);
+    var echo4_listener = try echo4_address.listen(io, .{ .reuse_address = true });
+    defer echo4_listener.deinit(io);
+    var echo6_address = try net.IpAddress.parse("::1", echo_port);
+    var echo6_listener = try echo6_address.listen(io, .{ .reuse_address = true });
+    defer echo6_listener.deinit(io);
+    var literal4_address = try net.IpAddress.parse("203.0.113.10", echo_port);
+    var literal4_listener = try literal4_address.listen(io, .{ .reuse_address = true });
+    defer literal4_listener.deinit(io);
+    var literal6_address = try net.IpAddress.parse("2001:db8:100::10", echo_port);
+    var literal6_listener = try literal6_address.listen(io, .{ .reuse_address = true });
+    defer literal6_listener.deinit(io);
+
+    var stdout_buffer: [128]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    try stdout_writer.interface.writeAll("READY\n");
+    try stdout_writer.interface.flush();
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, dnsAcceptLoop, .{ &dns_listener, io });
+    try group.concurrent(io, echoAcceptLoop, .{ &echo4_listener, io });
+    try group.concurrent(io, echoAcceptLoop, .{ &echo6_listener, io });
+    try group.concurrent(io, echoAcceptLoop, .{ &literal4_listener, io });
+    try group.concurrent(io, echoAcceptLoop, .{ &literal6_listener, io });
     try group.await(io);
 }
 

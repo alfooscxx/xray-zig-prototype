@@ -98,4 +98,28 @@ pub fn build(b: *std.Build) void {
     const install_ebpf_sockhash_selftest = b.addInstallArtifact(ebpf_sockhash_selftest, .{});
     const ebpf_sockhash_selftest_step = b.step("ebpf-sockhash-selftest", "Build the privileged TCP SOCKHASH capability selftest");
     ebpf_sockhash_selftest_step.dependOn(&install_ebpf_sockhash_selftest.step);
+
+    const sk_lookup_conformance = b.addExecutable(.{
+        .name = "sk-lookup-conformance",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/field/sk-lookup-conformance.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const install_sk_lookup_conformance = b.addInstallArtifact(sk_lookup_conformance, .{});
+    const sk_lookup_conformance_step = b.step("sk-lookup-conformance", "Build the local Linux SK_LOOKUP conformance probe");
+    sk_lookup_conformance_step.dependOn(&install_sk_lookup_conformance.step);
+
+    const sk_lookup_conformance_tests = b.addTest(.{ .root_module = sk_lookup_conformance.root_module });
+    const run_sk_lookup_conformance_tests = b.addRunArtifact(sk_lookup_conformance_tests);
+    test_step.dependOn(&run_sk_lookup_conformance_tests.step);
+
+    const sk_lookup_conformance_structure = b.addSystemCommand(&.{
+        "sh",
+        "tests/field/sk-lookup-conformance-structural.sh",
+        "tests/field/sk-lookup-conformance.zig",
+        "tests/field/sk-lookup-conformance.sh",
+    });
+    test_step.dependOn(&sk_lookup_conformance_structure.step);
 }

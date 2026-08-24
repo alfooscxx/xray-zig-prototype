@@ -1,7 +1,8 @@
-# Experimental FakeDNS SK_LOOKUP Inbound
+# Experimental SK_LOOKUP Inbound
 
 The Linux-only `sk_lookup` inbound is an experimental TCP dataplane. It sends
-connections for exact FakeDNS addresses to ordinary kernel TCP listeners. The
+connections for exact FakeDNS addresses, and optionally policy-routed IP
+literals, to ordinary kernel TCP listeners. The
 kernel therefore owns the handshake, retransmission, congestion control,
 reassembly, PMTU handling, and established socket state; the experimental TUN
 TCP stack is not involved in this path.
@@ -43,6 +44,11 @@ currently required:
       "mode": "required",
       "maxFlows": 1024,
       "idleTimeoutSeconds": 300
+    },
+    "transparentIntercept": {
+      "ingressInterface": "br-lan",
+      "excludedIPs": ["192.168.8.0/24", "fe80::/10"],
+      "proxyServerIPs": ["203.0.113.9", "2001:db8::9"]
     }
   }
 }
@@ -61,7 +67,17 @@ bounded to 1 through 86,400. Per-flow allocation or admission pressure falls
 back to the existing raw reactor when this is still ordering-safe; it does not
 make startup support optional.
 
-No other `sk_lookup`, `fakeDnsPersistence`, or `sockhashOffload` fields are accepted. The listener
+`transparentIntercept` is optional. Without it, behavior remains FakeDNS-only.
+With it, a no-lease destination is assigned only when it arrived on the named
+interface and does not match an exclusion. The name is resolved to an ifindex
+at startup; a missing interface is fatal. `excludedIPs` and `proxyServerIPs`
+are required non-empty arrays. Proxy-server entries must be exact addresses,
+not CIDRs. Both lists and both configured FakeDNS pools are loaded into BPF LPM
+tries. Consequently, an expired or missing address in a FakeDNS pool is never
+reinterpreted as a literal.
+
+No other `sk_lookup`, `fakeDnsPersistence`, `sockhashOffload`, or
+`transparentIntercept` fields are accepted. The listener
 addresses must have the indicated family. Ports are nonzero and
 `maxMapEntries` is bounded to 1 through 1,048,576. A `sk_lookup` inbound also
 requires `dns.fakeDns`.
@@ -89,12 +105,27 @@ synthetic address that the dataplane cannot route.
 xray-zig creates two HASH maps for exact IPv4 and IPv6 addresses, one SOCKMAP
 for the listener sockets, and a nine-entry per-CPU ARRAY named `xz_sk_count`
 for bounded monitoring counters. Values in the address maps contain
-`domain_id`, `generation`, and the monotonic `route_valid_until_ns`. The program
-accepts TCP only, checks an exact address-map hit and its
-`bpf_ktime_get_ns` expiry, and calls `bpf_sk_assign`. Non-TCP traffic, unknown
-families, misses, expired entries, missing listeners, and assignment failures
-are fail-open (`SK_PASS`). The counter map records hit, miss, expiry, IPv4/IPv6
-assignment success and error, pass, and drop without contended global updates;
+`domain_id`, `generation`, and the monotonic `route_valid_until_ns`.
+
+The namespace receives one attached `xz_sk_lookup` dispatcher. It tail-calls a
+small `xz_sk_fake` handler through the private `xz_sk_progs` PROG_ARRAY; an
+exact-map miss can tail-call the separate `xz_sk_literal` handler when
+`transparentIntercept` is enabled. Tail-call failure is fail-open. Expired
+FakeDNS entries do not enter literal policy, and FakeDNS pools are always in
+the literal exclusion tries, so stale/missing leases cannot become literals.
+FakeDNS and literal handling use separate listener lookup, assignment, and
+release programs. A successful
+FakeDNS assignment immediately executes `r0 = SK_PASS; BPF_EXIT`, with no
+shared branch register, long jump, admission publication, monitoring helper,
+or fallthrough into literal policy. Only the dispatcher is linked to the
+network namespace; handler FDs are owned by the PROG_ARRAY and process.
+Non-TCP traffic, unknown
+families, excluded destinations, wrong ingress interfaces, expired entries,
+missing listeners, and assignment failures are fail-open (`SK_PASS`). A
+no-lease destination outside the FakeDNS pools can reach the listener only
+through the configured ingress interface. The counter map records hit, miss,
+expiry, literal IPv4/IPv6 assignment success, IPv4/IPv6 assignment error, pass,
+and drop without contended global updates;
 the local control API aggregates it through the process-owned FD.
 
 The runtime uses `bpf()` syscalls directly. It has no runtime dependency on
@@ -106,6 +137,10 @@ detaches the namespace hook.
 Startup creates both listeners and the BPF objects, restores the complete
 FakeDNS store when persistence is configured, and only then attaches the BPF
 link. DNS and SK_LOOKUP workers are spawned after restoration and attach.
+Both listeners enable `IP_TRANSPARENT`/`IPV6_TRANSPARENT` before attachment.
+This is required when the selected destination is made local only by a policy
+route and is not assigned to an interface; without it `bpf_sk_assign` can
+succeed while TCP cannot create the transparent request socket or SYN-ACK.
 Publication to the metadata and address maps completes before the userspace
 lease is committed and before a DNS response is sent. The accepted socket's
 `getsockname` supplies the original fake local address and port. A FakeDNS
@@ -113,8 +148,37 @@ lease handle protects the normalized hostname for the complete synchronous
 `Dispatcher` call. The userspace `Session` remains the source of the frozen
 outbound decision; there is no correctness-critical LRU flow map.
 
+An admitted literal uses the original address and port from `getsockname`, has
+no sniffed domain, preserves the inbound tag and address-family preference,
+and remains eligible for SOCKHASH. Ordered domain, CIDR, inbound-tag, and
+default outbound selection stays in userspace. BPF selects only the inbound
+listener.
+
+Successful literal assignments also write a monotonic timestamp to a
+bounded LRU admission map keyed by family, both addresses, and both ports. A
+no-lease `accept` must consume a matching entry within 60 seconds before it can
+reach the dispatcher. This prevents direct connections to the wildcard
+listeners, or genuine local traffic missed by an operator exclusion, from
+bypassing the ingress BPF policy. The entry is written only after
+`bpf_sk_assign` succeeds; lookup is one-shot and expired entries fail closed.
+FakeDNS sessions still require their live userspace lease and never use this
+proof as a fallback.
+
 The application does not install routes. Operators must add only the intended
 FakeDNS prefixes or exact test addresses as local routes in the same namespace.
+
+For literal interception, the intended routing is nftables marking of selected
+LAN TCP, an `ip rule`, and a dedicated table with `local 0.0.0.0/0 dev lo` and
+`local ::/0 dev lo`. Do not replace a production TUN route until a
+source-scoped field test passes. Exclude router-local, management, and
+link-local destinations before setting the mark, and repeat them in
+`excludedIPs` as a second boundary. Every REALITY/proxy endpoint must use an
+IP-literal address, be excluded from marking, and be listed in
+`proxyServerIPs`. Hostname proxy endpoints are rejected while transparent
+interception is enabled because a static exclusion cannot remain fail-closed
+across DNS changes. Locally generated outbound sockets do not match the configured
+ingress ifindex, while the explicit server exclusion protects against routing
+mistakes and recursion. UDP is not admitted.
 
 ## Restart-Safe FakeDNS
 
@@ -344,6 +408,69 @@ the same cleanup on failure.
 The harness removes its own nested `/tmp/xz-ebpf-lab-$PID` state. The SSH
 orchestration that uploaded the binaries and script must remove that separate
 operator-created upload directory after the run.
+
+### Transparent Literal Lab
+
+Upload `tests/field/ebpf-sk-lookup-literals-lab.sh` beside the same two AArch64
+artifacts. After the required read-only AArch64 identity check, the exact field
+command is:
+
+```sh
+/tmp/UNIQUE/ebpf-sk-lookup-literals-lab.sh \
+  /tmp/UNIQUE/xray-zig /tmp/UNIQUE/ebpf-lab-peer
+```
+
+This harness does not stop or inspect the production service. It snapshots
+same-named BPF object IDs and identifies only objects newly created by its
+process. It gives the isolated process a unique control socket below its lab
+directory and waits for `status` to report `ready=true` before the first probe.
+Three unique namespaces contain an authorized client, a wrong-ingress
+client, and an isolated router. Only the authorized veth has an `iif` policy
+rule to a namespace-local table containing `local 0.0.0.0/0 dev lo` and
+`local ::/0 dev lo`; no root-namespace route or firewall rule is changed.
+
+The bounded run proves verifier/load for SK_LOOKUP and required SOCKHASH,
+authorized IPv4/IPv6 literals, direct CIDR and default blackhole decisions,
+wrong-ingress and direct-listener admission-proof rejection, excluded local
+CIDR and exact proxy-server addresses, live and stale/missing IPv4/IPv6
+FakeDNS, a freedom SOCKHASH handoff, and removal of every newly observed
+program and map ID. FakeDNS checks first perform and print a bounded DNS-only
+allocation, then probe the published address separately so DNS failures and
+SK_LOOKUP failures remain distinguishable. Before each live FakeDNS probe it
+requires an exact `bpftool map lookup` for the published IPv4/IPv6 key and
+captures the raw lease value plus per-CPU SK_LOOKUP counters before and after
+the SYN. It also captures the loaded xlated BPF program, monotonic/boottime
+snapshots, policy rules/routes, and authorized-veth packet counters. A
+60-second lab TTL keeps expiry outside the bounded live-hit diagnosis; stale
+expiry remains covered by the separate FakeDNS-only lab. Expected-negative client errors are
+captured in the lab directory and printed only when the harness itself fails.
+Both live FakeDNS allocations/connections are now the first dataplane actions
+after verifier/load and object discovery. Literal, missing-lease, blackhole,
+exclusion, admission-proof, and SOCKHASH probes run only afterward, ruling out
+earlier flow state as a cause of a live FakeDNS failure.
+The live IPv4 and IPv6 probes also run bounded numeric `tcpdump` captures on
+the isolated router veth, including TCP flags and sequence/acknowledgement
+numbers; captures are flushed and printed on failure. The router therefore
+needs `tcpdump` in addition to the previously listed lab dependencies.
+All processes, rules, links, addresses, routes, files, and
+namespaces belong to the temporary namespaces and are removed by the EXIT
+trap. Expected final output is:
+
+```text
+PASS: isolated transparent literals v4/v6, ingress proof, exclusions, FakeDNS, routing, SOCKHASH, and cleanup
+```
+
+For a FakeDNS-only control with the same rebuilt binaries, run immediately
+afterward from the same unique upload directory:
+
+```sh
+/tmp/UNIQUE/ebpf-sk-lookup-lab.sh \
+  /tmp/UNIQUE/xray-zig /tmp/UNIQUE/ebpf-lab-peer
+```
+
+That harness now snapshots same-named production BPF IDs and selects only its
+new namespace-owned program/maps, and it also uses a unique control socket. It
+does not require stopping the production service.
 
 ### Privileged SOCKHASH Capability Selftest
 

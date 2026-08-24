@@ -60,11 +60,26 @@ pub const SkLookupInboundSettings = struct {
     max_map_entries: u32,
     fake_dns_persistence: ?FakeDnsPersistenceSettings,
     sockhash_offload: ?SockhashOffloadSettings,
+    transparent_intercept: ?TransparentInterceptSettings,
 
     pub fn deinit(self: *SkLookupInboundSettings, allocator: std.mem.Allocator) void {
         allocator.free(self.listen4);
         allocator.free(self.listen6);
         if (self.fake_dns_persistence) |*persistence| persistence.deinit(allocator);
+        if (self.transparent_intercept) |*transparent| transparent.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const TransparentInterceptSettings = struct {
+    ingress_interface: []const u8,
+    excluded_ips: []IpRule,
+    proxy_server_ips: []IpRule,
+
+    pub fn deinit(self: *TransparentInterceptSettings, allocator: std.mem.Allocator) void {
+        allocator.free(self.ingress_interface);
+        allocator.free(self.excluded_ips);
+        allocator.free(self.proxy_server_ips);
         self.* = undefined;
     }
 };
@@ -476,7 +491,8 @@ fn parseSkLookupInboundSettings(allocator: std.mem.Allocator, maybe_value: ?std.
             !std.mem.eql(u8, key, "port6") and
             !std.mem.eql(u8, key, "maxMapEntries") and
             !std.mem.eql(u8, key, "fakeDnsPersistence") and
-            !std.mem.eql(u8, key, "sockhashOffload"))
+            !std.mem.eql(u8, key, "sockhashOffload") and
+            !std.mem.eql(u8, key, "transparentIntercept"))
         {
             return error.UnsupportedSkLookupSetting;
         }
@@ -501,6 +517,11 @@ fn parseSkLookupInboundSettings(allocator: std.mem.Allocator, maybe_value: ?std.
         owned.deinit(allocator);
     };
     const sockhash_offload = try parseSockhashOffloadSettings(object.get("sockhashOffload"));
+    const transparent_intercept = try parseTransparentInterceptSettings(allocator, object.get("transparentIntercept"));
+    errdefer if (transparent_intercept) |owned_value| {
+        var owned = owned_value;
+        owned.deinit(allocator);
+    };
 
     return .{
         .listen4 = listen4,
@@ -510,7 +531,48 @@ fn parseSkLookupInboundSettings(allocator: std.mem.Allocator, maybe_value: ?std.
         .max_map_entries = max_map_entries,
         .fake_dns_persistence = fake_dns_persistence,
         .sockhash_offload = sockhash_offload,
+        .transparent_intercept = transparent_intercept,
     };
+}
+
+fn parseTransparentInterceptSettings(allocator: std.mem.Allocator, maybe_value: ?std.json.Value) !?TransparentInterceptSettings {
+    const value = maybe_value orelse return null;
+    if (value != .object) return error.TransparentInterceptMustBeObject;
+    const object = &value.object;
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.eql(u8, key, "ingressInterface") and
+            !std.mem.eql(u8, key, "excludedIPs") and
+            !std.mem.eql(u8, key, "proxyServerIPs")) return error.UnsupportedTransparentInterceptSetting;
+    }
+    const ingress_interface = try requiredString(allocator, object, "ingressInterface", error.MissingTransparentIngressInterface);
+    errdefer allocator.free(ingress_interface);
+    if (ingress_interface.len == 0 or ingress_interface.len >= linux_if_name_size or
+        std.mem.indexOfScalar(u8, ingress_interface, '/') != null) return error.InvalidTransparentIngressInterface;
+    const excluded_ips = try parseRequiredIpRuleArray(allocator, object, "excludedIPs");
+    errdefer allocator.free(excluded_ips);
+    const proxy_server_ips = try parseRequiredIpRuleArray(allocator, object, "proxyServerIPs");
+    errdefer allocator.free(proxy_server_ips);
+    for (proxy_server_ips) |rule| switch (rule) {
+        .ip4 => |cidr| if (cidr.prefix_len != 32) return error.ProxyServerExclusionMustBeAddress,
+        .ip6 => |cidr| if (cidr.prefix_len != 128) return error.ProxyServerExclusionMustBeAddress,
+    };
+    return .{ .ingress_interface = ingress_interface, .excluded_ips = excluded_ips, .proxy_server_ips = proxy_server_ips };
+}
+
+const linux_if_name_size = 16;
+
+fn parseRequiredIpRuleArray(allocator: std.mem.Allocator, object: *const std.json.ObjectMap, key: []const u8) ![]IpRule {
+    const value = object.get(key) orelse return error.MissingTransparentExclusions;
+    if (value != .array or value.array.items.len == 0) return error.InvalidTransparentExclusions;
+    var rules: std.ArrayList(IpRule) = .empty;
+    errdefer rules.deinit(allocator);
+    for (value.array.items) |item| {
+        if (item != .string) return error.InvalidTransparentExclusions;
+        rules.append(allocator, parseIpRule(item.string) catch return error.InvalidTransparentExclusions) catch return error.OutOfMemory;
+    }
+    return rules.toOwnedSlice(allocator);
 }
 
 fn parseFakeDnsPersistenceSettings(
@@ -1275,6 +1337,29 @@ test "parses strict sk_lookup inbound settings" {
     try std.testing.expectEqualStrings("/sys/fs/bpf/xray-zig", settings.fake_dns_persistence.?.pin_directory);
     try std.testing.expectEqual(@as(u32, 64), settings.sockhash_offload.?.max_flows);
     try std.testing.expectEqual(@as(u32, 45), settings.sockhash_offload.?.idle_timeout_seconds);
+}
+
+test "parses strict sk_lookup transparent literal admission" {
+    const source =
+        \\{"inbounds":[{"tag":"ebpf-in","protocol":"sk_lookup","settings":{
+        \\  "listen4":"0.0.0.0","port4":19080,"listen6":"::","port6":19081,
+        \\  "transparentIntercept":{"ingressInterface":"br-lan","excludedIPs":["192.168.8.0/24","fe80::/10"],"proxyServerIPs":["203.0.113.9","2001:db8::9"]}
+        \\}}]}
+    ;
+    var cfg = try parse(std.testing.allocator, source);
+    defer cfg.deinit();
+    const transparent = cfg.inbounds[0].sk_lookup.?.transparent_intercept.?;
+    try std.testing.expectEqualStrings("br-lan", transparent.ingress_interface);
+    try std.testing.expectEqual(@as(usize, 2), transparent.excluded_ips.len);
+    try std.testing.expectEqual(@as(usize, 2), transparent.proxy_server_ips.len);
+}
+
+test "rejects unsafe sk_lookup transparent literal admission" {
+    const prefix = "{\"inbounds\":[{\"protocol\":\"sk_lookup\",\"settings\":{\"listen4\":\"0.0.0.0\",\"port4\":1,\"listen6\":\"::\",\"port6\":1,\"transparentIntercept\":";
+    try std.testing.expectError(error.MissingTransparentIngressInterface, parse(std.testing.allocator, prefix ++ "{\"excludedIPs\":[\"10.0.0.0/8\"],\"proxyServerIPs\":[\"203.0.113.9\"]}}}]}"));
+    try std.testing.expectError(error.InvalidTransparentExclusions, parse(std.testing.allocator, prefix ++ "{\"ingressInterface\":\"br-lan\",\"excludedIPs\":[],\"proxyServerIPs\":[\"203.0.113.9\"]}}}]}"));
+    try std.testing.expectError(error.ProxyServerExclusionMustBeAddress, parse(std.testing.allocator, prefix ++ "{\"ingressInterface\":\"br-lan\",\"excludedIPs\":[\"10.0.0.0/8\"],\"proxyServerIPs\":[\"203.0.113.0/24\"]}}}]}"));
+    try std.testing.expectError(error.UnsupportedTransparentInterceptSetting, parse(std.testing.allocator, prefix ++ "{\"ingressInterface\":\"br-lan\",\"excludedIPs\":[\"10.0.0.0/8\"],\"proxyServerIPs\":[\"203.0.113.9\"],\"udp\":true}}}]}"));
 }
 
 test "rejects ambiguous or unsupported sk_lookup settings" {

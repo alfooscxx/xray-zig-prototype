@@ -10,6 +10,7 @@ XRAY_BIN=$1
 PEER_BIN=$2
 LAB_ID=$$
 LAB_ROOT=/tmp/xz-ebpf-lab-$LAB_ID
+CONTROL_SOCKET=$LAB_ROOT/control.sock
 CLIENT_NS=xz-client-$LAB_ID
 ROUTER_NS=xz-router-$LAB_ID
 SUFFIX=$((LAB_ID % 10000))
@@ -24,6 +25,25 @@ BPF_MAP4_ID=
 BPF_MAP6_ID=
 BPF_LISTENERS_ID=
 BPF_COUNTERS_ID=
+BASE_PROG_IDS=
+BASE_MAP4_IDS=
+BASE_MAP6_IDS=
+BASE_LISTENER_IDS=
+BASE_COUNTER_IDS=
+
+named_ids() {
+    kind=$1
+    name=$2
+    bpftool "$kind" show name "$name" 2>/dev/null | sed -n 's/^\([0-9][0-9]*\):.*/\1/p' | tr '\n' ' '
+}
+
+new_named_id() {
+    kind=$1; name=$2; baseline=$3
+    for id in $(named_ids "$kind" "$name"); do
+        case " $baseline " in *" $id "*) ;; *) echo "$id"; return 0 ;; esac
+    done
+    return 1
+}
 
 assert_map4_entry() {
     bpftool map lookup id "$BPF_MAP4_ID" key hex c6 12 fe 01
@@ -86,7 +106,7 @@ cleanup() {
     fi
     ip netns del "$CLIENT_NS" 2>/dev/null
     ip netns del "$ROUTER_NS" 2>/dev/null
-    rm -f "$LAB_ROOT/config.json" "$LAB_ROOT/xray.log" "$LAB_ROOT/peer.log"
+    rm -f "$LAB_ROOT/config.json" "$LAB_ROOT/xray.log" "$LAB_ROOT/peer.log" "$CONTROL_SOCKET"
     rmdir "$LAB_ROOT" 2>/dev/null
     exit "$status"
 }
@@ -104,16 +124,11 @@ command -v ip >/dev/null || { echo "ip-full is required" >&2; exit 1; }
 ip -V 2>&1 | grep -q 'iproute2' || { echo "BusyBox ip is insufficient; install ip-full" >&2; exit 1; }
 ip netns list >/dev/null 2>&1 || { echo "ip netns support is required" >&2; exit 1; }
 ip netns list | grep -Eq "^$CLIENT_NS|^$ROUTER_NS" && { echo "lab namespace collision" >&2; exit 1; }
-if bpftool prog show name xz_sk_lookup 2>/dev/null | grep -q 'xz_sk_lookup'; then
-    echo "refusing to run: BPF program name xz_sk_lookup already exists" >&2
-    exit 1
-fi
-for map_name in xz_fake4 xz_fake6 xz_listeners xz_sk_count; do
-    if bpftool map show name "$map_name" 2>/dev/null | grep -q "$map_name"; then
-        echo "refusing to run: BPF map name $map_name already exists" >&2
-        exit 1
-    fi
-done
+BASE_PROG_IDS=$(named_ids prog xz_sk_lookup)
+BASE_MAP4_IDS=$(named_ids map xz_fake4)
+BASE_MAP6_IDS=$(named_ids map xz_fake6)
+BASE_LISTENER_IDS=$(named_ids map xz_listeners)
+BASE_COUNTER_IDS=$(named_ids map xz_sk_count)
 
 mkdir "$LAB_ROOT"
 
@@ -189,7 +204,8 @@ while ! grep -q '^READY$' "$LAB_ROOT/peer.log" 2>/dev/null; do
     sleep 1
 done
 
-ip netns exec "$ROUTER_NS" "$XRAY_BIN" run -config "$LAB_ROOT/config.json" >"$LAB_ROOT/xray.log" 2>&1 &
+ip netns exec "$ROUTER_NS" env XRAY_ZIG_CONTROL_SOCKET="$CONTROL_SOCKET" \
+    "$XRAY_BIN" run -config "$LAB_ROOT/config.json" >"$LAB_ROOT/xray.log" 2>&1 &
 XRAY_PID=$!
 attempt=0
 while ! ip -n "$ROUTER_NS" link show "$TUN_IF" >/dev/null 2>&1; do
@@ -199,11 +215,11 @@ while ! ip -n "$ROUTER_NS" link show "$TUN_IF" >/dev/null 2>&1; do
     sleep 1
 done
 
-BPF_PROG_ID=$(bpftool prog show name xz_sk_lookup | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-BPF_MAP4_ID=$(bpftool map show name xz_fake4 | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-BPF_MAP6_ID=$(bpftool map show name xz_fake6 | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-BPF_LISTENERS_ID=$(bpftool map show name xz_listeners | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
-BPF_COUNTERS_ID=$(bpftool map show name xz_sk_count | sed -n 's/^\([0-9][0-9]*\):.*/\1/p')
+BPF_PROG_ID=$(new_named_id prog xz_sk_lookup "$BASE_PROG_IDS")
+BPF_MAP4_ID=$(new_named_id map xz_fake4 "$BASE_MAP4_IDS")
+BPF_MAP6_ID=$(new_named_id map xz_fake6 "$BASE_MAP6_IDS")
+BPF_LISTENERS_ID=$(new_named_id map xz_listeners "$BASE_LISTENER_IDS")
+BPF_COUNTERS_ID=$(new_named_id map xz_sk_count "$BASE_COUNTER_IDS")
 [ -n "$BPF_PROG_ID" ] && [ -n "$BPF_MAP4_ID" ] && [ -n "$BPF_MAP6_ID" ] && [ -n "$BPF_LISTENERS_ID" ] && [ -n "$BPF_COUNTERS_ID" ]
 BPF_LINK_ID=$(bpftool link show | awk -v prog_id="$BPF_PROG_ID" '
     $0 ~ ("prog[[:space:]]+" prog_id "([[:space:]]|$)") {

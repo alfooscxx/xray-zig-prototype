@@ -1,0 +1,27 @@
+{
+  "inbounds": [{
+    "tag": "ebpf-in",
+    "protocol": "sk_lookup",
+    "settings": {
+      "listen4": "0.0.0.0", "port4": 19080,
+      "listen6": "::", "port6": 19081,
+      "transparentIntercept": {
+        "ingressInterface": "br-lan",
+        "excludedIPs": ["192.168.8.0/24", "fe80::/10"],
+        "proxyServerIPs": ["203.0.113.9", "2001:db8::9"]
+      }
+    }
+  }],
+  "outbounds": [
+    {"tag": "direct", "protocol": "freedom"},
+    {"tag": "proxy", "protocol": "blackhole"}
+  ],
+  "dns": {
+    "servers": [{"resolver":"1.1.1.1","outboundTag":"direct","domains":["domain:"]}],
+    "fakeDns": {}
+  },
+  "routing": {
+    "rules": [{"inboundTag":"ebpf-in","ip":["192.0.2.0/24","2001:db8:1::/48"],"outboundTag":"direct"}],
+    "defaultOutboundTag": "proxy"
+  }
+}

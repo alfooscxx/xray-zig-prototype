@@ -374,6 +374,18 @@ pub fn validate(cfg: *const config.Config) !void {
         return error.UnsupportedOutboundProtocol;
     }
 
+    for (cfg.inbounds) |inbound| {
+        const transparent = if (inbound.sk_lookup) |settings| settings.transparent_intercept orelse continue else continue;
+        for (cfg.outbounds) |outbound| {
+            if (!std.mem.eql(u8, outbound.protocol, "vless")) continue;
+            const vless_settings = switch (outbound.settings) {
+                .vless => |settings| settings,
+                .none => continue,
+            };
+            try validateTransparentProxyServer(transparent, vless_settings.address, vless_settings.port);
+        }
+    }
+
     const default_tag = cfg.routing.default_outbound_tag orelse return error.MissingDefaultOutbound;
     if (cfg.findOutbound(default_tag) == null) return error.MissingOutboundTag;
 
@@ -391,6 +403,13 @@ pub fn validate(cfg: *const config.Config) !void {
             }
         }
     }
+}
+
+fn validateTransparentProxyServer(transparent: config.TransparentInterceptSettings, address_text: []const u8, port: u16) !void {
+    const address = net.IpAddress.parse(address_text, port) catch
+        return error.TransparentProxyServerMustBeIpAddress;
+    for (transparent.proxy_server_ips) |rule| if (rule.matches(address)) return;
+    return error.UnprotectedTransparentProxyServer;
 }
 
 fn validateVlessOutbound(outbound: config.Outbound) !void {
@@ -472,6 +491,18 @@ test "rejects sk_lookup without FakeDNS" {
     var cfg = try config.parse(std.testing.allocator, source);
     defer cfg.deinit();
     try std.testing.expectError(error.MissingFakeDnsConfig, validate(&cfg));
+}
+
+test "transparent interception requires an exact IP proxy-server exclusion" {
+    const protected = [_]config.IpRule{.{ .ip4 = .{ .bytes = .{ 203, 0, 113, 9 }, .prefix_len = 32 } }};
+    const transparent: config.TransparentInterceptSettings = .{
+        .ingress_interface = "br-lan",
+        .excluded_ips = &.{},
+        .proxy_server_ips = @constCast(&protected),
+    };
+    try validateTransparentProxyServer(transparent, "203.0.113.9", 443);
+    try std.testing.expectError(error.UnprotectedTransparentProxyServer, validateTransparentProxyServer(transparent, "203.0.113.10", 443));
+    try std.testing.expectError(error.TransparentProxyServerMustBeIpAddress, validateTransparentProxyServer(transparent, "proxy.example", 443));
 }
 
 test "validates redirect VLESS Reality graph" {

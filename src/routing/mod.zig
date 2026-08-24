@@ -155,6 +155,24 @@ test "selects matching IP route" {
     try std.testing.expectEqualStrings("direct", ipv6_outbound.tag.?);
 }
 
+test "sk_lookup literals retain ordered IP inbound and default routing" {
+    const source =
+        \\{
+        \\  "inbounds": [{"tag":"ebpf-in","protocol":"socks","listen":"127.0.0.1","port":1080}],
+        \\  "outbounds": [{"tag":"direct","protocol":"freedom"},{"tag":"proxy","protocol":"blackhole"}],
+        \\  "routing": {"rules":[{"inboundTag":"ebpf-in","ip":["203.0.113.0/24","2001:db8::/32"],"outboundTag":"direct"}],"defaultOutboundTag":"proxy"}
+        \\}
+    ;
+    var cfg = try config.parse(std.testing.allocator, source);
+    defer cfg.deinit();
+    const direct4 = try selectOutbound(&cfg, .{ .target = .{ .address = try std.Io.net.IpAddress.parse("203.0.113.7", 443) }, .inbound_tag = "ebpf-in", .preferred_family = .ip4 });
+    const direct6 = try selectOutbound(&cfg, .{ .target = .{ .address = try std.Io.net.IpAddress.parse("2001:db8::7", 443) }, .inbound_tag = "ebpf-in", .preferred_family = .ip6 });
+    const proxy = try selectOutbound(&cfg, .{ .target = .{ .address = try std.Io.net.IpAddress.parse("198.51.100.7", 443) }, .inbound_tag = "ebpf-in", .preferred_family = .ip4 });
+    try std.testing.expectEqualStrings("direct", direct4.tag.?);
+    try std.testing.expectEqualStrings("direct", direct6.tag.?);
+    try std.testing.expectEqualStrings("proxy", proxy.tag.?);
+}
+
 test "falls back when IP route does not match" {
     const source =
         \\{

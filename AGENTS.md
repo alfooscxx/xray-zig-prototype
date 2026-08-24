@@ -77,10 +77,11 @@ and the deterministic delayed-preface field regression documented in
 
 ## Field Router Access
 
-The active field router is the AArch64 GL.iNet GL-MT6000. Communicate with it
-only through OpenSSH (`ssh`/`scp`) using an operator-supplied `ROUTER_SSH`
-destination. Do not infer the target from the default gateway, and do not use
-HTTP administration endpoints, command injection, RCE helpers, FTP, or legacy
+The active field router is the AArch64 GL.iNet GL-MT6000 at the static SSH
+destination `root@192.168.8.1`. Always use
+`ROUTER_SSH=root@192.168.8.1` for field-router SSH and SCP operations. Do not
+infer or substitute the target from the default gateway, and do not use HTTP
+administration endpoints, command injection, RCE helpers, FTP, or legacy
 deployment scripts.
 
 The old MIPS router is now only an optical bridge. Do not deploy binaries or
