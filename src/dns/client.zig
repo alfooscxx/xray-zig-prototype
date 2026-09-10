@@ -266,6 +266,12 @@ fn exchangeTcp(
     response_buffer: []u8,
     io: Io,
 ) ![]const u8 {
+    // Close the local endpoint before waiting for the dispatched task.  A
+    // DNS-over-TCP peer may keep its connection open after a complete
+    // response, so the close is what wakes a bridge blocked on that stream.
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+
     var pair = try createLoopbackPair(io);
     defer pair[0].close(io);
 
@@ -275,8 +281,6 @@ fn exchangeTcp(
     @memcpy(framed_query[0..2], &length_bytes);
     @memcpy(framed_query[2 .. packet.len + 2], packet);
 
-    var group: Io.Group = .init;
-    defer group.cancel(io);
     while (true) {
         group.concurrent(io, dispatchQuery, .{
             pair[1],
@@ -369,4 +373,70 @@ fn receiveAllTimeout(stream: net.Stream, buffer: []u8, io: Io) !void {
         if (message.data.len == 0) return error.EndOfStream;
         used += message.data.len;
     }
+}
+
+test "routed DNS returns a complete response before the dispatched stream closes" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const Harness = struct {
+        const response = "immediate-response";
+        const hold_open_ms = 500;
+
+        fn dispatch(
+            _: *anyopaque,
+            stream: net.Stream,
+            _: session.Session,
+            _: session.Preface,
+            io: Io,
+        ) !void {
+            var length_bytes: [2]u8 = undefined;
+            std.mem.writeInt(u16, &length_bytes, response.len, .big);
+            var write_buffer: [64]u8 = undefined;
+            var writer = stream.writer(io, &write_buffer);
+            try writer.interface.writeAll(&length_bytes);
+            try writer.interface.writeAll(response);
+            try writer.interface.flush();
+
+            // DNS-over-TCP permits the server to retain the connection after
+            // one response. Model that without sleeping so closing the local
+            // socketpair can wake this poll immediately.
+            _ = session.waitReadableTimeout(stream, stream, hold_open_ms) catch {};
+        }
+    };
+
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{
+        .stack_size = 1024 * 1024,
+        .concurrent_limit = .limited(2),
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var harness: u8 = 0;
+    const dispatcher: session.Dispatcher = .{
+        .context = &harness,
+        .dispatch_fn = Harness.dispatch,
+    };
+    var domains: [0]config.DomainRule = .{};
+    const server: config.DnsServer = .{
+        .resolver = "127.0.0.1:53",
+        .outbound_tag = "proxy",
+        .domains = &domains,
+    };
+    const upstream_address: net.IpAddress = .{ .ip4 = .loopback(53) };
+    var response_buffer: [response_capacity]u8 = undefined;
+
+    const started_ns = Io.Timestamp.now(io, .awake).nanoseconds;
+    const response = try exchangeTcp(
+        "query",
+        "example.test",
+        &server,
+        upstream_address,
+        dispatcher,
+        &response_buffer,
+        io,
+    );
+    const elapsed_ns = Io.Timestamp.now(io, .awake).nanoseconds - started_ns;
+
+    try std.testing.expectEqualStrings(Harness.response, response);
+    try std.testing.expect(elapsed_ns < 200 * std.time.ns_per_ms);
 }

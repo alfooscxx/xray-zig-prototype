@@ -24,10 +24,19 @@ pub const FallbackReason = enum {
     duplicate,
     socket_cookie,
     map_prepare,
+    state_prepare,
+    released_prepare,
+    client_stats_prepare,
+    upstream_stats_prepare,
+    client_peer_prepare,
+    upstream_peer_prepare,
+    client_target_prepare,
+    upstream_target_prepare,
     client_source,
     upstream_source,
     client_kick_payload,
     upstream_kick_payload,
+    tcp_progress,
     nonempty_preface,
 };
 pub const RealityStage = enum { tcp_connect, client_hello, server_response, vless_response_header, established };
@@ -147,6 +156,8 @@ pub const Registry = struct {
     sockhash_packets: AtomicU64 = .init(0),
     sockhash_kernel_bytes: AtomicU64 = .init(0),
     sockhash_redirect_errors: AtomicU64 = .init(0),
+    sockhash_backpressure_events: AtomicU64 = .init(0),
+    sockhash_backpressure_flows: AtomicU64 = .init(0),
     sockhash_closed_bytes: AtomicU64 = .init(0),
     raw_bytes: [2]AtomicU64 = atomicArray(2),
     vision_bytes: [2 * @typeInfo(VisionPath).@"enum".fields.len]AtomicU64 = atomicArray(2 * @typeInfo(VisionPath).@"enum".fields.len),
@@ -223,6 +234,8 @@ pub const Registry = struct {
         self.sockhash_packets.store(0, .release);
         self.sockhash_kernel_bytes.store(0, .release);
         self.sockhash_redirect_errors.store(0, .release);
+        self.sockhash_backpressure_events.store(0, .release);
+        self.sockhash_backpressure_flows.store(0, .release);
         self.sockhash_closed_bytes.store(0, .release);
         self.connection_errors.store(0, .release);
         self.connection_successes.store(0, .release);
@@ -428,7 +441,15 @@ pub const Registry = struct {
         self.addEvent(.sockhash_fallback, reason, now_ns);
     }
 
-    pub fn offloadClosed(self: *Registry, owner: Owner, uplink: u64, downlink: u64, redirect_errors: u64, now_ns: u64) void {
+    pub fn offloadClosed(
+        self: *Registry,
+        owner: Owner,
+        uplink: u64,
+        downlink: u64,
+        redirect_errors: u64,
+        backpressure_events: u64,
+        now_ns: u64,
+    ) void {
         const owner_index = @as(usize, @intFromEnum(owner));
         _ = self.offloaded_flows[owner_index].fetchSub(1, .monotonic);
         _ = self.connections_active[@intFromEnum(ConnectionStage.sockhash)].fetchSub(1, .monotonic);
@@ -437,6 +458,8 @@ pub const Registry = struct {
         _ = self.sockhash_bytes[owner_index * 2 + 1].fetchAdd(downlink, .monotonic);
         _ = self.sockhash_closed_bytes.fetchAdd(uplink +| downlink, .monotonic);
         _ = self.sockhash_redirect_errors.fetchAdd(redirect_errors, .monotonic);
+        if (backpressure_events != 0)
+            _ = self.sockhash_backpressure_flows.fetchAdd(1, .monotonic);
         self.addEvent(.sockhash_closed, .none, now_ns);
     }
 
@@ -503,7 +526,7 @@ pub const Registry = struct {
 
     pub fn renderBpfStatus(self: *Registry, writer: *Io.Writer) !void {
         try writer.print(
-            "{{\"sk_lookup\":{},\"sockhash_parser\":{},\"sockhash_verdict\":{},\"sockhash_monitor\":{},\"fakedns_persistence_configured\":{},\"fakedns_pin_compatible\":{},\"offloaded_flows\":{d},\"flow_capacity\":{d},\"closed_bytes\":{d},\"kernel_bytes\":{d},\"byte_divergence\":{d}}}\n",
+            "{{\"sk_lookup\":{},\"sockhash_parser\":{},\"sockhash_verdict\":{},\"sockhash_monitor\":{},\"fakedns_persistence_configured\":{},\"fakedns_pin_compatible\":{},\"offloaded_flows\":{d},\"flow_capacity\":{d},\"closed_bytes\":{d},\"kernel_bytes\":{d},\"byte_divergence\":{d},\"backpressure_events\":{d},\"backpressure_flows\":{d}}}\n",
             .{
                 self.bpf_sk_lookup_up.load(.acquire),
                 self.bpf_sockhash_parser_up.load(.acquire),
@@ -519,6 +542,8 @@ pub const Registry = struct {
                     self.sockhash_closed_bytes.load(.acquire),
                     self.sockhash_kernel_bytes.load(.acquire),
                 ),
+                self.sockhash_backpressure_events.load(.acquire),
+                self.sockhash_backpressure_flows.load(.acquire),
             },
         );
     }
@@ -641,6 +666,8 @@ pub const Registry = struct {
         }
         try metric(writer, "xray_zig_bpf_sockhash_packets_total{network=\"tcp\"}", self.sockhash_packets.load(.acquire));
         try metric(writer, "xray_zig_bpf_sockhash_redirect_errors_total{network=\"tcp\"}", self.sockhash_redirect_errors.load(.acquire));
+        try metric(writer, "xray_zig_bpf_sockhash_backpressure_total{network=\"tcp\"}", self.sockhash_backpressure_events.load(.acquire));
+        try metric(writer, "xray_zig_bpf_sockhash_backpressure_flows_total{network=\"tcp\"}", self.sockhash_backpressure_flows.load(.acquire));
         try metric(writer, "xray_zig_bpf_lookup_total{hook=\"sk_lookup\",result=\"hit\"}", self.bpf_lookup[0].load(.acquire));
         try metric(writer, "xray_zig_bpf_lookup_total{hook=\"sk_lookup\",result=\"miss\"}", self.bpf_lookup[1].load(.acquire));
         try metric(writer, "xray_zig_bpf_lookup_total{hook=\"sk_lookup\",result=\"pool_miss\"}", self.bpf_lookup[2].load(.acquire));

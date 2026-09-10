@@ -37,17 +37,22 @@ command -v bpftool >/dev/null || { echo "bpftool is required" >&2; exit 1; }
 command -v ip >/dev/null || { echo "ip-full is required" >&2; exit 1; }
 ip -V 2>&1 | grep -q 'iproute2' || { echo "BusyBox ip is insufficient; install ip-full" >&2; exit 1; }
 ip netns list | grep -Eq "^$LAB_NS" && { echo "selftest namespace collision" >&2; exit 1; }
-for prog_name in xz_sh_parser xz_sh_verdict; do
-    if bpftool prog show name "$prog_name" 2>/dev/null | grep -q "$prog_name"; then
-        echo "refusing to run: BPF program name $prog_name already exists" >&2
-        exit 1
-    fi
+
+bpf_ids() {
+    bpftool "$1" show name "$2" 2>/dev/null |
+        awk '$1 ~ /^[0-9]+:$/ { sub(":", "", $1); print $1 }' |
+        sort -n
+}
+
+PROG_NAMES="xz_sh_parser xz_sh_verdict"
+MAP_NAMES="xz_sh_targets xz_sh_sources xz_sh_peers xz_sh_state xz_sh_stats xz_sh_total xz_sh_released xz_sh_total_rel"
+before_programs=
+for prog_name in $PROG_NAMES; do
+    before_programs="$before_programs $prog_name:$(bpf_ids prog "$prog_name" | tr '\n' ',')"
 done
-for map_name in xz_sh_targets xz_sh_sources xz_sh_peers xz_sh_state xz_sh_stats xz_sh_total; do
-    if bpftool map show name "$map_name" 2>/dev/null | grep -q "$map_name"; then
-        echo "refusing to run: BPF map name $map_name already exists" >&2
-        exit 1
-    fi
+before_maps=
+for map_name in $MAP_NAMES; do
+    before_maps="$before_maps $map_name:$(bpf_ids map "$map_name" | tr '\n' ',')"
 done
 
 ip netns add "$LAB_NS"
@@ -70,11 +75,25 @@ wait "$WATCHDOG_PID" 2>/dev/null || true
 WATCHDOG_PID=
 [ "$selftest_status" -eq 0 ]
 
-for prog_name in xz_sh_parser xz_sh_verdict; do
-    ! bpftool prog show name "$prog_name" 2>/dev/null | grep -q "$prog_name"
-done
-for map_name in xz_sh_targets xz_sh_sources xz_sh_peers xz_sh_state xz_sh_stats xz_sh_total; do
-    ! bpftool map show name "$map_name" 2>/dev/null | grep -q "$map_name"
+attempt=0
+while :; do
+    after_programs=
+    for prog_name in $PROG_NAMES; do
+        after_programs="$after_programs $prog_name:$(bpf_ids prog "$prog_name" | tr '\n' ',')"
+    done
+    after_maps=
+    for map_name in $MAP_NAMES; do
+        after_maps="$after_maps $map_name:$(bpf_ids map "$map_name" | tr '\n' ',')"
+    done
+    if [ "$after_programs" = "$before_programs" ] && [ "$after_maps" = "$before_maps" ]; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 5 ] || {
+        echo "BPF objects did not return to the pre-test ID set" >&2
+        exit 1
+    }
+    sleep 1
 done
 
 echo "PASS: isolated SOCKHASH capability selftest and owned-object cleanup"

@@ -308,6 +308,29 @@ map with `bpf_sk_redirect_hash`. Missing peer/state/target entries are drops,
 increment a redirect-error counter, and cause userspace to reset the flow;
 there is no silent PASS into an unread socket queue.
 
+SK_SKB redirection can otherwise accumulate an unbounded `sk_psock` backlog
+when the destination stops making TCP progress. The verdict therefore admits
+at most 4 MiB per flow of redirected data that has not subsequently been
+accepted by its destination sockets. A separate 64 MiB process-wide emergency
+limit remains as the final OOM guard if many flows stall concurrently. The
+per-flow limit is checked first, so one ordinary stalled connection is closed
+without consuming a shared 4 MiB window and marking unrelated active flows as
+backpressured.
+
+Userspace derives cumulative accepted bytes from
+`TCP_INFO.tcpi_bytes_acked + SIOCOUTQ`: acknowledged bytes and bytes still in
+the ordinary target send queue both release redirect credit, so the limit does
+not cap the path bandwidth-delay product. Reading ACK progress before
+`SIOCOUTQ` makes a race conservatively undercount rather than release credit
+early. Userspace refreshes both per-flow and aggregate credit every 10 ms while
+flows are active. On exhaustion, the verdict records a backpressure event and
+returns `SK_PASS` for the current packet. That packet remains in the source
+socket's bounded receive queue, wakes the monitor, and makes that flow fail
+closed; it is never silently resumed after only part of the byte stream was
+redirected. The limits cover the internal redirect backlog, not ordinary TCP
+receive and send buffers, and may be exceeded by a small number of concurrently
+executing verdict packets.
+
 This split is required for a zero-copy cutover on Linux 6.12. Inserting a
 socket into a verdict map does not migrate data already in
 `sk_receive_queue`. An identity stream parser causes `tcp_bpf_recvmsg_parser()`
@@ -330,8 +353,9 @@ silently restarted as a two-direction raw flow after bytes may have been
 redirected.
 
 Fully offloaded flows are monitored through duplicate FDs. The BPF program
-updates per-direction bytes, monotonic `last_seen_ns`, redirect errors, and the
-persistent `xz_sh_total` ARRAY counters. Userspace propagates FIN as
+updates per-direction bytes, monotonic `last_seen_ns`, redirect errors,
+backpressure events, and the persistent `xz_sh_total` ARRAY counters.
+Userspace propagates FIN as
 `shutdown(peer, SHUT_WR)`, permits the opposite half to continue, propagates
 RST, enforces the configured monotonic idle timeout, and deletes exact map
 entries before closing its sockets. Process shutdown drains both full and
@@ -495,10 +519,12 @@ under a 30-second watchdog. The executable creates real TCP pairs, queues data
 in both receive queues before source insertion, proves exact prequeue/postqueue
 ordering in both directions, proves both client-first and upstream-first
 payload-plus-FIN queued before admission, permits the opposite peer to respond
-after each half-close, and then proves RST propagation on another flow. It
-fails unless admission is full SOCKHASH; hybrid/raw fallback is not
-accepted. The wrapper checks fixed BPF names for collisions before start,
-removes only its namespace, and requires all owned program/map names to be gone
+after each half-close, and then proves RST propagation on another flow. The
+backpressure cases prove both that a stalled destination is bounded and that
+exhausting one flow's credit does not prevent a simultaneous healthy flow from
+delivering data. It fails unless admission is full SOCKHASH; hybrid/raw
+fallback is not accepted. The wrapper snapshots same-named production BPF IDs,
+removes only its namespace, and requires the exact pre-test program/map set
 after process exit.
 
 ```sh

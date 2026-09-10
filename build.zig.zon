@@ -1,6 +1,6 @@
 .{
     .name = .xray_zig,
-    .version = "0.0.4",
+    .version = "0.0.9",
     .fingerprint = 0xfbeb1c68f9b3554e, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},

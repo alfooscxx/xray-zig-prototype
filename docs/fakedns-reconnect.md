@@ -45,8 +45,9 @@ FakeDNS is now opt-in through `dns.fakeDns`. Without that object, A, AAAA, and
 other query types are forwarded to the first matching resolver rule.
 Configurations can retain it for explicit FakeDNS use. VLESS response-wait
 errors now report `ClientEndOfStream` and
-`UpstreamEndOfStream` separately, and Debug/trace builds log the selected
-target for future field diagnosis.
+`UpstreamEndOfStream` separately. Response-wait failures include the selected
+target in ReleaseFast logs so field failures can be attributed without a
+diagnostic rebuild.
 
 ## Validation
 

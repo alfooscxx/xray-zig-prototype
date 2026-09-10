@@ -1,16 +1,13 @@
 {
   "inbounds": [
     {
-      "tag": "redirect-ipv4",
-      "listen": "0.0.0.0",
-      "port": 12345,
-      "protocol": "redirect"
-    },
-    {
-      "tag": "redirect-ipv6",
-      "listen": "::",
-      "port": 12346,
-      "protocol": "redirect"
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "port": 1081,
+      "protocol": "socks",
+      "settings": {
+        "udp": false
+      }
     },
     {
       "tag": "dns-in",
@@ -82,33 +79,11 @@
       {
         "resolver": "8.8.8.8",
         "outboundTag": "proxy",
-        "domains": [
-          "domain:"
-        ]
+        "domains": ["domain:"]
       }
     ]
   },
   "routing": {
-    "defaultOutboundTag": "proxy",
-    "rules": [
-      {
-        "domain": [
-          "domain:ru",
-          "domain:su",
-          "domain:by",
-          "domain:yandex.com",
-          "domain:vk.com",
-          "domain:livejournal.com",
-          "domain:xn--p1ai",
-          "domain:okko.tv",
-          "domain:okko.sport"
-        ],
-        "outboundTag": "direct"
-      },
-      {
-        "ip": ["127.0.0.0/8", "192.168.0.0/16", "10.0.0.0/8"],
-        "outboundTag": "direct"
-      }
-    ]
+    "defaultOutboundTag": "proxy"
   }
 }

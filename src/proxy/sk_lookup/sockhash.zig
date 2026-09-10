@@ -13,7 +13,16 @@ const fd_t = std.posix.fd_t;
 const posix = std.posix;
 
 const sk_drop: i32 = 0;
-const monitor_poll_ms = 1000;
+const sk_pass: i32 = 1;
+// Redirected SKBs can wait outside the target socket's normal send-buffer
+// accounting. Keep each flow's window small enough for the router while
+// refreshing it fast enough to sustain a 2.5 Gbit/s link.
+const max_unacknowledged_redirect_bytes: u64 = 4 * 1024 * 1024;
+// The per-flow limit isolates ordinary stalls. This larger process-wide limit
+// remains as a last-resort OOM guard if many flows stall at once.
+const max_global_unacknowledged_redirect_bytes: u64 = 64 * 1024 * 1024;
+const monitor_poll_ms = 10;
+const idle_monitor_poll_ms = 1000;
 const poll_rdhup: i16 = 0x2000;
 
 pub const FallbackReason = enum {
@@ -21,10 +30,19 @@ pub const FallbackReason = enum {
     duplicate,
     socket_cookie,
     map_prepare,
+    state_prepare,
+    released_prepare,
+    client_stats_prepare,
+    upstream_stats_prepare,
+    client_peer_prepare,
+    upstream_peer_prepare,
+    client_target_prepare,
+    upstream_target_prepare,
     client_source,
     upstream_source,
     client_kick_payload,
     upstream_kick_payload,
+    tcp_progress,
 };
 
 pub const Admission = union(enum) {
@@ -50,18 +68,32 @@ pub const Peer = extern struct {
 pub const FlowState = extern struct {
     active: u32,
     reserved: u32 = 0,
+    redirected_bytes: u64 = 0,
 };
 
 pub const DirectionStats = extern struct {
     bytes: u64,
     last_seen_ns: u64,
     redirect_errors: u64,
+    backpressure_events: u64,
 };
 
 pub const AggregateStats = extern struct {
     bytes: u64,
     packets: u64,
     redirect_errors: u64,
+    backpressure_events: u64,
+};
+
+const PrepareStage = enum {
+    state,
+    released,
+    client_stats,
+    upstream_stats,
+    client_peer,
+    upstream_peer,
+    client_target,
+    upstream_target,
 };
 
 pub const Dataplane = struct {
@@ -71,6 +103,8 @@ pub const Dataplane = struct {
     state_fd: fd_t,
     stats_fd: fd_t,
     aggregate_fd: fd_t,
+    released_fd: fd_t,
+    aggregate_released_fd: fd_t,
     parser_fd: fd_t,
     verdict_fd: fd_t,
     parser_link_fd: fd_t,
@@ -92,6 +126,10 @@ pub const Dataplane = struct {
         errdefer closeFd(stats_fd);
         const aggregate_fd = try createMap(.array, @sizeOf(u32), @sizeOf(AggregateStats), 1, "xz_sh_total");
         errdefer closeFd(aggregate_fd);
+        const released_fd = try createMap(.hash, @sizeOf(u64), @sizeOf(u64), max_flows, "xz_sh_released");
+        errdefer closeFd(released_fd);
+        const aggregate_released_fd = try createMap(.array, @sizeOf(u32), @sizeOf(u64), 1, "xz_sh_total_rel");
+        errdefer closeFd(aggregate_released_fd);
 
         const parser_instructions = parserProgram();
         const parser_fd = try loadProgram(
@@ -101,7 +139,15 @@ pub const Dataplane = struct {
             "xz_sh_parser",
         );
         errdefer closeFd(parser_fd);
-        const verdict_instructions = verdictProgram(targets_fd, peers_fd, state_fd, stats_fd, aggregate_fd);
+        const verdict_instructions = verdictProgram(
+            targets_fd,
+            peers_fd,
+            state_fd,
+            stats_fd,
+            aggregate_fd,
+            released_fd,
+            aggregate_released_fd,
+        );
         const verdict_fd = try loadProgram(
             &verdict_instructions,
             .sk_skb,
@@ -134,6 +180,8 @@ pub const Dataplane = struct {
             .state_fd = state_fd,
             .stats_fd = stats_fd,
             .aggregate_fd = aggregate_fd,
+            .released_fd = released_fd,
+            .aggregate_released_fd = aggregate_released_fd,
             .parser_fd = parser_fd,
             .verdict_fd = verdict_fd,
             .parser_link_fd = parser_link_fd,
@@ -148,6 +196,8 @@ pub const Dataplane = struct {
         closeFd(self.parser_fd);
         closeFd(self.stats_fd);
         closeFd(self.aggregate_fd);
+        closeFd(self.released_fd);
+        closeFd(self.aggregate_released_fd);
         closeFd(self.state_fd);
         closeFd(self.peers_fd);
         closeFd(self.sources_fd);
@@ -157,25 +207,34 @@ pub const Dataplane = struct {
 
     fn prepare(self: *Dataplane, flow_id: u64, client_cookie: u64, upstream_cookie: u64, client_fd: fd_t, upstream_fd: fd_t) !void {
         const active: FlowState = .{ .active = 1 };
-        try updateNoExist(self.state_fd, &flow_id, &active);
+        try updatePrepareNoExist(self.state_fd, &flow_id, &active, .state);
         errdefer delete(self.state_fd, &flow_id);
 
-        const zero: DirectionStats = .{ .bytes = 0, .last_seen_ns = 0, .redirect_errors = 0 };
-        try updateNoExist(self.stats_fd, &client_cookie, &zero);
+        const released: u64 = 0;
+        try updatePrepareNoExist(self.released_fd, &flow_id, &released, .released);
+        errdefer delete(self.released_fd, &flow_id);
+
+        const zero: DirectionStats = .{
+            .bytes = 0,
+            .last_seen_ns = 0,
+            .redirect_errors = 0,
+            .backpressure_events = 0,
+        };
+        try updatePrepareNoExist(self.stats_fd, &client_cookie, &zero, .client_stats);
         errdefer delete(self.stats_fd, &client_cookie);
-        try updateNoExist(self.stats_fd, &upstream_cookie, &zero);
+        try updatePrepareNoExist(self.stats_fd, &upstream_cookie, &zero, .upstream_stats);
         errdefer delete(self.stats_fd, &upstream_cookie);
 
         const client_peer: Peer = .{ .peer_cookie = upstream_cookie, .flow_id = flow_id, .direction = 0 };
         const upstream_peer: Peer = .{ .peer_cookie = client_cookie, .flow_id = flow_id, .direction = 1 };
-        try updateNoExist(self.peers_fd, &client_cookie, &client_peer);
+        try updatePrepareNoExist(self.peers_fd, &client_cookie, &client_peer, .client_peer);
         errdefer delete(self.peers_fd, &client_cookie);
-        try updateNoExist(self.peers_fd, &upstream_cookie, &upstream_peer);
+        try updatePrepareNoExist(self.peers_fd, &upstream_cookie, &upstream_peer, .upstream_peer);
         errdefer delete(self.peers_fd, &upstream_cookie);
 
-        try updateSocketNoExist(self.targets_fd, client_cookie, client_fd);
+        try updatePrepareSocketNoExist(self.targets_fd, client_cookie, client_fd, .client_target);
         errdefer delete(self.targets_fd, &client_cookie);
-        try updateSocketNoExist(self.targets_fd, upstream_cookie, upstream_fd);
+        try updatePrepareSocketNoExist(self.targets_fd, upstream_cookie, upstream_fd, .upstream_target);
     }
 
     fn insertSource(self: *Dataplane, cookie: u64, socket_fd: fd_t) !void {
@@ -195,18 +254,44 @@ pub const Dataplane = struct {
         return value;
     }
 
-    fn cleanup(self: *Dataplane, flow_id: u64, client_cookie: u64, upstream_cookie: u64, source_mask: u2) void {
-        if (source_mask & 1 != 0) delete(self.sources_fd, &client_cookie);
-        if (source_mask & 2 != 0) delete(self.sources_fd, &upstream_cookie);
+    fn updateReleased(self: *Dataplane, flow_id: u64, released: u64) !void {
+        try updateExisting(self.released_fd, &flow_id, &released);
+    }
+
+    fn updateAggregateReleased(self: *Dataplane, released: u64) !void {
+        const key: u32 = 0;
+        try updateExisting(self.aggregate_released_fd, &key, &released);
+    }
+
+    fn cleanup(
+        self: *Dataplane,
+        flow_id: u64,
+        client_cookie: u64,
+        upstream_cookie: u64,
+        source_mask: u2,
+        client_fd: fd_t,
+        upstream_fd: fd_t,
+    ) u64 {
         const inactive: FlowState = .{ .active = 0 };
         updateExisting(self.state_fd, &flow_id, &inactive) catch {};
+        if (source_mask & 1 != 0) delete(self.sources_fd, &client_cookie);
+        if (source_mask & 2 != 0) delete(self.sources_fd, &upstream_cookie);
+        // recv(MSG_PEEK) takes the TCP socket lock after source detachment.
+        // Any verdict that was already running has therefore finished before
+        // the per-flow maps are removed.
+        if (source_mask & 1 != 0) _ = kickSource(client_fd) catch {};
+        if (source_mask & 2 != 0) _ = kickSource(upstream_fd) catch {};
+        const client_bytes = if (self.stats(client_cookie)) |value| value.bytes else |_| 0;
+        const upstream_bytes = if (self.stats(upstream_cookie)) |value| value.bytes else |_| 0;
         delete(self.targets_fd, &client_cookie);
         delete(self.targets_fd, &upstream_cookie);
         delete(self.peers_fd, &client_cookie);
         delete(self.peers_fd, &upstream_cookie);
         delete(self.stats_fd, &client_cookie);
         delete(self.stats_fd, &upstream_cookie);
+        delete(self.released_fd, &flow_id);
         delete(self.state_fd, &flow_id);
+        return client_bytes +| upstream_bytes;
     }
 };
 
@@ -222,6 +307,10 @@ const Flow = struct {
     last_seen_ns: u64,
     client_bytes: u64 = 0,
     upstream_bytes: u64 = 0,
+    client_target_progress_base: u64,
+    upstream_target_progress_base: u64,
+    client_released: u64 = 0,
+    upstream_released: u64 = 0,
     next: ?*Flow = null,
 };
 
@@ -279,6 +368,12 @@ const HybridCleanup = struct {
     client_cookie: u64,
     upstream_cookie: u64,
     source_mask: u2,
+    client: net.Stream,
+    upstream: net.Stream,
+    client_target_progress_base: u64,
+    upstream_target_progress_base: u64,
+    client_released: u64 = 0,
+    upstream_released: u64 = 0,
 };
 
 pub const Manager = struct {
@@ -294,6 +389,7 @@ pub const Manager = struct {
     stopped: std.atomic.Value(bool) = .init(false),
     reserved_count: std.atomic.Value(u32) = .init(0),
     next_flow_id: std.atomic.Value(u64) = .init(1),
+    released_bytes: std.atomic.Value(u64) = .init(0),
     active_count: usize = 0,
 
     pub fn init(
@@ -392,6 +488,10 @@ pub const Manager = struct {
         const upstream_cookie = socketCookie(upstream_copy.socket.handle) catch return .{ .fallback = .socket_cookie };
         if (!cookiesUsable(client_cookie, upstream_cookie))
             return .{ .fallback = .socket_cookie };
+        const client_target_progress_base = tcpTargetProgress(upstream_copy.socket.handle) catch
+            return .{ .fallback = .tcp_progress };
+        const upstream_target_progress_base = tcpTargetProgress(client_copy.socket.handle) catch
+            return .{ .fallback = .tcp_progress };
 
         const flow_id = self.next_flow_id.fetchAdd(1, .monotonic);
         self.dataplane.prepare(
@@ -400,10 +500,19 @@ pub const Manager = struct {
             upstream_cookie,
             client_copy.socket.handle,
             upstream_copy.socket.handle,
-        ) catch return .{ .fallback = .map_prepare };
+        ) catch |err| return .{ .fallback = prepareFallbackReason(err) };
         var prepared = true;
         var source_mask: u2 = 0;
-        defer if (prepared) self.dataplane.cleanup(flow_id, client_cookie, upstream_cookie, source_mask);
+        defer if (prepared) {
+            self.releaseBudget(self.dataplane.cleanup(
+                flow_id,
+                client_cookie,
+                upstream_cookie,
+                source_mask,
+                client_copy.socket.handle,
+                upstream_copy.socket.handle,
+            ));
+        };
 
         self.dataplane.insertSource(client_cookie, client_copy.socket.handle) catch
             return .{ .fallback = .client_source };
@@ -423,6 +532,8 @@ pub const Manager = struct {
                 client_cookie,
                 upstream_cookie,
                 source_mask,
+                client_target_progress_base,
+                upstream_target_progress_base,
                 &prepared,
                 &reservation_owned,
                 .upstream_source,
@@ -460,6 +571,8 @@ pub const Manager = struct {
             .owner = owner,
             .lifecycle = initial_lifecycle.state,
             .last_seen_ns = monotonicNowNs(self.io),
+            .client_target_progress_base = client_target_progress_base,
+            .upstream_target_progress_base = upstream_target_progress_base,
         };
         // Both receive queues have passed through the parser/verdict path at
         // this point. Propagate FIN only now, after any pre-admission payload
@@ -484,11 +597,24 @@ pub const Manager = struct {
         client_cookie: u64,
         upstream_cookie: u64,
         source_mask: u2,
+        client_target_progress_base: u64,
+        upstream_target_progress_base: u64,
         prepared: *bool,
         reservation_owned: *bool,
         reason: FallbackReason,
     ) Admission {
         const cleanup = self.allocator.create(HybridCleanup) catch {
+            resetPeer(client.socket.handle, upstream.socket.handle);
+            return .{ .terminal = reason };
+        };
+        const cleanup_client = duplicateStream(client) catch {
+            self.allocator.destroy(cleanup);
+            resetPeer(client.socket.handle, upstream.socket.handle);
+            return .{ .terminal = reason };
+        };
+        const cleanup_upstream = duplicateStream(upstream) catch {
+            cleanup_client.close(self.io);
+            self.allocator.destroy(cleanup);
             resetPeer(client.socket.handle, upstream.socket.handle);
             return .{ .terminal = reason };
         };
@@ -498,12 +624,18 @@ pub const Manager = struct {
             .client_cookie = client_cookie,
             .upstream_cookie = upstream_cookie,
             .source_mask = source_mask,
+            .client = cleanup_client,
+            .upstream = cleanup_upstream,
+            .client_target_progress_base = client_target_progress_base,
+            .upstream_target_progress_base = upstream_target_progress_base,
         };
         reactor.adoptDuplicateWithCleanup(client, upstream, .{
             .context = cleanup,
             .callback = releaseHybrid,
             .health_callback = hybridHealthy,
         }) catch {
+            cleanup_upstream.close(self.io);
+            cleanup_client.close(self.io);
             self.allocator.destroy(cleanup);
             resetPeer(client.socket.handle, upstream.socket.handle);
             return .{ .terminal = reason };
@@ -541,7 +673,8 @@ pub const Manager = struct {
                 count += 1;
             }
 
-            _ = posix.poll(self.poll_fds[0 .. count * 2 + 1], monitor_poll_ms) catch continue;
+            const poll_timeout_ms: i32 = if (count == 0) idle_monitor_poll_ms else monitor_poll_ms;
+            _ = posix.poll(self.poll_fds[0 .. count * 2 + 1], poll_timeout_ms) catch continue;
             try Io.checkCancel(self.io);
             if (self.poll_fds[0].revents & posix.POLL.IN != 0) self.drainWake();
             if (self.stopped.load(.acquire)) return;
@@ -573,7 +706,9 @@ pub const Manager = struct {
                 monitoring.registry.sockhash_kernel_bytes.store(stats.bytes, .release);
                 monitoring.registry.sockhash_packets.store(stats.packets, .release);
                 monitoring.registry.sockhash_redirect_errors.store(stats.redirect_errors, .release);
+                monitoring.registry.sockhash_backpressure_events.store(stats.backpressure_events, .release);
             } else |_| {}
+            self.syncAggregateReleased();
         }
     }
 
@@ -582,6 +717,7 @@ pub const Manager = struct {
         monitoring.registry.sockhash_kernel_bytes.store(stats.bytes, .release);
         monitoring.registry.sockhash_packets.store(stats.packets, .release);
         monitoring.registry.sockhash_redirect_errors.store(stats.redirect_errors, .release);
+        monitoring.registry.sockhash_backpressure_events.store(stats.backpressure_events, .release);
     }
 
     fn serviceFlow(self: *Manager, flow: *Flow, client_events: i16, upstream_events: i16) void {
@@ -597,9 +733,42 @@ pub const Manager = struct {
             _ = flow.lifecycle.observe(.client, .reset);
             return;
         }
+        if (client_stats.backpressure_events != 0 or upstream_stats.backpressure_events != 0) {
+            _ = flow.lifecycle.observe(.client, .reset);
+            return;
+        }
         flow.client_bytes = client_stats.bytes;
         flow.upstream_bytes = upstream_stats.bytes;
         flow.last_seen_ns = @max(flow.last_seen_ns, @max(client_stats.last_seen_ns, upstream_stats.last_seen_ns));
+
+        const client_released = acceptedRedirectBytes(
+            flow.upstream.socket.handle,
+            flow.client_target_progress_base,
+            client_stats.bytes,
+        ) catch {
+            _ = flow.lifecycle.observe(.upstream, .reset);
+            return;
+        };
+        const upstream_released = acceptedRedirectBytes(
+            flow.client.socket.handle,
+            flow.upstream_target_progress_base,
+            upstream_stats.bytes,
+        ) catch {
+            _ = flow.lifecycle.observe(.client, .reset);
+            return;
+        };
+        const newly_released = (client_released -| flow.client_released) +|
+            (upstream_released -| flow.upstream_released);
+        flow.client_released = @max(flow.client_released, client_released);
+        flow.upstream_released = @max(flow.upstream_released, upstream_released);
+        self.releaseBudget(newly_released);
+        self.dataplane.updateReleased(
+            flow.flow_id,
+            flow.client_released +| flow.upstream_released,
+        ) catch {
+            _ = flow.lifecycle.observe(.client, .reset);
+            return;
+        };
 
         const client_actions = flow.lifecycle.observe(.client, inspectSource(flow.client.socket.handle, client_events));
         const upstream_actions = flow.lifecycle.observe(.upstream, inspectSource(flow.upstream.socket.handle, upstream_events));
@@ -654,20 +823,23 @@ pub const Manager = struct {
             .bytes = flow.client_bytes,
             .last_seen_ns = flow.last_seen_ns,
             .redirect_errors = 1,
+            .backpressure_events = 0,
         };
         const upstream_stats: DirectionStats = self.dataplane.stats(flow.upstream_cookie) catch .{
             .bytes = flow.upstream_bytes,
             .last_seen_ns = flow.last_seen_ns,
             .redirect_errors = 1,
+            .backpressure_events = 0,
         };
         log.info(
-            "sockhash-close owner={s} flow={d} client_bytes={d} upstream_bytes={d} errors={d} reset={}\n",
+            "sockhash-close owner={s} flow={d} client_bytes={d} upstream_bytes={d} errors={d} backpressure={d} reset={}\n",
             .{
                 @tagName(flow.owner),
                 flow.flow_id,
                 client_stats.bytes,
                 upstream_stats.bytes,
                 client_stats.redirect_errors +| upstream_stats.redirect_errors,
+                client_stats.backpressure_events +| upstream_stats.backpressure_events,
                 flow.lifecycle.reset,
             },
         );
@@ -676,16 +848,20 @@ pub const Manager = struct {
             client_stats.bytes,
             upstream_stats.bytes,
             client_stats.redirect_errors +| upstream_stats.redirect_errors,
+            client_stats.backpressure_events +| upstream_stats.backpressure_events,
             monotonicNowNs(self.io),
         );
-        self.dataplane.cleanup(
+        const redirected_bytes = self.dataplane.cleanup(
             flow.flow_id,
             flow.client_cookie,
             flow.upstream_cookie,
             flow.source_mask,
+            flow.client.socket.handle,
+            flow.upstream.socket.handle,
         );
         flow.client.close(self.io);
         flow.upstream.close(self.io);
+        self.releaseBudget(redirected_bytes -| (flow.client_released +| flow.upstream_released));
         self.allocator.destroy(flow);
         self.releaseReservation();
         if (self.active_count > 0) self.active_count -= 1;
@@ -701,6 +877,16 @@ pub const Manager = struct {
 
     fn releaseReservation(self: *Manager) void {
         _ = self.reserved_count.fetchSub(1, .release);
+    }
+
+    fn releaseBudget(self: *Manager, bytes: u64) void {
+        if (bytes == 0) return;
+        _ = self.released_bytes.fetchAdd(bytes, .monotonic);
+        self.wake();
+    }
+
+    fn syncAggregateReleased(self: *Manager) void {
+        self.dataplane.updateAggregateReleased(self.released_bytes.load(.acquire)) catch {};
     }
 
     fn wake(self: *Manager) void {
@@ -752,29 +938,72 @@ fn monitoringReason(reason: FallbackReason) monitoring.FallbackReason {
     };
 }
 
+fn prepareFallbackReason(err: anyerror) FallbackReason {
+    return switch (err) {
+        error.SockhashPrepareStateFailed => .state_prepare,
+        error.SockhashPrepareReleasedFailed => .released_prepare,
+        error.SockhashPrepareClientStatsFailed => .client_stats_prepare,
+        error.SockhashPrepareUpstreamStatsFailed => .upstream_stats_prepare,
+        error.SockhashPrepareClientPeerFailed => .client_peer_prepare,
+        error.SockhashPrepareUpstreamPeerFailed => .upstream_peer_prepare,
+        error.SockhashPrepareClientTargetFailed => .client_target_prepare,
+        error.SockhashPrepareUpstreamTargetFailed => .upstream_target_prepare,
+        else => .map_prepare,
+    };
+}
+
 fn releaseHybrid(context: *anyopaque) void {
     const cleanup: *HybridCleanup = @ptrCast(@alignCast(context));
     const manager = cleanup.manager;
-    manager.dataplane.cleanup(
+    const redirected_bytes = manager.dataplane.cleanup(
         cleanup.flow_id,
         cleanup.client_cookie,
         cleanup.upstream_cookie,
         cleanup.source_mask,
+        cleanup.client.socket.handle,
+        cleanup.upstream.socket.handle,
     );
+    cleanup.client.close(manager.io);
+    cleanup.upstream.close(manager.io);
+    manager.releaseBudget(redirected_bytes -| (cleanup.client_released +| cleanup.upstream_released));
     manager.releaseReservation();
     manager.allocator.destroy(cleanup);
 }
 
 fn hybridHealthy(context: *anyopaque) bool {
     const cleanup: *HybridCleanup = @ptrCast(@alignCast(context));
+    const previously_released = cleanup.client_released +| cleanup.upstream_released;
     if (cleanup.source_mask & 1 != 0) {
         const stats = cleanup.manager.dataplane.stats(cleanup.client_cookie) catch return false;
-        if (stats.redirect_errors != 0) return false;
+        if (stats.redirect_errors != 0 or stats.backpressure_events != 0) return false;
+        cleanup.client_released = @max(
+            cleanup.client_released,
+            acceptedRedirectBytes(
+                cleanup.upstream.socket.handle,
+                cleanup.client_target_progress_base,
+                stats.bytes,
+            ) catch return false,
+        );
     }
     if (cleanup.source_mask & 2 != 0) {
         const stats = cleanup.manager.dataplane.stats(cleanup.upstream_cookie) catch return false;
-        if (stats.redirect_errors != 0) return false;
+        if (stats.redirect_errors != 0 or stats.backpressure_events != 0) return false;
+        cleanup.upstream_released = @max(
+            cleanup.upstream_released,
+            acceptedRedirectBytes(
+                cleanup.client.socket.handle,
+                cleanup.upstream_target_progress_base,
+                stats.bytes,
+            ) catch return false,
+        );
     }
+    cleanup.manager.dataplane.updateReleased(
+        cleanup.flow_id,
+        cleanup.client_released +| cleanup.upstream_released,
+    ) catch return false;
+    cleanup.manager.releaseBudget(
+        (cleanup.client_released +| cleanup.upstream_released) -| previously_released,
+    );
     return true;
 }
 
@@ -858,6 +1087,105 @@ fn socketCookie(fd: fd_t) !u64 {
     return cookie;
 }
 
+// Stable prefix of Linux's struct tcp_info through tcpi_bytes_acked. Keeping
+// the kernel ABI local avoids a libc dependency in static router builds.
+const TcpInfoAckPrefix = extern struct {
+    state: u8,
+    ca_state: u8,
+    retransmits: u8,
+    probes: u8,
+    backoff: u8,
+    options: u8,
+    window_scales: u8,
+    delivery_flags: u8,
+    rto: u32,
+    ato: u32,
+    snd_mss: u32,
+    rcv_mss: u32,
+    unacked: u32,
+    sacked: u32,
+    lost: u32,
+    retrans: u32,
+    fackets: u32,
+    last_data_sent: u32,
+    last_ack_sent: u32,
+    last_data_recv: u32,
+    last_ack_recv: u32,
+    pmtu: u32,
+    rcv_ssthresh: u32,
+    rtt: u32,
+    rttvar: u32,
+    snd_ssthresh: u32,
+    snd_cwnd: u32,
+    advmss: u32,
+    reordering: u32,
+    rcv_rtt: u32,
+    rcv_space: u32,
+    total_retrans: u32,
+    pacing_rate: u64,
+    max_pacing_rate: u64,
+    bytes_acked: u64,
+};
+
+fn tcpBytesAcked(fd: fd_t) !u64 {
+    var info: TcpInfoAckPrefix = undefined;
+    var length: linux.socklen_t = @sizeOf(TcpInfoAckPrefix);
+    const rc = linux.getsockopt(
+        fd,
+        linux.IPPROTO.TCP,
+        linux.TCP.INFO,
+        @ptrCast(&info),
+        &length,
+    );
+    if (linux.errno(rc) != .SUCCESS or length < @offsetOf(TcpInfoAckPrefix, "bytes_acked") + @sizeOf(u64))
+        return error.SockhashTcpProgressUnavailable;
+    return info.bytes_acked;
+}
+
+fn tcpTargetProgress(fd: fd_t) !u64 {
+    // Read ACK progress first. If ACK processing races with SIOCOUTQ, the sum
+    // can temporarily undercount bytes accepted by the target send queue, but
+    // it cannot overcount them and accidentally release hidden-backlog credit.
+    const acked = try tcpBytesAcked(fd);
+    var queued: c_int = 0;
+    const rc = linux.ioctl(fd, linux.SIOCOUTQ, @intFromPtr(&queued));
+    if (linux.errno(rc) != .SUCCESS or queued < 0)
+        return error.SockhashTcpProgressUnavailable;
+    return acked +| @as(u64, @intCast(queued));
+}
+
+fn acceptedProgress(progress_base: u64, progress_now: u64, redirected: u64) u64 {
+    return @min(redirected, progress_now -| progress_base);
+}
+
+fn acceptedRedirectBytes(fd: fd_t, progress_base: u64, redirected: u64) !u64 {
+    return acceptedProgress(progress_base, try tcpTargetProgress(fd), redirected);
+}
+
+test "TCP_INFO ACK prefix matches the Linux UAPI" {
+    try std.testing.expectEqual(@as(usize, 120), @offsetOf(TcpInfoAckPrefix, "bytes_acked"));
+    try std.testing.expectEqual(@as(usize, 128), @sizeOf(TcpInfoAckPrefix));
+}
+
+test "SOCKHASH progress includes target OUTQ without releasing hidden backlog" {
+    const baseline = 10_000;
+    try std.testing.expectEqual(@as(u64, 4096), acceptedProgress(baseline, baseline + 4096, 8192));
+    try std.testing.expectEqual(@as(u64, 8192), acceptedProgress(baseline, baseline + 16_384, 8192));
+    try std.testing.expectEqual(@as(u64, 0), acceptedProgress(baseline, baseline - 1, 8192));
+}
+
+test "SOCKHASH prepare failures preserve their exact stage" {
+    try std.testing.expectEqual(FallbackReason.state_prepare, prepareFallbackReason(error.SockhashPrepareStateFailed));
+    try std.testing.expectEqual(FallbackReason.released_prepare, prepareFallbackReason(error.SockhashPrepareReleasedFailed));
+    try std.testing.expectEqual(FallbackReason.client_stats_prepare, prepareFallbackReason(error.SockhashPrepareClientStatsFailed));
+    try std.testing.expectEqual(FallbackReason.upstream_stats_prepare, prepareFallbackReason(error.SockhashPrepareUpstreamStatsFailed));
+    try std.testing.expectEqual(FallbackReason.client_peer_prepare, prepareFallbackReason(error.SockhashPrepareClientPeerFailed));
+    try std.testing.expectEqual(FallbackReason.upstream_peer_prepare, prepareFallbackReason(error.SockhashPrepareUpstreamPeerFailed));
+    try std.testing.expectEqual(FallbackReason.client_target_prepare, prepareFallbackReason(error.SockhashPrepareClientTargetFailed));
+    try std.testing.expectEqual(FallbackReason.upstream_target_prepare, prepareFallbackReason(error.SockhashPrepareUpstreamTargetFailed));
+    try std.testing.expectEqual(FallbackReason.map_prepare, prepareFallbackReason(error.Unexpected));
+}
+
 fn duplicateStream(stream: net.Stream) !net.Stream {
     const rc = linux.dup(stream.socket.handle);
     if (linux.errno(rc) != .SUCCESS) return error.SystemResources;
@@ -909,14 +1237,47 @@ fn updateSocketNoExist(map_fd: fd_t, cookie: u64, socket_fd: fd_t) !void {
     try update(map_fd, std.mem.asBytes(&cookie), std.mem.asBytes(&value), BPF.NOEXIST);
 }
 
+fn updatePrepareNoExist(map_fd: fd_t, key: anytype, value: anytype, stage: PrepareStage) !void {
+    try updatePrepare(map_fd, std.mem.asBytes(key), std.mem.asBytes(value), stage);
+}
+
+fn updatePrepareSocketNoExist(map_fd: fd_t, cookie: u64, socket_fd: fd_t, stage: PrepareStage) !void {
+    const value: u32 = @intCast(socket_fd);
+    try updatePrepare(map_fd, std.mem.asBytes(&cookie), std.mem.asBytes(&value), stage);
+}
+
+fn updatePrepare(map_fd: fd_t, key: []const u8, value: []const u8, stage: PrepareStage) !void {
+    const err = updateErrno(map_fd, key, value, BPF.NOEXIST);
+    if (err == .SUCCESS) return;
+    log.warn(
+        "SOCKHASH prepare failed stage={s} map_fd={d} errno={s}({d})\n",
+        .{ @tagName(stage), map_fd, @tagName(err), @intFromEnum(err) },
+    );
+    return switch (stage) {
+        .state => error.SockhashPrepareStateFailed,
+        .released => error.SockhashPrepareReleasedFailed,
+        .client_stats => error.SockhashPrepareClientStatsFailed,
+        .upstream_stats => error.SockhashPrepareUpstreamStatsFailed,
+        .client_peer => error.SockhashPrepareClientPeerFailed,
+        .upstream_peer => error.SockhashPrepareUpstreamPeerFailed,
+        .client_target => error.SockhashPrepareClientTargetFailed,
+        .upstream_target => error.SockhashPrepareUpstreamTargetFailed,
+    };
+}
+
 fn update(map_fd: fd_t, key: []const u8, value: []const u8, flags: u64) !void {
+    if (updateErrno(map_fd, key, value, flags) != .SUCCESS)
+        return error.SockhashMapUpdateFailed;
+}
+
+fn updateErrno(map_fd: fd_t, key: []const u8, value: []const u8, flags: u64) linux.E {
     var attr: BPF.Attr = .{ .map_elem = std.mem.zeroes(BPF.MapElemAttr) };
     attr.map_elem.map_fd = map_fd;
     attr.map_elem.key = @intFromPtr(key.ptr);
     attr.map_elem.result.value = @intFromPtr(value.ptr);
     attr.map_elem.flags = flags;
     const rc = linux.bpf(.map_update_elem, &attr, @sizeOf(BPF.MapElemAttr));
-    if (linux.errno(rc) != .SUCCESS) return error.SockhashMapUpdateFailed;
+    return linux.errno(rc);
 }
 
 fn lookup(map_fd: fd_t, key: anytype, value: anytype) !void {
@@ -1010,53 +1371,87 @@ fn xaddAt(dst: BPF.Insn.Reg, offset: i16, src: BPF.Insn.Reg) BPF.Insn {
     return instruction;
 }
 
-fn verdictProgram(targets_fd: fd_t, peers_fd: fd_t, state_fd: fd_t, stats_fd: fd_t, aggregate_fd: fd_t) [62]BPF.Insn {
+fn verdictProgram(
+    targets_fd: fd_t,
+    peers_fd: fd_t,
+    state_fd: fd_t,
+    stats_fd: fd_t,
+    aggregate_fd: fd_t,
+    released_fd: fd_t,
+    aggregate_released_fd: fd_t,
+) [92]BPF.Insn {
     return .{
         BPF.Insn.mov(.r6, .r1),
         BPF.Insn.call(.get_socket_cookie),
-        BPF.Insn.jeq(.r0, 0, 54),
+        BPF.Insn.jeq(.r0, 0, 87),
         BPF.Insn.stx(.double_word, .r10, -8, .r0),
         BPF.Insn.ld_map_fd1(.r1, stats_fd),
         BPF.Insn.ld_map_fd2(stats_fd),
         BPF.Insn.mov(.r2, .r10),
         BPF.Insn.add(.r2, -8),
         BPF.Insn.call(.map_lookup_elem),
-        BPF.Insn.jeq(.r0, 0, 47),
+        BPF.Insn.jeq(.r0, 0, 80),
         BPF.Insn.mov(.r8, .r0),
-        BPF.Insn.ldx(.word, .r9, .r6, 0),
-        xaddAt(.r8, 0, .r9),
-        BPF.Insn.call(.ktime_get_ns),
-        BPF.Insn.stx(.double_word, .r8, 8, .r0),
+        BPF.Insn.ld_map_fd1(.r1, peers_fd),
+        BPF.Insn.ld_map_fd2(peers_fd),
+        BPF.Insn.mov(.r2, .r10),
+        BPF.Insn.add(.r2, -8),
+        BPF.Insn.call(.map_lookup_elem),
+        BPF.Insn.jeq(.r0, 0, 73),
+        BPF.Insn.ldx(.double_word, .r1, .r0, 8),
+        BPF.Insn.stx(.double_word, .r10, -16, .r1),
+        BPF.Insn.ldx(.double_word, .r1, .r0, 0),
+        BPF.Insn.stx(.double_word, .r10, -24, .r1),
+        BPF.Insn.ld_map_fd1(.r1, state_fd),
+        BPF.Insn.ld_map_fd2(state_fd),
+        BPF.Insn.mov(.r2, .r10),
+        BPF.Insn.add(.r2, -16),
+        BPF.Insn.call(.map_lookup_elem),
+        BPF.Insn.jeq(.r0, 0, 63),
+        BPF.Insn.mov(.r9, .r0),
+        BPF.Insn.ldx(.word, .r1, .r0, 0),
+        BPF.Insn.jne(.r1, 1, 60),
         BPF.Insn.st(.word, .r10, -32, 0),
         BPF.Insn.ld_map_fd1(.r1, aggregate_fd),
         BPF.Insn.ld_map_fd2(aggregate_fd),
         BPF.Insn.mov(.r2, .r10),
         BPF.Insn.add(.r2, -32),
         BPF.Insn.call(.map_lookup_elem),
-        BPF.Insn.jeq(.r0, 0, 36),
+        BPF.Insn.jeq(.r0, 0, 53),
         BPF.Insn.mov(.r7, .r0),
-        BPF.Insn.ldx(.word, .r9, .r6, 0),
-        xaddAt(.r7, 0, .r9),
-        BPF.Insn.mov(.r9, 1),
-        xaddAt(.r7, 8, .r9),
-        BPF.Insn.ld_map_fd1(.r1, peers_fd),
-        BPF.Insn.ld_map_fd2(peers_fd),
-        BPF.Insn.mov(.r2, .r10),
-        BPF.Insn.add(.r2, -8),
-        BPF.Insn.call(.map_lookup_elem),
-        BPF.Insn.jeq(.r0, 0, 20),
-        BPF.Insn.ldx(.double_word, .r9, .r0, 8),
-        BPF.Insn.stx(.double_word, .r10, -16, .r9),
-        BPF.Insn.ldx(.double_word, .r9, .r0, 0),
-        BPF.Insn.stx(.double_word, .r10, -24, .r9),
-        BPF.Insn.ld_map_fd1(.r1, state_fd),
-        BPF.Insn.ld_map_fd2(state_fd),
+        BPF.Insn.ld_map_fd1(.r1, released_fd),
+        BPF.Insn.ld_map_fd2(released_fd),
         BPF.Insn.mov(.r2, .r10),
         BPF.Insn.add(.r2, -16),
         BPF.Insn.call(.map_lookup_elem),
-        BPF.Insn.jeq(.r0, 0, 10),
-        BPF.Insn.ldx(.word, .r1, .r0, 0),
-        BPF.Insn.jne(.r1, 1, 8),
+        BPF.Insn.jeq(.r0, 0, 46),
+        BPF.Insn.ldx(.double_word, .r4, .r9, 8),
+        BPF.Insn.ldx(.double_word, .r1, .r0, 0),
+        BPF.Insn.sub(.r4, .r1),
+        BPF.Insn.ldx(.word, .r1, .r6, 0),
+        BPF.Insn.add(.r4, .r1),
+        BPF.Insn.jgt(.r4, @as(i32, @intCast(max_unacknowledged_redirect_bytes)), 35),
+        BPF.Insn.ld_map_fd1(.r1, aggregate_released_fd),
+        BPF.Insn.ld_map_fd2(aggregate_released_fd),
+        BPF.Insn.mov(.r2, .r10),
+        BPF.Insn.add(.r2, -32),
+        BPF.Insn.call(.map_lookup_elem),
+        BPF.Insn.jeq(.r0, 0, 34),
+        BPF.Insn.ldx(.double_word, .r4, .r7, 0),
+        BPF.Insn.ldx(.double_word, .r1, .r0, 0),
+        BPF.Insn.sub(.r4, .r1),
+        BPF.Insn.ldx(.word, .r1, .r6, 0),
+        BPF.Insn.add(.r4, .r1),
+        BPF.Insn.jgt(.r4, @as(i32, @intCast(max_global_unacknowledged_redirect_bytes)), 23),
+        BPF.Insn.ldx(.word, .r1, .r6, 0),
+        xaddAt(.r9, 8, .r1),
+        xaddAt(.r8, 0, .r1),
+        BPF.Insn.call(.ktime_get_ns),
+        BPF.Insn.stx(.double_word, .r8, 8, .r0),
+        BPF.Insn.ldx(.word, .r1, .r6, 0),
+        xaddAt(.r7, 0, .r1),
+        BPF.Insn.mov(.r1, 1),
+        xaddAt(.r7, 8, .r1),
         BPF.Insn.ld_map_fd1(.r2, targets_fd),
         BPF.Insn.ld_map_fd2(targets_fd),
         BPF.Insn.mov(.r1, .r6),
@@ -1064,14 +1459,18 @@ fn verdictProgram(targets_fd: fd_t, peers_fd: fd_t, state_fd: fd_t, stats_fd: fd
         BPF.Insn.add(.r3, -24),
         BPF.Insn.mov(.r4, 0),
         BPF.Insn.call(.sk_redirect_hash),
-        BPF.Insn.jne(.r0, sk_drop, 4),
-        BPF.Insn.mov(.r9, 1),
-        xaddAt(.r7, 16, .r9),
-        xaddAt(.r8, 16, .r9),
+        BPF.Insn.jeq(.r0, sk_drop, 1),
+        BPF.Insn.exit(),
+        BPF.Insn.mov(.r1, 1),
+        xaddAt(.r7, 16, .r1),
+        xaddAt(.r8, 16, .r1),
         BPF.Insn.mov(.r0, sk_drop),
         BPF.Insn.exit(),
-        BPF.Insn.mov(.r9, 1),
-        xaddAt(.r8, 16, .r9),
+        BPF.Insn.mov(.r1, 1),
+        xaddAt(.r7, 24, .r1),
+        xaddAt(.r8, 24, .r1),
+        BPF.Insn.mov(.r0, sk_pass),
+        BPF.Insn.exit(),
         BPF.Insn.mov(.r0, sk_drop),
         BPF.Insn.exit(),
     };
@@ -1082,21 +1481,22 @@ test "SOCKHASH parser and verdict have stable instruction layout" {
     try std.testing.expectEqual(@as(usize, 2), parser.len);
     try std.testing.expectEqual(BPF.Insn.exit(), parser[1]);
 
-    const verdict = verdictProgram(10, 11, 12, 13, 14);
-    try std.testing.expectEqual(@as(usize, 62), verdict.len);
+    const verdict = verdictProgram(10, 11, 12, 13, 14, 15, 16);
+    try std.testing.expectEqual(@as(usize, 92), verdict.len);
     try std.testing.expectEqual(BPF.Insn.call(.get_socket_cookie), verdict[1]);
-    try std.testing.expectEqual(BPF.Insn.call(.sk_redirect_hash), verdict[51]);
-    try std.testing.expectEqual(BPF.Insn.exit(), verdict[57]);
-    try std.testing.expectEqual(BPF.Insn.exit(), verdict[61]);
-    const final_exit: isize = 57;
-    for ([_]usize{ 2, 9 }) |index|
-        try std.testing.expectEqual(final_exit, @as(isize, @intCast(index + 1)) + verdict[index].off);
-    const per_stats_error_path: isize = 58;
-    try std.testing.expectEqual(per_stats_error_path, @as(isize, 22) + verdict[21].off);
-    const error_path: isize = 53;
-    for ([_]usize{ 32, 42, 44 }) |index|
-        try std.testing.expectEqual(error_path, @as(isize, @intCast(index + 1)) + verdict[index].off);
-    try std.testing.expectEqual(final_exit, @as(isize, 53) + verdict[52].off);
+    try std.testing.expectEqual(BPF.Insn.call(.sk_redirect_hash), verdict[77]);
+    try std.testing.expectEqual(BPF.Insn.exit(), verdict[79]);
+    try std.testing.expectEqual(BPF.Insn.exit(), verdict[89]);
+    try std.testing.expectEqual(BPF.Insn.mov(.r0, sk_drop), verdict[90]);
+    try std.testing.expectEqual(BPF.Insn.exit(), verdict[91]);
+    const fail_path: isize = 90;
+    for ([_]usize{ 2, 9, 16, 26, 29, 36, 43, 55 }) |index|
+        try std.testing.expectEqual(fail_path, @as(isize, @intCast(index + 1)) + verdict[index].off);
+    const backpressure_path: isize = 85;
+    for ([_]usize{ 49, 61 }) |index|
+        try std.testing.expectEqual(backpressure_path, @as(isize, @intCast(index + 1)) + verdict[index].off);
+    const redirect_error_path: isize = 80;
+    try std.testing.expectEqual(redirect_error_path, @as(isize, 79) + verdict[78].off);
 }
 
 test "SOCKHASH link create uses the stable Linux UAPI fields" {

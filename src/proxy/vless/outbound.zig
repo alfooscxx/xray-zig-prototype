@@ -65,7 +65,7 @@ pub fn handle(outbound: *const config.Outbound, client: net.Stream, sess: sessio
         diagnostics.setThreadName("xz-vless-wait");
         waitResponseHeader(client, &upstream, &traffic_state, io) catch |err| {
             monitoring.registry.realityOutcome(.vless_response_header, false);
-            log.warn("vless {d} response wait failed: {s}\n", .{ connection_id, @errorName(err) });
+            logResponseWaitFailure(connection_id, sess.target, err);
             return err;
         };
         monitoring.registry.realityOutcome(.vless_response_header, true);
@@ -98,6 +98,19 @@ fn logEstablished(connection_id: u32, target: session.Target, client_tls: bool) 
         .host => |host| log.info(
             "vless {d} established target={s}:{d} client_tls={}\n",
             .{ connection_id, host.name.bytes, host.port, client_tls },
+        ),
+    }
+}
+
+fn logResponseWaitFailure(connection_id: u32, target: session.Target, err: anyerror) void {
+    switch (target) {
+        .address => |address| log.warn(
+            "vless {d} response wait failed target={f} reason={s}\n",
+            .{ connection_id, address, @errorName(err) },
+        ),
+        .host => |host| log.warn(
+            "vless {d} response wait failed target={s}:{d} reason={s}\n",
+            .{ connection_id, host.name.bytes, host.port, @errorName(err) },
         ),
     }
 }

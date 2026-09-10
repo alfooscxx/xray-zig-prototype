@@ -49,11 +49,13 @@ implementation provides the following observability building blocks:
   packet-by-packet events. The SOCKHASH close
   event records `owner=freedom|vless_vision|generic`, per-direction bytes,
   redirect errors, and reset state.
-- Each active SOCKHASH direction has bounded `bytes`, `last_seen_ns`, and
-  `redirect_errors` state in `xz_sh_stats`. `xz_sh_total` retains aggregate
-  bytes, packets, and redirect errors for the process lifetime, independent of
-  individual flow cleanup. These maps are not pinned and are recreated on
-  every process start.
+- Each active SOCKHASH direction has bounded `bytes`, `last_seen_ns`,
+  `redirect_errors`, and `backpressure_events` state in `xz_sh_stats`.
+  `xz_sh_total` retains aggregate bytes, packets, redirect errors, and
+  backpressure events for the process lifetime, independent of individual
+  flow cleanup. `xz_sh_state` and `xz_sh_released` hold the bounded per-flow
+  redirected and released credit used by backpressure enforcement. These maps
+  are not pinned and are recreated on every process start.
 - SK_LOOKUP maintains hit, exact-map miss, FakeDNS pool-miss,
   socket-assignment, pass, and drop
   counters in the bounded per-CPU `xz_sk_count` ARRAY. The control snapshot
@@ -246,6 +248,8 @@ xray_zig_bpf_offload_fallback_total{network,owner,reason}
 xray_zig_bpf_sockhash_bytes_total{network,owner,direction}
 xray_zig_bpf_sockhash_packets_total{network}
 xray_zig_bpf_sockhash_redirect_errors_total{network}
+xray_zig_bpf_sockhash_backpressure_total{network}
+xray_zig_bpf_sockhash_backpressure_flows_total{network}
 ```
 
 The bounded owner values are `freedom`, `vless_vision`, and `generic`. Admission
